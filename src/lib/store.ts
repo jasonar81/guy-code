@@ -295,6 +295,13 @@ interface AppState {
   ) => Promise<boolean>;
   setDefaultApiKey: (id: string) => Promise<void>;
   deleteApiKey: (id: string) => Promise<void>;
+  /**
+   * Zero out a key's accumulated hourly carry-over (under/over-spend)
+   * and re-anchor the adjustment clock to the current hour. Historical
+   * spend totals are preserved; only the rolling adjustment is cleared.
+   * Returns true when the main process confirmed the reset.
+   */
+  resetApiKeyBudgetAdjustment: (id: string) => Promise<boolean>;
   setSessionApiKey: (sessionId: string, apiKeyId: string | null) => Promise<void>;
   setBudgetKeyFilter: (apiKeyId: string | null) => void;
 }
@@ -478,6 +485,12 @@ export const useApp = create<AppState>((set, get) => ({
     // First-key delete may flip hasApiKey false.
     const ok = await window.api.secret.hasKey();
     set({ hasApiKey: ok });
+  },
+
+  resetApiKeyBudgetAdjustment: async (id) => {
+    const r = await window.api.apiKeys.resetBudgetAdjustment(id);
+    set({ apiKeys: r.keys });
+    return r.ok;
   },
 
   setSessionApiKey: async (sessionId, apiKeyId) => {

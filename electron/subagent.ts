@@ -44,7 +44,7 @@ import { TOOLS, executeTool, type ToolContext } from './tools';
 import { getMcpToolSchemas } from './mcp';
 import { computeCostMicros } from './pricing';
 import { insertUsageEvent } from './db';
-import { precheckTurn } from './budget';
+import { precheckCall } from './budget';
 import type { MemoryBundle } from './memory';
 
 /** Roles supported by the subagent system. */
@@ -322,9 +322,13 @@ export async function runSubagent(
 
     // Pre-flight budget check. Subagents share the parent's bucket; if
     // there's no headroom we bail with a structured message rather than
-    // burning a request that the API would also block. Note: we do NOT
-    // call noteRunStart/noteRunEnd here — the parent already reserved.
-    const pre = precheckTurn(parent.sessionId, parent.apiKeyId);
+    // burning a request that the API would also block. Same per-API-call
+    // semantics as the parent loop — every round of the subagent goes
+    // through this gate. usage_events rows recorded under the parent's
+    // sessionId mean `sessionHasCallInCurrentHour` returns true after the
+    // first subagent round, so the parent + subagent share the single
+    // min-one-call exemption per hour.
+    const pre = precheckCall(parent.sessionId, parent.apiKeyId);
     if (!pre.allowed) {
       log.warn(`[${tag}] budget block on round ${round}: ${pre.reason}`);
       throw new Error(

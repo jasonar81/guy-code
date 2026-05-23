@@ -13,6 +13,7 @@ import {
   Star,
   Trash2,
   Edit3,
+  RotateCcw,
 } from 'lucide-react';
 import clsx from 'clsx';
 import type { McpServerStatus, ApiKey } from '@/types';
@@ -505,6 +506,7 @@ function ApiKeysSection({ keys }: { keys: ApiKey[] }) {
   const updateKey = useApp((s) => s.updateApiKey);
   const deleteKey = useApp((s) => s.deleteApiKey);
   const setDefault = useApp((s) => s.setDefaultApiKey);
+  const resetAdjustment = useApp((s) => s.resetApiKeyBudgetAdjustment);
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -593,6 +595,21 @@ function ApiKeysSection({ keys }: { keys: ApiKey[] }) {
                   setBusyId(null);
                 }
               }}
+              onResetAdjustment={async () => {
+                if (
+                  !window.confirm(
+                    `Reset accumulated overages/underages for "${k.name}"?\n\nThis zeros out the carry-over adjustment that rolls unused or overspent budget between hours. Historical spend totals are NOT deleted — only the rolling adjustment is cleared, so the next hour starts fresh at exactly daily / 24.`
+                  )
+                ) {
+                  return;
+                }
+                setBusyId(k.id);
+                try {
+                  await resetAdjustment(k.id);
+                } finally {
+                  setBusyId(null);
+                }
+              }}
             />
           )
         )}
@@ -625,12 +642,14 @@ function KeyRow({
   onEdit,
   onMakeDefault,
   onDelete,
+  onResetAdjustment,
 }: {
   k: ApiKey;
   busy: boolean;
   onEdit: () => void;
   onMakeDefault: () => void;
   onDelete: () => void;
+  onResetAdjustment: () => void;
 }) {
   return (
     <div className="flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-bg/40">
@@ -668,6 +687,14 @@ function KeyRow({
             Set default
           </button>
         )}
+        <button
+          onClick={onResetAdjustment}
+          disabled={busy}
+          className="p-1 rounded text-text-dim hover:text-text hover:bg-bg-hover"
+          title="Reset accumulated hourly overages/underages (clean slate; spend history untouched)"
+        >
+          <RotateCcw size={11} />
+        </button>
         <button
           onClick={onEdit}
           disabled={busy}

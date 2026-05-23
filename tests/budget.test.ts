@@ -1,18 +1,27 @@
 /**
- * Comprehensive tests for `electron/budget.ts`.
+ * Comprehensive tests for `electron/budget.ts` — hourly carry-over model.
  *
- * The budget module is the most failure-prone part of the codebase
- * (we've now rewritten it 3+ times). These tests pin down the
- * intended semantics of the hourly-bucket model:
+ * The budget governor is the most failure-prone part of the codebase
+ * (rewritten several times). These tests pin down the carry-over model
+ * the user explicitly specified:
  *
- *   • Hourly cap = daily / 24, clock-aligned buckets.
- *   • Pre-flight allows uncapped, force-resume, bucket-has-room, OR
- *     min-one-turn-per-session-per-hour exemption. Otherwise blocks.
- *   • Resume sweep wakes paused sessions whose bucket has refilled.
+ *   • base_hourly = daily_budget / 24, constant.
+ *   • Each hour's effective_cap = base_hourly + adjustment_so_far.
+ *   • Underspend rolls forward, overspend rolls forward as a negative
+ *     adjustment. Walked example (base=5, clean start):
+ *       H1: adj=0,  effective=5, spent=7 → new_adj = 5−7 = −2
+ *       H2: adj=−2, effective=3, spent=2 → new_adj = 3−2 = +1
+ *       H3: adj=+1, effective=6, …
+ *   • Pre-flight before EVERY API call (not per-turn). Allowed when
+ *     uncapped, force-resume bypass, bucket has room, or session has
+ *     no calls in the current hour (min-one-call-per-hour exemption).
+ *   • Reset zeros the carry-over and re-anchors to the current hour.
+ *   • Settle-on-read handles arbitrary offline gaps (app restart after
+ *     hours / days).
  *
- * Strategy: vi.mock the `./db` module so tests control all spend
- * data, api_keys rows, and settings via in-memory fixtures. No
- * SQLite needed.
+ * Strategy: vi.mock the `./db` module so tests fully control spend
+ * data, api_keys rows, and settings via in-memory fixtures. No SQLite
+ * needed. Adjustment columns are simulated directly on the fake row.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -33,6 +42,8 @@ const _apiKeyRows = new Map<
     name: string;
     daily_budget_usd: number | null;
     is_default: number;
+    adjustment_micros: number;
+    adjustment_hour_ts: number;
   }
 >();
 let _defaultApiKeyId: string | null = null;
@@ -67,9 +78,6 @@ function resetFixtures() {
 }
 
 // ----- vi.mock('./db') ---------------------------------------------------
-// Substitute a hand-rolled in-memory db that supports just the queries
-// budget.ts uses. Each test calls resetFixtures() then writes its
-// scenario into the fixtures.
 
 vi.mock('../electron/db', () => {
   function spendBetweenImpl(
@@ -87,7 +95,6 @@ vi.mock('../electron/db', () => {
       prepare(sql: string) {
         return {
           get<T>(...args: unknown[]): T | undefined {
-            // Match the SUM-of-cost queries by SQL fragment.
             if (sql.includes('SELECT COALESCE(SUM(cost_usd_micros), 0)')) {
               const [from, toExclusive, apiKeyId] = args as [
                 number,
@@ -101,7 +108,6 @@ vi.mock('../electron/db', () => {
               );
               return { total } as T;
             }
-            // sessionHasTurnInCurrentHour query.
             if (sql.includes('FROM usage_events') && sql.includes('LIMIT 1')) {
               const [sessionId, from, toExclusive] = args as [
                 string,
@@ -136,6 +142,20 @@ vi.mock('../electron/db', () => {
     getSetting(key: string) {
       return _settings.get(key) ?? null;
     },
+    setApiKeyBudgetAdjustment(id: string, adjustmentMicros: number, hourTs: number) {
+      const row = _apiKeyRows.get(id);
+      if (row) {
+        row.adjustment_micros = Math.round(adjustmentMicros);
+        row.adjustment_hour_ts = Math.round(hourTs);
+      }
+    },
+    resetApiKeyBudgetAdjustment(id: string, hourTs: number) {
+      const row = _apiKeyRows.get(id);
+      if (row) {
+        row.adjustment_micros = 0;
+        row.adjustment_hour_ts = Math.round(hourTs);
+      }
+    },
     setSessionState(id: string, state: string) {
       _setSessionStateCalls.push({ id, state });
     },
@@ -153,25 +173,31 @@ vi.mock('../electron/agentEvents', () => ({
   broadcastStateChanged: vi.fn(),
 }));
 
-// Imports must come AFTER vi.mock — vitest hoists the mocks to the top
-// at runtime, but the static-analyzer-friendly form is to import at
-// the top in source order.
+// Imports must come AFTER vi.mock — vitest hoists them at runtime.
 import {
   getDailyBudgetMicros,
+  getBaseHourCapMicros,
+  getEffectiveHourCapMicros,
   getHourCapMicros,
   currentHourSpendMicros,
   todaySpendMicros,
   rollingDaySpendMicros,
-  sessionHasTurnInCurrentHour,
-  noteRunStart,
-  noteRunEnd,
+  sessionHasCallInCurrentHour,
+  precheckCall,
   precheckTurn,
   setBypassNextTurn,
+  resetBudgetAdjustment,
 } from '../electron/budget';
 
 // ----- Helpers ----------------------------------------------------------
 
 const $1 = 1_000_000;
+const HOUR_MS = 60 * 60 * 1000;
+
+function hourTs(iso: string): number {
+  // Helper to spell out "start of this hour" in tests.
+  return new Date(iso).getTime();
+}
 
 function addSpend(opts: {
   ts: number;
@@ -188,14 +214,33 @@ function addSpend(opts: {
   });
 }
 
-function setKey(id: string, opts: { dailyUsd?: number | null; isDefault?: boolean; name?: string }) {
+function setKey(
+  id: string,
+  opts: {
+    dailyUsd?: number | null;
+    isDefault?: boolean;
+    name?: string;
+    /** Pre-seed adjustment (e.g. for migration / restart scenarios). */
+    adjustmentUsd?: number;
+    /** Pre-seed adjustment_hour_ts. Defaults to 0 (uninitialized). */
+    adjustmentHourTs?: number;
+  }
+) {
   _apiKeyRows.set(id, {
     id,
     name: opts.name ?? id,
     daily_budget_usd: opts.dailyUsd ?? null,
     is_default: opts.isDefault ? 1 : 0,
+    adjustment_micros: Math.round((opts.adjustmentUsd ?? 0) * $1),
+    adjustment_hour_ts: opts.adjustmentHourTs ?? 0,
   });
   if (opts.isDefault) _defaultApiKeyId = id;
+}
+
+function getRow(id: string) {
+  const r = _apiKeyRows.get(id);
+  if (!r) throw new Error(`test bug: no row for key ${id}`);
+  return r;
 }
 
 beforeEach(() => {
@@ -206,7 +251,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-// ----- getDailyBudgetMicros ---------------------------------------------
+// ----- getDailyBudgetMicros (unchanged from old model) ------------------
 
 describe('getDailyBudgetMicros', () => {
   it('returns per-key daily budget when set', () => {
@@ -242,262 +287,428 @@ describe('getDailyBudgetMicros', () => {
     setKey('k2', { dailyUsd: -5 });
     expect(getDailyBudgetMicros('k2')).toBeNull();
   });
-
-  it('ignores non-numeric or empty global setting strings', () => {
-    _settings.set('budget.dailyBudgetUsd', '');
-    _settings.set('budget.rollingHourCapUsd', 'NaNbread');
-    expect(getDailyBudgetMicros()).toBeNull();
-  });
 });
 
-// ----- getHourCapMicros -------------------------------------------------
+// ----- Base + effective hour cap ----------------------------------------
 
-describe('getHourCapMicros', () => {
+describe('getBaseHourCapMicros', () => {
   it('returns daily / 24 floored', () => {
     setKey('k1', { dailyUsd: 80 });
-    expect(getHourCapMicros('k1')).toBe(Math.floor((80 * $1) / 24));
+    expect(getBaseHourCapMicros('k1')).toBe(Math.floor((80 * $1) / 24));
   });
 
   it('returns null when uncapped', () => {
-    expect(getHourCapMicros('absent')).toBeNull();
-  });
-
-  it('rounds-down sub-cent fractions to avoid micro-overrun', () => {
-    setKey('k1', { dailyUsd: 1 }); // 1 USD = 1_000_000 micros, /24 = 41666.66...
-    expect(getHourCapMicros('k1')).toBe(41666);
+    expect(getBaseHourCapMicros('absent')).toBeNull();
   });
 });
 
-// ----- currentHourSpendMicros / todaySpendMicros / rollingDaySpendMicros
+describe('getEffectiveHourCapMicros', () => {
+  it('returns base + adjustment after settle initializes a fresh key', () => {
+    setKey('k1', { dailyUsd: 240 }); // base = $10/hr
+    const now = hourTs('2026-05-23T13:30:00');
+    // First read settles from uninitialized (hour_ts=0): anchors to
+    // current hour with adjustment=0, returns base.
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(10 * $1);
+    // Row was updated.
+    const r = getRow('k1');
+    expect(r.adjustment_micros).toBe(0);
+    expect(r.adjustment_hour_ts).toBe(hourTs('2026-05-23T13:00:00'));
+  });
+
+  it('returns null when uncapped (no settle attempted)', () => {
+    expect(getEffectiveHourCapMicros('absent')).toBeNull();
+  });
+
+  it('back-compat alias getHourCapMicros routes through getEffectiveHourCapMicros', () => {
+    setKey('k1', { dailyUsd: 240 });
+    expect(getHourCapMicros('k1')).toBe(getEffectiveHourCapMicros('k1'));
+  });
+
+  it("user's H1→H2 example: underspend at H1, effective_cap drops at H2", () => {
+    // Their numbers: base=$5/hr (= $120/day), start clean.
+    // H1: spent=$7 → new_adj = 5 − 7 = −$2
+    // H2: effective = base + adj = 5 − 2 = $3
+    setKey('k1', {
+      dailyUsd: 120,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T13:30:00'),
+      costMicros: 7 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    // Settle at start of H2 (14:00).
+    const nowH2 = hourTs('2026-05-23T14:30:00');
+    const effH2 = getEffectiveHourCapMicros('k1', nowH2);
+    expect(effH2).toBe(3 * $1);
+    // Adjustment row updated to −$2.
+    expect(getRow('k1').adjustment_micros).toBe(-2 * $1);
+    expect(getRow('k1').adjustment_hour_ts).toBe(hourTs('2026-05-23T14:00:00'));
+  });
+
+  it("user's H2→H3 example: spent=2 under cap=3 → adj=+1", () => {
+    // Continuing the example. H2 starts with adj=−2. Spent $2 in H2.
+    // new_adj = (5 + −2) − 2 = +$1. H3 effective = 5 + 1 = $6.
+    setKey('k1', {
+      dailyUsd: 120,
+      adjustmentUsd: -2,
+      adjustmentHourTs: hourTs('2026-05-23T14:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T14:30:00'),
+      costMicros: 2 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const nowH3 = hourTs('2026-05-23T15:30:00');
+    expect(getEffectiveHourCapMicros('k1', nowH3)).toBe(6 * $1);
+    expect(getRow('k1').adjustment_micros).toBe(1 * $1);
+    expect(getRow('k1').adjustment_hour_ts).toBe(hourTs('2026-05-23T15:00:00'));
+  });
+
+  it('settles many hours in a single SQL pass (app restart after long idle)', () => {
+    // Base = $5/hr. Adjustment anchored to noon. Now is 10pm (10 hours
+    // later). One hour had $10 of spend (overshoot by $5); the other 9
+    // hours had no activity.
+    //   total_allowed = 10 × 5 + 0 = $50
+    //   total_spent   = $10
+    //   new_adj       = $50 − $10 = $40 (accumulated underspend)
+    setKey('k1', {
+      dailyUsd: 120,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T12:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T14:30:00'),
+      costMicros: 10 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const now = hourTs('2026-05-23T22:30:00');
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(45 * $1); // base 5 + adj 40
+    expect(getRow('k1').adjustment_micros).toBe(40 * $1);
+  });
+
+  it('idempotent within a single hour: re-reading does not double-count', () => {
+    setKey('k1', {
+      dailyUsd: 120,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T13:30:00'),
+      costMicros: 7 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const nowH2 = hourTs('2026-05-23T14:30:00');
+    expect(getEffectiveHourCapMicros('k1', nowH2)).toBe(3 * $1);
+    // Second call in the same hour shouldn't re-settle.
+    expect(getEffectiveHourCapMicros('k1', nowH2)).toBe(3 * $1);
+    expect(getEffectiveHourCapMicros('k1', nowH2)).toBe(3 * $1);
+    expect(getRow('k1').adjustment_micros).toBe(-2 * $1);
+  });
+
+  it('effective cap can be negative when previous hour overshot massively', () => {
+    // base = $1/hr, prev hour spent $100. new_adj = 1 − 100 = −$99.
+    // Next hour's effective = 1 + (−99) = −$98.
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T13:30:00'),
+      costMicros: 100 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const nowH2 = hourTs('2026-05-23T14:30:00');
+    expect(getEffectiveHourCapMicros('k1', nowH2)).toBe(-98 * $1);
+  });
+
+  it('positive adjustment accumulates without cap across many idle hours', () => {
+    // User explicitly chose uncapped accumulation. After 168 idle
+    // hours (1 week) on a $24/day key (base = $1/hr), adjustment
+    // should reach 168 × $1 = $168.
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-16T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(169 * $1); // base 1 + adj 168
+    expect(getRow('k1').adjustment_micros).toBe(168 * $1);
+  });
+});
+
+// ----- Spend queries ----------------------------------------------------
 
 describe('spend queries', () => {
   it('currentHourSpendMicros sums only the current clock hour', () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
-    const lastHour = new Date('2026-05-23T12:45:00').getTime();
-    const earlyThisHour = new Date('2026-05-23T13:01:00').getTime();
-    const lateThisHour = new Date('2026-05-23T13:59:00').getTime();
-    addSpend({ ts: lastHour, costMicros: 100 * $1, apiKeyId: 'k1' });
-    addSpend({ ts: earlyThisHour, costMicros: 1 * $1, apiKeyId: 'k1' });
-    addSpend({ ts: lateThisHour, costMicros: 2 * $1, apiKeyId: 'k1' });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: hourTs('2026-05-23T12:45:00'), costMicros: 100 * $1, apiKeyId: 'k1' });
+    addSpend({ ts: hourTs('2026-05-23T13:01:00'), costMicros: 1 * $1, apiKeyId: 'k1' });
+    addSpend({ ts: hourTs('2026-05-23T13:59:00'), costMicros: 2 * $1, apiKeyId: 'k1' });
     expect(currentHourSpendMicros(now, 'k1')).toBe(3 * $1);
   });
 
-  it('currentHourSpendMicros filters by api_key_id when given', () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
+  it('currentHourSpendMicros filters by api_key_id', () => {
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now - 60_000, costMicros: 5 * $1, apiKeyId: 'k1' });
     addSpend({ ts: now - 60_000, costMicros: 10 * $1, apiKeyId: 'k2' });
     expect(currentHourSpendMicros(now, 'k1')).toBe(5 * $1);
     expect(currentHourSpendMicros(now, 'k2')).toBe(10 * $1);
-    // null aggregates across all keys.
     expect(currentHourSpendMicros(now, null)).toBe(15 * $1);
   });
 
   it('todaySpendMicros sums the current local day only', () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
-    const yesterday = new Date('2026-05-22T23:59:00').getTime();
-    const earlyToday = new Date('2026-05-23T00:01:00').getTime();
-    const justNow = new Date('2026-05-23T13:00:00').getTime();
-    addSpend({ ts: yesterday, costMicros: 50 * $1, apiKeyId: 'k1' });
-    addSpend({ ts: earlyToday, costMicros: 5 * $1, apiKeyId: 'k1' });
-    addSpend({ ts: justNow, costMicros: 7 * $1, apiKeyId: 'k1' });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: hourTs('2026-05-22T23:59:00'), costMicros: 50 * $1, apiKeyId: 'k1' });
+    addSpend({ ts: hourTs('2026-05-23T00:01:00'), costMicros: 5 * $1, apiKeyId: 'k1' });
+    addSpend({ ts: hourTs('2026-05-23T13:00:00'), costMicros: 7 * $1, apiKeyId: 'k1' });
     expect(todaySpendMicros(now, 'k1')).toBe(12 * $1);
   });
 
   it('rollingDaySpendMicros sums the trailing 24h', () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
-    const within = now - 23 * 60 * 60 * 1000;
-    const outside = now - 25 * 60 * 60 * 1000;
-    addSpend({ ts: within, costMicros: 3 * $1, apiKeyId: 'k1' });
-    addSpend({ ts: outside, costMicros: 3 * $1, apiKeyId: 'k1' });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: now - 23 * HOUR_MS, costMicros: 3 * $1, apiKeyId: 'k1' });
+    addSpend({ ts: now - 25 * HOUR_MS, costMicros: 3 * $1, apiKeyId: 'k1' });
     expect(rollingDaySpendMicros(now, 'k1')).toBe(3 * $1);
-  });
-
-  it('per-key totals exclude legacy un-keyed events', () => {
-    const now = Date.now();
-    addSpend({ ts: now - 60_000, costMicros: 5 * $1, apiKeyId: null });
-    addSpend({ ts: now - 60_000, costMicros: 7 * $1, apiKeyId: 'k1' });
-    expect(currentHourSpendMicros(now, 'k1')).toBe(7 * $1);
-    // Aggregated includes the un-keyed event.
-    expect(currentHourSpendMicros(now, null)).toBe(12 * $1);
   });
 });
 
-// ----- sessionHasTurnInCurrentHour --------------------------------------
+// ----- sessionHasCallInCurrentHour --------------------------------------
 
-describe('sessionHasTurnInCurrentHour', () => {
-  it('returns true when the session has any spend in the current hour', () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
+describe('sessionHasCallInCurrentHour', () => {
+  it('returns true when session has any usage row in the current hour', () => {
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({
-      ts: new Date('2026-05-23T13:01:00').getTime(),
+      ts: hourTs('2026-05-23T13:01:00'),
       costMicros: 1,
       apiKeyId: 'k1',
       sessionId: 's1',
     });
-    expect(sessionHasTurnInCurrentHour('s1', now)).toBe(true);
+    expect(sessionHasCallInCurrentHour('s1', now)).toBe(true);
   });
 
   it("returns false when the session's spend is in a different hour", () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({
-      ts: new Date('2026-05-23T12:30:00').getTime(),
+      ts: hourTs('2026-05-23T12:30:00'),
       costMicros: 1,
       apiKeyId: 'k1',
       sessionId: 's1',
     });
-    expect(sessionHasTurnInCurrentHour('s1', now)).toBe(false);
-  });
-
-  it('returns false when the session has no spend at all', () => {
-    expect(sessionHasTurnInCurrentHour('absent')).toBe(false);
+    expect(sessionHasCallInCurrentHour('s1', now)).toBe(false);
   });
 
   it('does not leak across sessions on the same key', () => {
-    const now = new Date('2026-05-23T13:30:00').getTime();
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({
-      ts: new Date('2026-05-23T13:01:00').getTime(),
+      ts: hourTs('2026-05-23T13:01:00'),
       costMicros: 1,
       apiKeyId: 'k1',
       sessionId: 's1',
     });
-    expect(sessionHasTurnInCurrentHour('s2', now)).toBe(false);
+    expect(sessionHasCallInCurrentHour('s2', now)).toBe(false);
   });
 });
 
-// ----- In-flight reservation -------------------------------------------
+// ----- precheckCall (the main decision tree) ----------------------------
 
-describe('noteRunStart / noteRunEnd', () => {
-  it('reserves and releases per-key', () => {
-    setKey('k1', { dailyUsd: 24 }); // hour cap = 1M
-    const now = Date.now();
-    // No reservation, no spend → bucket has full hour cap of room.
-    const r0 = precheckTurn('s1', 'k1');
-    expect(r0.allowed).toBe(true);
-
-    // After noteRunStart, reservation = $5; hour cap = $1; reservation
-    // alone exceeds bucket → blocks (and exemption only applies if no
-    // prior turn this hour, which is true here, so it allows under the
-    // exemption).
-    noteRunStart('k1');
-    addSpend({ ts: now, costMicros: 1, apiKeyId: 'k1', sessionId: 's1' });
-    const r1 = precheckTurn('s2', 'k1');
-    // s2 has no prior turn this hour → exemption applies even though
-    // reservation alone is over the cap.
-    expect(r1.allowed).toBe(true);
-    expect(r1.reason).toMatch(/exemption/);
-
-    // Release the reservation.
-    noteRunEnd('k1');
-    // s2 still has no prior turn this hour, so still allowed via
-    // exemption regardless. Block path is exercised below.
-  });
-
-  it('does not go below zero on extra noteRunEnd calls', () => {
-    noteRunEnd('k1');
-    noteRunEnd('k1');
-    setKey('k1', { dailyUsd: 24 });
-    const r = precheckTurn('s1', 'k1');
-    expect(r.allowed).toBe(true);
-  });
-});
-
-// ----- precheckTurn (the main decision tree) ----------------------------
-
-describe('precheckTurn', () => {
+describe('precheckCall', () => {
   it('Step 1: uncapped key → allow', () => {
-    const r = precheckTurn('s1', 'absent');
+    const r = precheckCall('s1', 'absent');
     expect(r.allowed).toBe(true);
     expect(r.capMicros).toBe(0);
   });
 
   it('Step 2: force-resume bypass → allow + consume one-shot', () => {
-    setKey('k1', { dailyUsd: 24 }); // hour cap = $1
-    const now = Date.now();
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
     setBypassNextTurn('s1');
-    const r1 = precheckTurn('s1', 'k1');
+    const r1 = precheckCall('s1', 'k1', now);
     expect(r1.allowed).toBe(true);
     expect(r1.reason).toMatch(/force-resume/);
-    // Bypass consumed → next call (s1 has prior turn) blocks.
-    const r2 = precheckTurn('s1', 'k1');
+    // Bypass consumed → next call (s1 has prior call this hour) blocks.
+    const r2 = precheckCall('s1', 'k1', now);
     expect(r2.allowed).toBe(false);
   });
 
   it('Step 3: bucket has room → allow', () => {
-    setKey('k1', { dailyUsd: 240 }); // hour cap = $10
-    const now = Date.now();
+    setKey('k1', {
+      dailyUsd: 240,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 3 * $1, apiKeyId: 'k1', sessionId: 's1' });
-    const r = precheckTurn('s1', 'k1');
+    const r = precheckCall('s1', 'k1', now);
     expect(r.allowed).toBe(true);
     expect(r.capMicros).toBe(10 * $1);
     expect(r.spentMicros).toBe(3 * $1);
   });
 
-  it('Step 4: bucket exhausted, session has no prior turn → exemption', () => {
-    setKey('k1', { dailyUsd: 24 }); // hour cap = $1
-    const now = Date.now();
+  it('Step 4: bucket exhausted, session has no prior call → exemption', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 'other' });
-    const r = precheckTurn('newSession', 'k1');
+    const r = precheckCall('newSession', 'k1', now);
     expect(r.allowed).toBe(true);
     expect(r.reason).toMatch(/exemption/);
   });
 
-  it('Step 5: bucket exhausted AND session has prior turn → block', () => {
-    setKey('k1', { dailyUsd: 24 }); // hour cap = $1
-    const now = Date.now();
+  it('Step 5: bucket exhausted AND session has prior call → block', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
-    const r = precheckTurn('s1', 'k1');
+    const r = precheckCall('s1', 'k1', now);
     expect(r.allowed).toBe(false);
     expect(r.reason).toMatch(/hour spend/);
     expect(r.spentMicros).toBe(5 * $1);
   });
 
-  it('block reason includes in-flight reservation when reserved > 0', () => {
-    setKey('k1', { dailyUsd: 24 });
-    const now = Date.now();
-    addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
-    noteRunStart('k1');
-    const r = precheckTurn('s1', 'k1');
-    expect(r.allowed).toBe(false);
-    expect(r.reason).toMatch(/in-flight/);
-    noteRunEnd('k1');
-  });
-
-  it('nextRetryTs lands at the top of the next clock hour', () => {
-    setKey('k1', { dailyUsd: 24 });
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-05-23T13:42:17'));
-    addSpend({
-      ts: new Date('2026-05-23T13:00:30').getTime(),
-      costMicros: 5 * $1,
-      apiKeyId: 'k1',
-      sessionId: 's1',
+  it('block reason names the effective cap (after carry-over), not base', () => {
+    // base=$5, adj=−$3 → effective=$2. Spent $2 → blocked.
+    setKey('k1', {
+      dailyUsd: 120,
+      adjustmentUsd: -3,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
     });
-    const r = precheckTurn('s1', 'k1');
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: now, costMicros: 2 * $1, apiKeyId: 'k1', sessionId: 's1' });
+    const r = precheckCall('s1', 'k1', now);
     expect(r.allowed).toBe(false);
-    const expected = new Date('2026-05-23T14:00:00').getTime();
-    expect(r.nextRetryTs).toBe(expected);
+    expect(r.capMicros).toBe(2 * $1);
+    expect(r.reason).toMatch(/effective cap 2\.00/);
   });
 
-  it('exemption applies BEFORE block, but not before bucket-has-room', () => {
-    // If there's room AND no prior turn, we hit Step 3 (room), not the
-    // exemption. The exemption is only used when bucket is already full.
-    setKey('k1', { dailyUsd: 240 }); // hour cap = $10
-    const now = Date.now();
+  it('exemption applies BEFORE block but not before room check', () => {
+    setKey('k1', {
+      dailyUsd: 240,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 1 * $1, apiKeyId: 'k1', sessionId: 'other' });
-    const r = precheckTurn('newSession', 'k1');
+    const r = precheckCall('newSession', 'k1', now);
     expect(r.allowed).toBe(true);
     // Reason is empty (Step 3, "bucket has room"), not "exemption".
     expect(r.reason).toBe('');
   });
 
   it('per-key isolation: spend on key A does not block key B', () => {
-    setKey('a', { dailyUsd: 24 });
-    setKey('b', { dailyUsd: 24 });
-    const now = Date.now();
+    setKey('a', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    setKey('b', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 100 * $1, apiKeyId: 'a', sessionId: 's1' });
-    // s1 on key A is blocked.
-    expect(precheckTurn('s1', 'a').allowed).toBe(false);
-    // s1 on key B has no prior turn this hour → exemption (allow).
-    expect(precheckTurn('s1', 'b').allowed).toBe(true);
+    expect(precheckCall('s1', 'a', now).allowed).toBe(false);
+    expect(precheckCall('s1', 'b', now).allowed).toBe(true);
+  });
+
+  it('nextRetryTs lands at the top of the next clock hour', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:42:17.123');
+    addSpend({
+      ts: hourTs('2026-05-23T13:00:30'),
+      costMicros: 5 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(false);
+    expect(r.nextRetryTs).toBe(hourTs('2026-05-23T14:00:00'));
+  });
+
+  it('back-compat alias precheckTurn === precheckCall', () => {
+    expect(precheckTurn).toBe(precheckCall);
+  });
+
+  it('Step 4 exemption fires even when effective cap is negative', () => {
+    // Heavy carry-over overspend means effective cap is deeply negative.
+    // A session that hasn't called this hour still gets its one call.
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: -50,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    const r = precheckCall('freshSession', 'k1', now);
+    expect(r.allowed).toBe(true);
+    expect(r.reason).toMatch(/exemption/);
+    expect(r.capMicros).toBeLessThan(0);
+  });
+});
+
+// ----- resetBudgetAdjustment --------------------------------------------
+
+describe('resetBudgetAdjustment', () => {
+  it('zeros the adjustment and re-anchors to current hour', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: -47.5,
+      adjustmentHourTs: hourTs('2026-05-23T10:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    resetBudgetAdjustment('k1', now);
+    expect(getRow('k1').adjustment_micros).toBe(0);
+    expect(getRow('k1').adjustment_hour_ts).toBe(hourTs('2026-05-23T13:00:00'));
+  });
+
+  it('after reset, the next effective cap is just base_hourly', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: -100,
+      adjustmentHourTs: hourTs('2026-05-23T10:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    resetBudgetAdjustment('k1', now);
+    // No spend in current hour; effective = base = $1.
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(1 * $1);
+  });
+
+  it('does NOT delete usage_events rows (historical spend totals preserved)', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: -50,
+      adjustmentHourTs: hourTs('2026-05-23T10:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-22T10:30:00'),
+      costMicros: 30 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    resetBudgetAdjustment('k1', hourTs('2026-05-23T13:30:00'));
+    // Spend history is untouched.
+    expect(_spendRows).toHaveLength(1);
   });
 });

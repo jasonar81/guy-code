@@ -324,6 +324,16 @@ declare global {
         delete: (
           id: string
         ) => Promise<{ keys: ApiKey[]; sessions: SessionRow[] }>;
+        /**
+         * Zero out accumulated hourly carry-over (under/over-spend) for
+         * one key and re-anchor the adjustment clock to the current
+         * hour. Historical `usage_events` rows are untouched. Surfaced
+         * as a per-key "Reset overages/underages" button on the
+         * Settings page.
+         */
+        resetBudgetAdjustment: (
+          id: string
+        ) => Promise<{ ok: boolean; keys: ApiKey[] }>;
       };
       mcp: {
         list: () => Promise<McpServerStatus[]>;

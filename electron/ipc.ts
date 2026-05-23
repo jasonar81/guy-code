@@ -32,6 +32,7 @@ import {
   getDailyBudgetMicros,
   getHourCapMicros,
   setBypassNextTurn,
+  resetBudgetAdjustment,
 } from './budget';
 import { importClaudeProjects } from './claudeImport';
 import { listMcpServers, signInMcp, signOutMcp } from './mcp';
@@ -261,6 +262,18 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     deleteApiKeyById(id);
     resetClient(id);
     return { keys: listApiKeys(), sessions: listSessionsAll() };
+  });
+
+  // Zero out a key's accumulated hourly carry-over and re-anchor to the
+  // current hour. `usage_events` rows are NOT deleted — historical spend
+  // totals remain accurate, only the carry-over adjustment chain is
+  // reset. Used when the user wants a clean slate (e.g. after a budget
+  // logic bug or a large unintended overage they don't want amortized
+  // across future hours). The Settings page surfaces this as a per-key
+  // "Reset overages/underages" button.
+  ipcMain.handle('apiKeys:resetBudgetAdjustment', (_e, id: string) => {
+    resetBudgetAdjustment(id);
+    return { ok: true, keys: listApiKeys() };
   });
 
   // ---- MCP servers ----

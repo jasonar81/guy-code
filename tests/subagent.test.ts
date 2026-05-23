@@ -167,16 +167,19 @@ vi.mock('../electron/db', () => ({
 // Mock budget so we can flip pre-flight allow/block per test.
 let _budgetAllow = true;
 let _budgetReason = '';
-vi.mock('../electron/budget', () => ({
-  precheckTurn: () => ({
+// The subagent loop now imports `precheckCall`; keep `precheckTurn` as
+// a back-compat alias in the mock for the (slim) chance an old test
+// fixture references it.
+vi.mock('../electron/budget', () => {
+  const fn = () => ({
     allowed: _budgetAllow,
     reason: _budgetReason,
     capMicros: 1_000_000,
     spentMicros: 0,
-    reservedMicros: 0,
     nextRetryTs: 0,
-  }),
-}));
+  });
+  return { precheckCall: fn, precheckTurn: fn };
+});
 
 // Stub electron-log via the global setup, plus pricing returning a
 // fixed value so the cost-row math is deterministic.

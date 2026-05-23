@@ -563,6 +563,29 @@ function migrate(d: Database) {
         CREATE INDEX usage_events_api_key_ts ON usage_events(api_key_id, ts);
       `,
     },
+    {
+      version: 5,
+      // Hourly carry-over budget state. The user's mental model is
+      // dead simple: each clock hour gets `daily / 24`. If you underspend
+      // an hour, the unused amount rolls into the next hour. If you
+      // overspend, the next hour's effective cap is reduced by the
+      // overage. Two columns on api_keys track this:
+      //   • adjustment_micros — signed carry-over for the NEXT hour.
+      //     A positive value means past hours underspent; negative means
+      //     past hours overspent. Effective cap for any hour H is
+      //     `(daily/24) + adjustment_as_of_start_of_H`.
+      //   • adjustment_hour_ts — start-of-hour (ms) the adjustment is
+      //     "as of". On any read we settle from this timestamp forward
+      //     to the current hour using a single SUM over usage_events.
+      // The columns default to 0/0 so a brand-new install (or a key
+      // created after this migration) starts with a clean slate. The
+      // Settings "Reset overages/underages" button rewinds back to this
+      // initial state for one specific key.
+      up: `
+        ALTER TABLE api_keys ADD COLUMN adjustment_micros INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE api_keys ADD COLUMN adjustment_hour_ts INTEGER NOT NULL DEFAULT 0;
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -1192,13 +1215,33 @@ export interface ApiKeyRow {
   per_turn_cap_usd: number | null;
   is_default: number;
   created_at: number;
+  /**
+   * Signed carry-over from past hours, in USD micros. Positive = unused
+   * budget that rolls forward; negative = overspend that subtracts from
+   * future hours. Updated atomically by `settleApiKeyAdjustment` on the
+   * first budget read in any new hour.
+   */
+  adjustment_micros: number;
+  /**
+   * Start-of-hour (ms, local-clock-aligned) that `adjustment_micros` is
+   * "as of". Zero means uninitialized — the next settle call anchors it
+   * to the current hour with a zero adjustment (clean slate).
+   */
+  adjustment_hour_ts: number;
 }
+
+/**
+ * Column list used by every api_keys SELECT. Centralized so adding a
+ * new column doesn't require touching five copies of the query string.
+ */
+const API_KEY_COLS =
+  'id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at, adjustment_micros, adjustment_hour_ts';
 
 /** All keys, default first. The full set including cipher_b64. */
 export function listApiKeysFull(): ApiKeyRow[] {
   return db()
     .prepare(
-      `SELECT id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at
+      `SELECT ${API_KEY_COLS}
          FROM api_keys
         ORDER BY is_default DESC, created_at ASC`
     )
@@ -1208,10 +1251,7 @@ export function listApiKeysFull(): ApiKeyRow[] {
 /** Look up a single key by id. */
 export function getApiKeyRow(id: string): ApiKeyRow | undefined {
   return db()
-    .prepare(
-      `SELECT id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at
-         FROM api_keys WHERE id = ?`
-    )
+    .prepare(`SELECT ${API_KEY_COLS} FROM api_keys WHERE id = ?`)
     .get<ApiKeyRow>(id);
 }
 
@@ -1223,17 +1263,47 @@ export function getDefaultApiKeyRow(): ApiKeyRow | undefined {
   return (
     db()
       .prepare(
-        `SELECT id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at
-           FROM api_keys WHERE is_default = 1 LIMIT 1`
+        `SELECT ${API_KEY_COLS} FROM api_keys WHERE is_default = 1 LIMIT 1`
       )
       .get<ApiKeyRow>() ??
     db()
       .prepare(
-        `SELECT id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at
-           FROM api_keys ORDER BY created_at ASC LIMIT 1`
+        `SELECT ${API_KEY_COLS} FROM api_keys ORDER BY created_at ASC LIMIT 1`
       )
       .get<ApiKeyRow>()
   );
+}
+
+/**
+ * Persist a settled adjustment for a specific key. Called after the
+ * settle-on-read step walks the previous-hour spend into a new
+ * `(adjustment_micros, adjustment_hour_ts)` pair. Idempotent: re-running
+ * with the same args is a no-op.
+ */
+export function setApiKeyBudgetAdjustment(
+  id: string,
+  adjustmentMicros: number,
+  adjustmentHourTs: number
+): void {
+  db()
+    .prepare(
+      `UPDATE api_keys SET adjustment_micros = ?, adjustment_hour_ts = ? WHERE id = ?`
+    )
+    .run(Math.round(adjustmentMicros), Math.round(adjustmentHourTs), id);
+}
+
+/**
+ * Zero out the carry-over adjustment for a key and re-anchor to the
+ * current hour. Wired to the Settings "Reset overages/underages" button.
+ * Spend history in `usage_events` is left untouched — only the
+ * accumulated carry-over is cleared.
+ */
+export function resetApiKeyBudgetAdjustment(id: string, nowHourTs: number): void {
+  db()
+    .prepare(
+      `UPDATE api_keys SET adjustment_micros = 0, adjustment_hour_ts = ? WHERE id = ?`
+    )
+    .run(Math.round(nowHourTs), id);
 }
 
 /** Insert a new API key row. */

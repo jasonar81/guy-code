@@ -20,7 +20,7 @@ npm run test:ui
 
 | File | Module under test | What we pin down |
 |---|---|---|
-| `tests/budget.test.ts` | `electron/budget.ts` | Hourly-bucket precheck (all 5 decision branches), per-key isolation, in-flight reservation, cap math (`daily / 24`), legacy setting fallback, force-resume one-shot, sessionHasTurnInCurrentHour |
+| `tests/budget.test.ts` | `electron/budget.ts` | Hourly carry-over model: settle-on-read math (user's H1→H2→H3 worked example, multi-hour offline gap collapsed via closed-form SQL), per-call precheck (all 5 decision branches), per-key isolation, base/effective hour cap, idempotent settlement within a single hour, negative effective caps preserved, exemption fires even when cap is negative, reset zeroes adjustment without deleting usage_events, force-resume one-shot, sessionHasCallInCurrentHour |
 | `tests/pricing.test.ts` | `electron/pricing.ts` | Per-model price lookup, suffix/date-tag stripping, family fallback (opus/sonnet/haiku), cache-write multipliers (5m=1.25×, 1h=2.0×), cache-read=0.10×, cost computation rounding |
 | `tests/format.test.ts` | `src/lib/format.ts` | USD formatting at every magnitude, token compaction, relative time, absolute time labels, dateGroupLabel, sessionDisplayTitle fallback chain |
 | `tests/compaction.test.ts` | `electron/compaction.ts` | `estimateTokens` for string/blocks/tool_use/tool_result content, ceil-rounding |

@@ -66,6 +66,10 @@ const api = {
     ) => ipcRenderer.invoke('apiKeys:update', id, patch),
     setDefault: (id: string) => ipcRenderer.invoke('apiKeys:setDefault', id),
     delete: (id: string) => ipcRenderer.invoke('apiKeys:delete', id),
+    // Zero accumulated carry-over (underages/overages) for one key.
+    // Wired to the per-key "Reset overages/underages" button in Settings.
+    resetBudgetAdjustment: (id: string) =>
+      ipcRenderer.invoke('apiKeys:resetBudgetAdjustment', id),
   },
   mcp: {
     list: () => ipcRenderer.invoke('mcp:list'),

@@ -40,7 +40,7 @@ import {
 import { getDefaultApiKeyId } from './secret';
 import { computeCostMicros } from './pricing';
 import { loadMemory } from './memory';
-import { precheckTurn, noteRunStart, noteRunEnd } from './budget';
+import { precheckCall } from './budget';
 import { broadcastAgentEvent, broadcastStateChanged } from './agentEvents';
 // Note: client-side `ephemeralizeMessages` and `maybeCompact` are no
 // longer called from the agent loop — `streamMessage` now relies on
@@ -237,6 +237,18 @@ interface RunArgs {
   attachments?: unknown[];
   /** History to seed if our JSONL is empty. Used when continuing imported sessions. */
   seedFromJsonl?: string | null;
+  /**
+   * When true, treat this call as a CONTINUATION of an in-flight turn
+   * that was paused mid-flight by the per-call budget governor. Skips
+   * appending a new user message — the JSONL already has everything
+   * the loop needs, including the original user prompt and any
+   * intermediate assistant / tool_result rounds. `userText` should be
+   * empty in this mode; if it's not, it's still appended as an
+   * additional follow-up. The resume sweep sets this when waking a
+   * session whose `pending_user_text` is empty (meaning the pause
+   * happened between API calls, not before the user message landed).
+   */
+  continueExisting?: boolean;
 }
 
 /** Type guard: is this a valid image media type for Anthropic? */
@@ -361,63 +373,60 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
   const resolvedApiKeyId: string | null =
     getSessionApiKey(sessionId) ?? getDefaultApiKeyId();
 
-  // Declared here (not inside try) so the `finally` can safely read it
-  // even when precheck blocks and we never reach the `noteRunStart` call.
-  // Toggled to true at the moment we actually take the reservation.
-  let runReserved = false;
-
   try {
-    // ---- Budget governor pre-flight ------------------------------------
-    const budget = precheckTurn(sessionId, resolvedApiKeyId);
-    if (!budget.allowed) {
-      // Park the user's intent so the resume sweep can auto-fire at the top
-      // of the next hour. Without this, the message would be lost on app
-      // restart or when the renderer state evicts the chat.
-      //
-      // APPEND instead of overwrite: if the user already has a queued
-      // message (typed a thought, hit send, got blocked, then typed
-      // another thought and hit send), we keep BOTH. Without this,
-      // each subsequent send-while-sleeping silently destroyed the
-      // prior queued reply — the user's first thought was lost the
-      // moment they typed a second.
-      //
-      // Format: separate with a blank line so the agent reads them as
-      // distinct paragraphs. Trim each side so we don't get weird
-      // leading/trailing whitespace blobs from copy-pastes.
-      const prev = getSessionPending(sessionId)?.pending_user_text ?? null;
-      const merged = prev && prev.trim()
-        ? `${prev.trim()}\n\n${userText.trim()}`
-        : userText;
-      setSessionPending(sessionId, merged, Date.now());
-      setSessionState(sessionId, 'sleeping-budget');
-      broadcastStateChanged(sessionId, 'sleeping-budget');
-      onEv({
-        type: 'budget_blocked',
-        sessionId,
-        reason: budget.reason,
-        capMicros: budget.capMicros,
-        spentMicros: budget.spentMicros,
-      });
-      // Tell the renderer about the queued text so it can render a
-      // persistent "queued" bubble that survives app restart. The
-      // renderer wires this through to refreshSessions() which then
-      // shows the queued text from the SessionRow row's
-      // pending_user_text column. We also fire turn_done so the
-      // streaming spinner clears.
-      onEv({ type: 'turn_done', sessionId, stopReason: 'budget' });
-      return;
+    // ---- Pre-turn budget pre-flight ------------------------------------
+    //
+    // This is the FIRST of two checkpoints. It fires once, BEFORE we
+    // touch the JSONL or push the user message into `messages`. If the
+    // bucket is already exhausted at turn start (and the session has
+    // already used its min-one-call exemption this hour) we park the
+    // user's text in `pending_user_text` and sleep the session right
+    // here — the message goes nowhere until the resume sweep wakes us.
+    //
+    // The SECOND checkpoint lives inside the while loop below and fires
+    // before every subsequent `streamMessage`. The two-checkpoint
+    // design exists because the pre-turn case has a user message we
+    // need to STASH (not lose), while the in-loop case can rely on the
+    // JSONL already being the source of truth (the user message is
+    // written, intermediate rounds are written; resume just continues
+    // the loop).
+    //
+    // Continuation mode (resume sweep set `continueExisting: true`)
+    // skips this pre-turn check entirely. The session was already
+    // mid-flight; the resume sweep already decided the bucket has room.
+    if (!args.continueExisting) {
+      const budget = precheckCall(sessionId, resolvedApiKeyId);
+      if (!budget.allowed) {
+        // Park the user's intent so the resume sweep can auto-fire at
+        // the top of the next hour. Without this, the message would be
+        // lost on app restart or when the renderer state evicts the chat.
+        //
+        // APPEND instead of overwrite: if the user already has a queued
+        // message (typed a thought, hit send, got blocked, then typed
+        // another thought and hit send), we keep BOTH. Without this,
+        // each subsequent send-while-sleeping silently destroyed the
+        // prior queued reply — the user's first thought was lost the
+        // moment they typed a second.
+        const prev = getSessionPending(sessionId)?.pending_user_text ?? null;
+        const merged = prev && prev.trim()
+          ? `${prev.trim()}\n\n${userText.trim()}`
+          : userText;
+        setSessionPending(sessionId, merged, Date.now());
+        setSessionState(sessionId, 'sleeping-budget');
+        broadcastStateChanged(sessionId, 'sleeping-budget');
+        onEv({
+          type: 'budget_blocked',
+          sessionId,
+          reason: budget.reason,
+          capMicros: budget.capMicros,
+          spentMicros: budget.spentMicros,
+        });
+        onEv({ type: 'turn_done', sessionId, stopReason: 'budget' });
+        return;
+      }
+      // We're either fresh or auto-resumed; clear any stale pending marker.
+      setSessionPending(sessionId, null, null);
     }
-    // We're either fresh or auto-resumed; clear any stale pending marker.
-    setSessionPending(sessionId, null, null);
-
-    // Reserve a turn's-worth of budget on this key while we run. Released
-    // in the `finally` below regardless of how the turn ends. Without this,
-    // two parallel sessions on the same key can both pass precheck at the
-    // same instant when there's only $5 of budget left, then collectively
-    // spend $10 before either's first usage_event lands. The reservation
-    // closes that race window.
-    noteRunStart(resolvedApiKeyId);
-    runReserved = true;
 
     setSessionState(sessionId, 'running');
     broadcastStateChanged(sessionId, 'running');
@@ -460,16 +469,34 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // plain-string form (cheaper to log, identical semantics to the model).
     // The cast to MessageParam is safe at runtime — the SDK's content array
     // type is missing the `document` variant, but Anthropic's API accepts it.
-    const userContent = buildUserContent(effectiveText, attachments);
-    const userMsg = { role: 'user' as const, content: userContent } as Anthropic.MessageParam;
-    messages.push(userMsg);
-    appendJsonlEvent(ourPath, {
-      type: 'user',
-      uuid: randomUUID(),
-      sessionId,
-      cwd,
-      message: { role: 'user', content: userContent },
-    });
+    //
+    // SKIPPED in continuation mode (resume sweep waking a mid-flight pause):
+    // the user message is already in JSONL from the original turn, and the
+    // loaded `messages` already contains it plus any intermediate
+    // assistant/tool_result rounds. We re-enter the loop with what's there.
+    // If the caller passed BOTH `continueExisting` AND non-empty `userText`
+    // (or attachments), we treat the new text as a follow-up appended on
+    // top of the existing history — same semantics as a fresh send while
+    // the session was running.
+    if (!args.continueExisting || effectiveText.trim() || attachments.length > 0) {
+      const userContent = buildUserContent(effectiveText, attachments);
+      const userMsg = {
+        role: 'user' as const,
+        content: userContent,
+      } as Anthropic.MessageParam;
+      messages.push(userMsg);
+      appendJsonlEvent(ourPath, {
+        type: 'user',
+        uuid: randomUUID(),
+        sessionId,
+        cwd,
+        message: { role: 'user', content: userContent },
+      });
+    } else {
+      log.info(
+        `[agent] continueExisting=true; skipping user-message append (messages=${messages.length})`
+      );
+    }
 
     const model = (getSetting('model') as string) || DEFAULT_MODEL;
     const memory = loadMemory({ cwd, projectId });
@@ -565,6 +592,45 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         onEv({ type: 'turn_done', sessionId, stopReason: 'aborted' });
         break;
       }
+
+      // ---- Per-API-call budget pre-flight ------------------------------
+      //
+      // The second of two budget checkpoints (the first is the pre-turn
+      // one above). This fires before EVERY `streamMessage` — every loop
+      // iteration, including iterations triggered by tool_result rounds.
+      // A long turn that makes 50 API calls goes through this gate 50
+      // times. No reservations, no in-flight counter: per-call gating
+      // means the worst-case drift between two parallel sessions on the
+      // same key is one extra call's spend, and the carry-over math
+      // absorbs that into the next hour's effective cap.
+      //
+      // On block: persist the session as `sleeping-budget` and return.
+      // We do NOT touch `pending_user_text` here because the original
+      // user message is already in JSONL along with any intermediate
+      // rounds we've completed. The resume sweep will see an empty
+      // pending text + sleeping-budget state and call back into this
+      // function with `continueExisting: true` to re-enter the loop
+      // without injecting a new user message.
+      {
+        const budget = precheckCall(sessionId, resolvedApiKeyId);
+        if (!budget.allowed) {
+          log.info(
+            `[agent] per-call budget block ${sessionId}: ${budget.reason}`
+          );
+          setSessionState(sessionId, 'sleeping-budget');
+          broadcastStateChanged(sessionId, 'sleeping-budget');
+          onEv({
+            type: 'budget_blocked',
+            sessionId,
+            reason: budget.reason,
+            capMicros: budget.capMicros,
+            spentMicros: budget.spentMicros,
+          });
+          onEv({ type: 'turn_done', sessionId, stopReason: 'budget' });
+          return;
+        }
+      }
+
       // Stream a single message
       const partials = new Map<number, { id: string; name: string; input: string }>();
       let pendingText = '';
@@ -1086,12 +1152,11 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     }
   } finally {
     activeRuns.delete(sessionId);
-    // Release the budget reservation taken at turn-start. Guarded by
-    // `runReserved` so the early-return paths (precheck blocked, double-
-    // start guard) don't decrement a reservation they never made.
-    if (runReserved) {
-      noteRunEnd(resolvedApiKeyId);
-      runReserved = false;
-    }
+    // The old reservation-based governor used to decrement an in-flight
+    // counter here. Removed in the carry-over rewrite: per-call
+    // precheck makes that race-protection unnecessary because the
+    // worst-case drift between two parallel sessions on the same key
+    // is one extra call's spend, and the carry-over math absorbs it
+    // into the next hour's effective cap automatically.
   }
 }

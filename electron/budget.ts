@@ -1,44 +1,58 @@
-// Hourly-bucket budget governor.
+// Hourly carry-over budget governor.
 //
-// Model (per the user's spec):
-//   • Per API key: `daily_budget_usd` (the human knob).
-//   • Hourly cap = `daily_budget / 24`. Buckets are CLOCK-ALIGNED — each
-//     bucket runs from the top of one hour to the top of the next (e.g.
-//     1:00pm-2:00pm = one bucket).
-//   • Pre-flight before every turn:
-//        1. Uncapped key → ALLOW.
-//        2. force-resume one-shot → ALLOW (consumes the bypass flag).
-//        3. `currentHourSpend + inFlightReservation < hourCap` → ALLOW.
-//        4. Session has not yet completed a turn in THIS hour → ALLOW
-//           (the "min one turn per session per hour" exemption — even
-//           with the bucket exhausted, a session that hasn't run yet
-//           gets one shot).
-//        5. Otherwise → BLOCK; user text gets parked in
-//           `sessions.pending_user_text`, session state becomes
-//           `sleeping-budget`, retry scheduled for top of next hour.
-//   • Resume sweep runs every minute, wakes paused sessions whose
-//     bucket has refilled (typically at the top of every clock hour).
+// The model (per the user's spec, with their worked example):
 //
-// Why not rolling 60-min windows? The user explicitly asked for clock-
-// aligned buckets — they're easier to reason about (the "1pm bucket"
-// is the same number whether you check at 1:01 or 1:59) and they make
-// the wake time a clean clock-tick rather than a sliding target.
+//   • Per API key: `daily_budget_usd` is the human knob.
+//   • `base_hourly = daily / 24`. Constant.
+//   • Each clock hour starts with an effective cap of
+//        effective_cap_for_H = base_hourly + adjustment_as_of_start_of_H
+//     where `adjustment` is the signed carry-over from past hours.
+//   • At the moment hour H ends and H+1 begins, the new adjustment is:
+//        new_adjustment = effective_cap_for_H − spent_in_H
+//                       = (base_hourly + old_adjustment) − spent_in_H
+//     Positive means we underspent and unused budget rolls forward;
+//     negative means we overspent and the next hour's effective cap is
+//     reduced by the overage.
 //
-// Why min-one-turn-per-hour? With N sessions running in parallel,
-// without an exemption the first session to start in an hour can
-// burn the whole bucket and starve every other session for the rest
-// of the hour. The exemption is per-session — once a session has
-// fired any turn in the current hour bucket, subsequent turns gate
-// on the cap normally. So a single key with 10 active sessions can
-// burst up to ~$cap + 10×$avg_turn in a worst-case hour, but we
-// guarantee progress on every active session.
+//   User's example (base=5, starting clean slate):
+//     H1: adj=0,  effective=5, spent=7, new_adj = 5 − 7 = −2
+//     H2: adj=−2, effective=3, spent=2, new_adj = 3 − 2 = +1
+//     H3: adj=+1, effective=6, …
 //
-// What's preserved:
-//   • Per-key isolation. Spend on key A doesn't gate key B.
-//   • In-memory in-flight reservation closes the parallel-precheck race.
-//   • `forceResume(sessionId)` one-shot bypass for critical turns.
-//   • Persistence across restarts: paused state and pending text live
-//     on the session row in SQLite.
+// Implementation strategy:
+//
+//   • Two columns on `api_keys` hold the carry-over state:
+//     `adjustment_micros` (signed) and `adjustment_hour_ts` (the start-
+//     of-hour the adjustment is "as of"). Updated atomically inside
+//     `settle()` on the first budget read in any new hour.
+//   • `settle()` walks forward from `adjustment_hour_ts` to the current
+//     hour in ONE SQL query. The closed-form math used:
+//        elapsed = (current_hour_ts − adjustment_hour_ts) / 1h
+//        total_allowed_in_elapsed = elapsed × base_hourly + old_adj
+//        total_spent_in_elapsed   = SUM(usage_events in that window)
+//        new_adjustment           = total_allowed_in_elapsed − total_spent
+//     This is equivalent to iterating hour-by-hour but faster (one query
+//     for any number of elapsed hours; matters after the app's been
+//     closed for hours/days).
+//   • Pre-flight runs BEFORE EVERY API CALL (every `streamMessage` and
+//     every subagent round). NOT once per turn. A turn that makes 50
+//     calls gets 50 budget checks. This is why we don't need any
+//     in-flight reservation: drift can only ever be one call's worth,
+//     and the carry-over makes any overrun self-correcting in the next
+//     hour.
+//   • Min-one-call-per-session-per-hour exemption: if a session has zero
+//     rows in `usage_events` for the current hour bucket, its FIRST call
+//     in this hour is allowed regardless of cap. After that first call
+//     it's gated normally. Guarantees progress across N parallel
+//     sessions on the same key.
+//   • Reset button (Settings → API key) zeros `adjustment_micros` and
+//     re-anchors `adjustment_hour_ts` to the current hour.
+//
+// What's NOT here (removed deliberately from the prior implementation):
+//   • `_inFlight` reservation map. Per-call checking + carry-over
+//     handles drift; the reservation was solving a problem the new
+//     model doesn't have.
+//   • `noteRunStart` / `noteRunEnd` exports. Callers don't need them.
 
 import {
   db,
@@ -48,6 +62,9 @@ import {
   getApiKeyRow,
   getDefaultApiKeyRow,
   getSetting,
+  setApiKeyBudgetAdjustment,
+  resetApiKeyBudgetAdjustment,
+  type ApiKeyRow,
 } from './db';
 import { broadcastAgentEvent, broadcastStateChanged } from './agentEvents';
 import log from 'electron-log';
@@ -55,32 +72,34 @@ import log from 'electron-log';
 const MICROS_PER_USD = 1_000_000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
-/**
- * Conservative reservation for an in-flight turn whose real cost we
- * don't yet have. Sized to a typical single-iteration cost so two
- * sessions that precheck simultaneously when the bucket has $X left
- * can't both pass and collectively spend > $X. Every loop iteration
- * persists its real cost; the reservation only spans the gap between
- * turn-start and the first usage row.
- */
-const TURN_RESERVATION_MICROS = 5 * MICROS_PER_USD;
 
 let _resumeTimer: NodeJS.Timeout | null = null;
-const _bypassNextTurn = new Set<string>();
-/** Per-key in-flight reservation count. Incremented at turn start, decremented at turn end. */
-const _inFlight = new Map<string, number>();
+const _bypassNextCall = new Set<string>();
 
-// ---- Settings + caps ----------------------------------------------------
+// ---- Time helpers -------------------------------------------------------
+
+function startOfDay(ts: number): number {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function startOfHour(ts: number): number {
+  const d = new Date(ts);
+  d.setMinutes(0, 0, 0);
+  return d.getTime();
+}
+
+function startOfNextHour(ts: number): number {
+  return startOfHour(ts) + HOUR_MS;
+}
+
+// ---- Budget settings ----------------------------------------------------
 
 /**
  * Daily budget (USD micros) for an API key, or null when uncapped
- * (governor disabled). Resolution order:
- *   1. The api_keys row's `daily_budget_usd` (per-key).
- *   2. Global setting `budget.dailyBudgetUsd` (fallback for keys with no
- *      per-key cap configured).
- *   3. Legacy `budget.rollingHourCapUsd × 24` (pre-multikey schema; kept
- *      so users on older configs aren't suddenly uncapped).
- *   4. null — uncapped.
+ * (governor disabled). Resolution order — per-key column, then global
+ * setting, then legacy setting × 24 for users on pre-multikey configs.
  */
 export function getDailyBudgetMicros(apiKeyId?: string | null): number | null {
   const row = apiKeyId ? getApiKeyRow(apiKeyId) : getDefaultApiKeyRow();
@@ -101,43 +120,18 @@ export function getDailyBudgetMicros(apiKeyId?: string | null): number | null {
 }
 
 /**
- * Hourly cap (USD micros) for a key — exactly `daily / 24`. Returns null
- * when the key is uncapped. The clock-hour math is: a $80/day key gets
- * $80/24 ≈ $3.333 per hour. Floor-rounded so we don't accidentally allow
- * $0.0001 over from sub-cent rounding.
+ * The base hourly slice = `daily / 24`. Constant given the daily budget
+ * setting; does NOT include the carry-over adjustment. For the actual
+ * effective cap used by the governor, call `getEffectiveHourCapMicros`.
  */
-export function getHourCapMicros(apiKeyId?: string | null): number | null {
+export function getBaseHourCapMicros(apiKeyId?: string | null): number | null {
   const daily = getDailyBudgetMicros(apiKeyId);
   if (daily == null) return null;
   return Math.floor(daily / 24);
 }
 
-// ---- Time + spend queries ----------------------------------------------
+// ---- Spend queries ------------------------------------------------------
 
-function startOfDay(ts: number): number {
-  const d = new Date(ts);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-function startOfHour(ts: number): number {
-  const d = new Date(ts);
-  d.setMinutes(0, 0, 0);
-  return d.getTime();
-}
-
-function startOfNextHour(ts: number): number {
-  return startOfHour(ts) + HOUR_MS;
-}
-
-/**
- * Sum of live-source spend in [from, toExclusive), optionally filtered to
- * a single API key. When `apiKeyId` is null/undefined, sums across ALL
- * keys (used by "All keys" aggregated views). When provided, filters to
- * that key only — legacy events with `api_key_id IS NULL` are excluded
- * from per-key totals so a single key's spend isn't inflated by historical
- * un-keyed activity.
- */
 function spendBetween(
   from: number,
   toExclusive: number,
@@ -181,7 +175,7 @@ export function todaySpendMicros(
   return spendBetween(d, d + DAY_MS, apiKeyId);
 }
 
-/** Rolling 24-hour spend (for the sidebar's "no-budget" fallback display). */
+/** Rolling 24h spend (for the no-budget-set fallback display). */
 export function rollingDaySpendMicros(
   now: number = Date.now(),
   apiKeyId?: string | null
@@ -191,16 +185,11 @@ export function rollingDaySpendMicros(
 
 /**
  * Has session `sessionId` recorded any spend in the current clock-hour
- * bucket? Used by the precheck to grant the min-one-turn-per-session-
- * per-hour exemption: a session that hasn't fired yet this hour gets
- * its first turn even when the bucket is exhausted.
- *
- * We check `usage_events.session_id` rather than turn count because a
- * single turn can produce multiple usage rows (one per loop iteration);
- * any row at all in the bucket means the session has used some budget
- * this hour and the exemption no longer applies.
+ * bucket? Used by the precheck to grant the min-one-call-per-session-
+ * per-hour exemption. We probe `usage_events.session_id`: any row at all
+ * in the bucket means this session has already had its exemption.
  */
-export function sessionHasTurnInCurrentHour(
+export function sessionHasCallInCurrentHour(
   sessionId: string,
   now: number = Date.now()
 ): boolean {
@@ -216,29 +205,107 @@ export function sessionHasTurnInCurrentHour(
   return !!r;
 }
 
-// ---- In-flight reservation ---------------------------------------------
+// ---- Carry-over settlement ---------------------------------------------
 
-function reservedMicros(apiKeyId: string | null | undefined): number {
-  const k = apiKeyId ?? '';
-  return (_inFlight.get(k) ?? 0) * TURN_RESERVATION_MICROS;
+/**
+ * Settle the carry-over adjustment for a key forward to the current
+ * hour, persisting the result. Called on every precheck and budget
+ * status read. Idempotent within a single hour bucket — once
+ * `adjustment_hour_ts` equals `startOfHour(now)`, settle is a no-op.
+ *
+ * After app restart (when many hours may have elapsed), settle walks
+ * from the stored timestamp to the current hour in a single SQL query
+ * using the closed-form math:
+ *
+ *   elapsed_hours = (current_hour_ts − adjustment_hour_ts) / 1h
+ *   total_allowed = elapsed_hours × base + stored_adjustment
+ *   total_spent   = SUM(usage_events in [adjustment_hour_ts, current_hour_ts))
+ *   new_adj       = total_allowed − total_spent
+ *
+ * The math is equivalent to iterating hour-by-hour (because each hour's
+ * `new_adj = effective_cap − spent_in_hour` chains additively), but
+ * does it in O(1) SQL regardless of how long the app was offline.
+ *
+ * Returns the new `(adjustment_micros, hour_ts)` pair as it now exists
+ * in the DB. For uncapped keys (no daily budget set) returns 0/0; the
+ * adjustment is meaningless when there's no cap.
+ */
+function settle(
+  row: ApiKeyRow,
+  now: number
+): { adjustmentMicros: number; hourTs: number } {
+  const base = getBaseHourCapMicros(row.id);
+  if (base == null) {
+    // Uncapped key: no carry-over math to do. Don't touch the columns
+    // either — if the user sets a daily budget later, we'll start
+    // fresh from the current hour at that moment.
+    return {
+      adjustmentMicros: row.adjustment_micros,
+      hourTs: row.adjustment_hour_ts,
+    };
+  }
+  const currentHourTs = startOfHour(now);
+
+  // Uninitialized (hour_ts == 0): anchor to the current hour with a
+  // zero adjustment. This gives every key a clean slate on first read
+  // after the v5 migration.
+  if (row.adjustment_hour_ts === 0) {
+    setApiKeyBudgetAdjustment(row.id, 0, currentHourTs);
+    return { adjustmentMicros: 0, hourTs: currentHourTs };
+  }
+
+  // Already up-to-date or even ahead (clock-skew defensive): nothing
+  // to settle. Returning the stored values keeps the read pure.
+  if (row.adjustment_hour_ts >= currentHourTs) {
+    return {
+      adjustmentMicros: row.adjustment_micros,
+      hourTs: row.adjustment_hour_ts,
+    };
+  }
+
+  // Walk forward. Note: `elapsed` is an integer because both timestamps
+  // are exact hour boundaries (we always store `startOfHour(...)`).
+  const elapsed = Math.round((currentHourTs - row.adjustment_hour_ts) / HOUR_MS);
+  const totalAllowed = elapsed * base + row.adjustment_micros;
+  const totalSpent = spendBetween(row.adjustment_hour_ts, currentHourTs, row.id);
+  const newAdjustment = totalAllowed - totalSpent;
+  setApiKeyBudgetAdjustment(row.id, newAdjustment, currentHourTs);
+  log.info(
+    `[budget] settled key=${row.id} elapsed=${elapsed}h allowed=${(totalAllowed / MICROS_PER_USD).toFixed(2)} spent=${(totalSpent / MICROS_PER_USD).toFixed(2)} new_adj=${(newAdjustment / MICROS_PER_USD).toFixed(2)}`
+  );
+  return { adjustmentMicros: newAdjustment, hourTs: currentHourTs };
 }
 
 /**
- * Reserve a turn's-worth of budget at turn start. Pair with `noteRunEnd`
- * in a finally block so reservations always release. Without this, two
- * sessions that precheck simultaneously when the bucket has $5 left can
- * both pass and collectively spend $10.
+ * Effective cap for the current hour bucket. Calls `settle` first to
+ * roll past hours' over/underspend into the adjustment, then returns
+ * `base + adjustment`. Returns null when the key is uncapped.
+ *
+ * Side effect: persists the settled adjustment if it changed. This is
+ * fine because settle is idempotent and the cost is one SQL UPDATE on
+ * the first read in any new hour.
  */
-export function noteRunStart(apiKeyId: string | null | undefined): void {
-  const k = apiKeyId ?? '';
-  _inFlight.set(k, (_inFlight.get(k) ?? 0) + 1);
+export function getEffectiveHourCapMicros(
+  apiKeyId?: string | null,
+  now: number = Date.now()
+): number | null {
+  const base = getBaseHourCapMicros(apiKeyId);
+  if (base == null) return null;
+  const row = apiKeyId ? getApiKeyRow(apiKeyId) : getDefaultApiKeyRow();
+  if (!row) return base; // shouldn't happen if base is non-null, but defensive
+  const { adjustmentMicros } = settle(row, now);
+  // Negative effective caps are valid (means "this hour starts with
+  // less than zero room" — every call will fail the cap check unless
+  // the exemption applies). Floor at the stored value, not at zero.
+  return base + adjustmentMicros;
 }
 
-export function noteRunEnd(apiKeyId: string | null | undefined): void {
-  const k = apiKeyId ?? '';
-  const cur = _inFlight.get(k) ?? 0;
-  if (cur <= 1) _inFlight.delete(k);
-  else _inFlight.set(k, cur - 1);
+/**
+ * Back-compat alias for callers that previously asked for "the hour
+ * cap". They now want the effective (carry-over-adjusted) cap.
+ */
+export function getHourCapMicros(apiKeyId?: string | null): number | null {
+  return getEffectiveHourCapMicros(apiKeyId);
 }
 
 // ---- Pre-flight ---------------------------------------------------------
@@ -246,38 +313,46 @@ export function noteRunEnd(apiKeyId: string | null | undefined): void {
 interface PrecheckResult {
   allowed: boolean;
   reason: string;
-  /** Hourly cap in micros (0 when uncapped). */
+  /** Effective hourly cap (base + adjustment) in micros. 0 when uncapped. */
   capMicros: number;
-  /** Current clock-hour spend (excludes in-flight reservations) in micros. */
+  /** Current clock-hour spend in micros. */
   spentMicros: number;
-  /** When the user's pending message will be retried automatically (top of next hour). */
+  /** Top-of-next-hour timestamp the resume sweep will re-evaluate at. */
   nextRetryTs: number;
 }
 
 /**
- * Pre-flight check fired before EVERY turn (initial send and every loop
- * iteration). The five-step decision tree mirrors the comment block at
- * the top of this file. Returns enough detail for the agent to emit a
- * `budget_blocked` event with both the cap and the actual spend so the
- * UI banner can show "this hour: $X / $Y".
+ * Pre-flight check fired BEFORE EVERY ANTHROPIC API CALL. Both the main
+ * agent loop and the subagent loop call this on every iteration; not
+ * once per turn. The five-step decision tree:
+ *
+ *   1. Uncapped key → ALLOW.
+ *   2. Force-resume one-shot flag set for this session → ALLOW
+ *      (consumes the flag).
+ *   3. `currentHourSpend < effectiveCap` → ALLOW.
+ *   4. Bucket exhausted, but this session has no calls in the current
+ *      hour yet → ALLOW with reason `first-call-this-hour exemption`.
+ *      (Every session that's trying to make progress gets at least one
+ *      API call per hour regardless of cap.)
+ *   5. Otherwise → BLOCK; the caller pauses and the resume sweep will
+ *      re-check at the top of the next hour.
  */
-export function precheckTurn(
+export function precheckCall(
   sessionId?: string,
-  apiKeyId?: string | null
+  apiKeyId?: string | null,
+  now: number = Date.now()
 ): PrecheckResult {
-  const now = Date.now();
   const nextRetryTs = startOfNextHour(now);
-  const cap = getHourCapMicros(apiKeyId);
 
-  // Step 1: uncapped key → always allow.
+  // Step 1.
+  const cap = getEffectiveHourCapMicros(apiKeyId, now);
   if (cap == null) {
     return { allowed: true, reason: '', capMicros: 0, spentMicros: 0, nextRetryTs };
   }
 
-  // Step 2: force-resume one-shot. Consumed atomically so the next
-  // turn after this one will be checked normally.
-  if (sessionId && _bypassNextTurn.has(sessionId)) {
-    _bypassNextTurn.delete(sessionId);
+  // Step 2. One-shot bypass for "Force resume".
+  if (sessionId && _bypassNextCall.has(sessionId)) {
+    _bypassNextCall.delete(sessionId);
     log.info(`[budget] bypass consumed for ${sessionId}`);
     return {
       allowed: true,
@@ -289,63 +364,96 @@ export function precheckTurn(
   }
 
   const spent = currentHourSpendMicros(now, apiKeyId);
-  const reserved = reservedMicros(apiKeyId);
 
-  // Step 3: bucket has room → allow.
-  if (spent + reserved < cap) {
+  // Step 3. Room in the bucket.
+  if (spent < cap) {
     return { allowed: true, reason: '', capMicros: cap, spentMicros: spent, nextRetryTs };
   }
 
-  // Step 4: bucket exhausted, but this session hasn't fired any turn
-  // in the current clock hour → grant the min-one-turn exemption. The
-  // exemption is checked AFTER the bucket-room check so a session
-  // doesn't waste its exemption when there was budget for it anyway.
-  if (sessionId && !sessionHasTurnInCurrentHour(sessionId, now)) {
+  // Step 4. Min-one-call exemption. The session hasn't burned anything
+  // in this hour yet — let it through, even if the bucket is empty or
+  // already in the red (cap can be negative if the previous hour
+  // overshot by a lot).
+  if (sessionId && !sessionHasCallInCurrentHour(sessionId, now)) {
     return {
       allowed: true,
-      reason: 'first-turn-this-hour exemption',
+      reason: 'first-call-this-hour exemption',
       capMicros: cap,
       spentMicros: spent,
       nextRetryTs,
     };
   }
 
-  // Step 5: blocked.
+  // Step 5. Blocked.
   return {
     allowed: false,
-    reason:
-      reserved > 0
-        ? `hour spend ${(spent / MICROS_PER_USD).toFixed(2)} + in-flight ${(reserved / MICROS_PER_USD).toFixed(2)} ≥ cap ${(cap / MICROS_PER_USD).toFixed(2)}`
-        : `hour spend ${(spent / MICROS_PER_USD).toFixed(2)} ≥ cap ${(cap / MICROS_PER_USD).toFixed(2)}`,
+    reason: `hour spend ${(spent / MICROS_PER_USD).toFixed(2)} ≥ effective cap ${(cap / MICROS_PER_USD).toFixed(2)}`,
     capMicros: cap,
     spentMicros: spent,
     nextRetryTs,
   };
 }
 
+/**
+ * Back-compat alias for callers that imported the old per-turn name.
+ * Same behavior; just the function that fires before every API call.
+ */
+export const precheckTurn = precheckCall;
+
 // ---- Force resume ------------------------------------------------------
 
 /**
  * Mark a session to bypass the NEXT precheck. One-shot — once consumed,
- * subsequent turns are gated normally. Use sparingly; this is the
- * "I need this critical task done now even though I'm over budget"
- * escape hatch wired to the sidebar's "Force resume" button.
+ * subsequent calls are gated normally. Wired to the sidebar's "Force
+ * resume" button for the "I need this critical turn done now even
+ * though I'm over budget" escape hatch.
  */
 export function setBypassNextTurn(sessionId: string): void {
-  _bypassNextTurn.add(sessionId);
+  _bypassNextCall.add(sessionId);
+}
+
+// ---- Reset --------------------------------------------------------------
+
+/**
+ * Zero out a key's accumulated carry-over and re-anchor it to the
+ * current hour. `usage_events` rows are NOT deleted (the historical
+ * spend totals stay correct); only the adjustment chain is reset, so
+ * the next hour's effective cap is just `base_hourly` again.
+ *
+ * Used by the Settings "Reset overages/underages" button.
+ */
+export function resetBudgetAdjustment(apiKeyId: string, now: number = Date.now()): void {
+  resetApiKeyBudgetAdjustment(apiKeyId, startOfHour(now));
+  log.info(`[budget] reset carry-over adjustment for key=${apiKeyId}`);
 }
 
 // ---- Resume sweep ------------------------------------------------------
 
 /**
  * Runs every minute. Walks `sleeping-budget` sessions and wakes any
- * whose hourly bucket has refilled (current hour spend < hourly cap).
- * The typical wake trigger is the top of the next clock hour — when
- * the bucket rolls over, `currentHourSpendMicros` drops to whatever
- * spend has accumulated since the rollover, which is usually 0.
+ * whose hourly bucket has room (or whose min-one-call exemption now
+ * applies in the current hour). Typical wake trigger is the top of the
+ * next clock hour: settle rolls past spend into the adjustment, the
+ * new bucket's spend is 0, and `spent < effectiveCap` becomes true.
  *
- * Also acts as crash recovery: if the app was closed while paused, the
- * startup tick re-fires any pending text whose bucket now has room.
+ * Two resume modes — the sweep picks the right one per session:
+ *
+ *   • `pending_user_text` is non-empty → fresh turn. The user typed a
+ *     message that was parked (because precheck blocked at the start
+ *     of the turn) or accumulated multiple parked messages. Call
+ *     `runUserTurn` with that text; it'll append the message to the
+ *     JSONL and start the loop.
+ *
+ *   • `pending_user_text` is empty → mid-flight pause. The agent loop
+ *     was in the middle of a turn and the per-call precheck blocked
+ *     before the next API call. The JSONL is the source of truth and
+ *     already contains everything (user message + intermediate
+ *     assistant/tool_result rounds). Call `runUserTurn` with an empty
+ *     `userText` AND `continueExisting: true` so it skips appending a
+ *     new user message and just re-enters the loop.
+ *
+ * Also acts as crash recovery: if the app was killed while paused, the
+ * startup sweep finds the row and resumes it.
  */
 async function resumeSweep() {
   const sleepers = listSessionsByState('sleeping-budget');
@@ -355,36 +463,47 @@ async function resumeSweep() {
 
   const now = Date.now();
   for (const s of sleepers) {
-    const cap = getHourCapMicros(s.api_key_id);
+    const cap = getEffectiveHourCapMicros(s.api_key_id, now);
     let canWake = false;
     if (cap == null) {
       canWake = true; // key became uncapped while sleeping
     } else {
       const spent = currentHourSpendMicros(now, s.api_key_id);
-      const reserved = reservedMicros(s.api_key_id);
-      if (spent + reserved < cap) canWake = true;
-      // The min-one-turn exemption ALSO wakes sleepers — if the new
-      // hour has rolled over and the session hasn't fired in it, it
-      // qualifies for its first turn even if other sessions on the
-      // key have already drained the bucket.
-      else if (!sessionHasTurnInCurrentHour(s.id, now)) canWake = true;
+      if (spent < cap) canWake = true;
+      // The min-one-call exemption ALSO wakes sleepers — if the hour
+      // has rolled over and this session hasn't fired in the new
+      // bucket, it qualifies even when other sessions on the key have
+      // already drained it.
+      else if (!sessionHasCallInCurrentHour(s.id, now)) canWake = true;
     }
     if (!canWake) continue;
 
     setSessionState(s.id, 'idle');
     broadcastStateChanged(s.id, 'idle');
     broadcastAgentEvent({ type: 'budget_woke', sessionId: s.id });
-    if (s.pending_user_text && s.pending_user_text.trim()) {
-      const pending = s.pending_user_text;
-      // Clear pending FIRST so weird timing on the resume can't
-      // double-fire the same message.
+
+    const pending = s.pending_user_text?.trim();
+    if (pending) {
+      // Pre-turn pause: never started, fresh user text waiting.
       setSessionPending(s.id, null, null);
-      log.info(`[budget] auto-resuming ${s.id} with pending message`);
+      log.info(`[budget] auto-resuming ${s.id} with pending message (fresh turn)`);
       runUserTurn({
         sessionId: s.id,
         projectId: s.project_id,
         cwd: s.cwd ?? '',
         userText: pending,
+        seedFromJsonl: s.jsonl_path,
+      }).catch((e) => log.error(`[budget] auto-resume of ${s.id} failed`, e));
+    } else {
+      // Mid-flight pause: JSONL has the truth. Continue without
+      // injecting a new user message.
+      log.info(`[budget] auto-resuming ${s.id} (continuing in-flight turn)`);
+      runUserTurn({
+        sessionId: s.id,
+        projectId: s.project_id,
+        cwd: s.cwd ?? '',
+        userText: '',
+        continueExisting: true,
         seedFromJsonl: s.jsonl_path,
       }).catch((e) => log.error(`[budget] auto-resume of ${s.id} failed`, e));
     }
