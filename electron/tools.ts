@@ -43,6 +43,13 @@ export interface ToolContext {
   memory?: MemoryBundle;
   /** Abort signal so blocking tools can wake on user-initiated cancel. */
   signal?: AbortSignal;
+  /**
+   * API key id this turn is being charged to. Currently consumed by the
+   * subagent tools (`Task` / `Plan` / `Execute` / `Review`) so the child
+   * call lands in the same per-key budget bucket and ledger as the
+   * parent. Other tools ignore it.
+   */
+  apiKeyId?: string | null;
 }
 
 export interface ToolDef {
@@ -1063,6 +1070,185 @@ const WAIT_FOR_USER: ToolDef = {
   },
 };
 
+// ---- Subagent tools ------------------------------------------------------
+//
+// `Task` is the generic primitive: caller picks a role hint and provides a
+// freeform prompt. `Plan`, `Execute`, and `Review` are preset wrappers that
+// hardwire the role, intentionally restricting the parent's knobs so the
+// model uses the right phase for the right job. All four delegate to
+// `runSubagent` in `electron/subagent.ts`, which spins up a fresh Anthropic
+// call with a curated tool subset and a role-specific system prompt. The
+// parent agent's tool call BLOCKS until the child returns its final text —
+// no parallelism, no recursion (children cannot spawn grandchildren).
+//
+// We import lazily inside `execute` to avoid a circular module load:
+// subagent.ts imports `TOOLS` to look up tool schemas, and TOOLS imports
+// the subagent runners. The `await import` defers the resolution until
+// runtime, when both modules are fully initialized.
+
+const TASK: ToolDef = {
+  schema: {
+    name: 'Task',
+    description:
+      'Spawn a subagent in a fresh context window. Use when a chunk of work would consume too much of your own context (e.g. exhaustive code search, multi-file refactor, deep review). The subagent runs sequentially (you wait), shares your API key + budget, and returns its final text as your tool_result. It CANNOT spawn further subagents and has no access to TodoWrite or WaitForUser. Pick the role that matches the work: "plan" (read-only investigation + planning), "execute" (code edits + verification), "review" (read-only critique), or "general" (anything else; same toolset as execute).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        description: {
+          type: 'string',
+          description: 'Short title for logs and audit (3-8 words).',
+        },
+        prompt: {
+          type: 'string',
+          description:
+            'The task body the subagent receives as its only user message. Be specific about goals, constraints, and what you want as output. The subagent has no memory of your conversation outside this prompt.',
+        },
+        role: {
+          type: 'string',
+          enum: ['plan', 'execute', 'review', 'general'],
+          description:
+            'Role hint that picks the subagent\'s system prompt + tool subset. Default: "general".',
+        },
+      },
+      required: ['description', 'prompt'],
+    },
+  },
+  async execute(input, ctx) {
+    const { runSubagent } = await import('./subagent');
+    const role = (input.role || 'general') as
+      | 'plan'
+      | 'execute'
+      | 'review'
+      | 'general';
+    return runSubagent(
+      {
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId || '',
+        cwd: ctx.cwd,
+        apiKeyId: ctx.apiKeyId ?? null,
+        signal: ctx.signal,
+        memory: ctx.memory,
+      },
+      {
+        role,
+        description: String(input.description ?? 'task'),
+        prompt: String(input.prompt ?? ''),
+      }
+    );
+  },
+};
+
+const PLAN: ToolDef = {
+  schema: {
+    name: 'Plan',
+    description:
+      'Spawn a planning subagent in a fresh context. The child READS the codebase (Read/Glob/Grep/recall_memory) and returns a numbered, file-grounded plan with risks and an effort estimate. It CANNOT edit, write, or modify any state. Use this when the task ahead is non-trivial and you want a planning pass before committing to execution — keeps your own context small and produces a structured handoff to a follow-up Execute call.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task: {
+          type: 'string',
+          description:
+            'What needs to be planned. Include constraints, target files (if you know them), and the success criteria.',
+        },
+      },
+      required: ['task'],
+    },
+  },
+  async execute(input, ctx) {
+    const { runSubagent } = await import('./subagent');
+    return runSubagent(
+      {
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId || '',
+        cwd: ctx.cwd,
+        apiKeyId: ctx.apiKeyId ?? null,
+        signal: ctx.signal,
+        memory: ctx.memory,
+      },
+      {
+        role: 'plan',
+        description: 'plan',
+        prompt: String(input.task ?? ''),
+      }
+    );
+  },
+};
+
+const EXECUTE: ToolDef = {
+  schema: {
+    name: 'Execute',
+    description:
+      'Spawn an execution subagent in a fresh context. The child has full edit tools (Read/Write/Edit/Bash/Grep/Glob/Wait*) MINUS Task, Plan, Execute, Review, TodoWrite, WaitForUser. Use when you have a clear, scoped change in mind and want it shipped without using up your own context on the diff/test loop. Pass the plan you already have — vague prompts produce sloppy work.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        plan: {
+          type: 'string',
+          description:
+            'The plan to execute. Be specific: file paths, the exact change, and how to verify (commands to run, tests to look for). The subagent will not see your prior context.',
+        },
+      },
+      required: ['plan'],
+    },
+  },
+  async execute(input, ctx) {
+    const { runSubagent } = await import('./subagent');
+    return runSubagent(
+      {
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId || '',
+        cwd: ctx.cwd,
+        apiKeyId: ctx.apiKeyId ?? null,
+        signal: ctx.signal,
+        memory: ctx.memory,
+      },
+      {
+        role: 'execute',
+        description: 'execute',
+        prompt: String(input.plan ?? ''),
+      }
+    );
+  },
+};
+
+const REVIEW: ToolDef = {
+  schema: {
+    name: 'Review',
+    description:
+      'Spawn a review subagent in a fresh context. The child reads the changed files (Read/Glob/Grep) and returns a structured critique: "Findings:" (bug-shaped issues), "Suggestions:" (non-blocking improvements), and a verdict (APPROVED or CHANGES REQUESTED). Read-only — cannot modify code. Use after an Execute pass when you want a second opinion before declaring done.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        work: {
+          type: 'string',
+          description:
+            'Describe what was done, where (file paths + line ranges), and what the reviewer should focus on (correctness, perf, security, style, test coverage). The subagent will read the files itself.',
+        },
+      },
+      required: ['work'],
+    },
+  },
+  async execute(input, ctx) {
+    const { runSubagent } = await import('./subagent');
+    return runSubagent(
+      {
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId || '',
+        cwd: ctx.cwd,
+        apiKeyId: ctx.apiKeyId ?? null,
+        signal: ctx.signal,
+        memory: ctx.memory,
+      },
+      {
+        role: 'review',
+        description: 'review',
+        prompt: String(input.work ?? ''),
+      }
+    );
+  },
+};
+
 // ---- Registry ----
 
 export const TOOLS: Record<string, ToolDef> = {
@@ -1085,6 +1271,10 @@ export const TOOLS: Record<string, ToolDef> = {
   list_skills: LIST_SKILLS,
   read_skill: READ_SKILL,
   WaitForUser: WAIT_FOR_USER,
+  Task: TASK,
+  Plan: PLAN,
+  Execute: EXECUTE,
+  Review: REVIEW,
 };
 
 export function getToolSchemas(): Anthropic.Tool[] {

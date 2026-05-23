@@ -28,6 +28,7 @@ npm run test:ui
 | `tests/memory.test.ts` | `electron/memory.ts` | `claudeSlugForCwd` (Windows + POSIX), `recallFromBundle` substring search with header preservation and result cap |
 | `tests/store.test.ts` | `src/lib/store.ts` | TodoWrite → currentTodos: first plan, wholesale replacement, empty-array clears, malformed leaves alone, drops invalid items, non-TodoWrite tools don't touch the plan |
 | `tests/CurrentPlanPanel.test.tsx` | `src/components/CurrentPlanPanel.tsx` | Renders nothing when empty / null, item list rendering per status, N/M progress count, collapse toggle, plan replacement reflected |
+| `tests/subagent.test.ts` | `electron/subagent.ts` | Role tool subset enforcement (no Task/Plan/Execute/Review recursion, no TodoWrite, no WaitForUser), end_turn → final text, tool_use round-trip, refusal of disallowed tool names, abort propagation, budget pre-flight blocking, MAX_SUBAGENT_ROUNDS cap, role-specific system prompt, server-side context_management config |
 
 ## Test discipline
 

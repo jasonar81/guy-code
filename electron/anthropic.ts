@@ -74,7 +74,7 @@ export const DEFAULT_MODEL = 'claude-opus-4-7[1m]';
  * `[1m]` (Claude Code convention) and `-1m` (informal) so users can type
  * either in Settings without confusion.
  */
-function parseExtendedContext(model: string): { id: string; want1m: boolean } {
+export function parseExtendedContext(model: string): { id: string; want1m: boolean } {
   let id = model.trim();
   let want1m = false;
   // Try `[1m]` first — that's the canonical Claude Code form.
@@ -210,6 +210,18 @@ export function buildSystemBlocks(args: {
         `  • Conversation recall: when the user refers to something earlier in THIS conversation that you don't remember (e.g. "what did we decide about X?", "go back and find the numbers from before", "what command did I have you run?"), call \`search_conversation\` with a unique phrase from what they described. The full transcript is on disk and that tool greps it — older turns get compacted out of your context window, so don't assume "not in my context" means "didn't happen". Don't conflate this with \`recall_memory\` (which only searches saved CLAUDE.md/MEMORY.md leaves, NOT chat history).`,
         `  • If the user's message looks like a literal tool invocation — e.g. "WaitForTime(5000)", "Bash(ls)", "ToolName(arg=value)" — just execute the tool. Don't ask "did you mean to invoke this?" or otherwise second-guess. Parse the args, run the tool, summarize the result. The user is testing or scripting; trust them.`,
         `  • Never ask a clarifying question and then proceed in the same turn. Either ask via WaitForUser and stop, or proceed silently. Asking + doing is the worst outcome — it wastes the user's attention.`,
+        ``,
+        `Subagents — when to delegate:`,
+        `  You have four subagent tools: \`Task\` (generic), \`Plan\`, \`Execute\`, \`Review\`. Each spawns a child agent in a fresh context window with a curated tool subset. The child runs sequentially (you wait for the result), shares your API key + budget, and CANNOT spawn its own subagents. Its only output is the final assistant text it produces, which you receive as the tool_result.`,
+        `  Use a subagent when ANY of these apply:`,
+        `    (a) The work would consume large chunks of YOUR context window — exhaustive code search across many files, reading 20+ files, deep multi-file refactor, large diff review. The child does the reading; you only see the conclusion.`,
+        `    (b) You want a clean handoff between phases — Plan a thing, then Execute the plan in a fresh window where the planning chatter doesn't pollute the actual work, then Review the result without bias from the implementer's own narration.`,
+        `    (c) The user explicitly asks for a "fresh take" / "clean look" / "second opinion" / "re-read with fresh eyes" — that's a Review or general Task call.`,
+        `  Do NOT use a subagent when:`,
+        `    • The task is small (< 5 tool calls). The overhead of spinning up a fresh window and re-reading context isn't worth it.`,
+        `    • You'd just be passing through the user's request verbatim with no added value. The subagent is a context-isolation tool, not a delegation-of-responsibility tool — you're still on the hook for the result.`,
+        `    • You need the child to remember earlier conversation turns. It can't — write what it needs to know into the prompt.`,
+        `  When you call a subagent, write a 1-2 sentence narration first explaining WHY you're spawning it (what context pressure or phase boundary you're addressing). Then call the tool. Don't narrate after the call until the result comes back — the subagent's run can take a while and silence is fine because the user sees the tool card pulse.`,
       ].join('\n'),
       cache_control: CACHE_1H,
     },

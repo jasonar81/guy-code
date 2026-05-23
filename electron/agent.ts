@@ -964,6 +964,10 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           projectId,
           memory,
           signal: ctrl.signal,
+          // Forward the resolved api key so subagent tools (Task / Plan /
+          // Execute / Review) charge their child calls to the same key
+          // and budget bucket the parent is using.
+          apiKeyId: resolvedApiKeyId,
         });
         const ms = Date.now() - start;
         // Audit row for this tool call. Output is summarized to keep DB
