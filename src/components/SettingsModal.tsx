@@ -1,0 +1,817 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  X,
+  KeyRound,
+  Cpu,
+  Save,
+  Plug,
+  LogIn,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  Plus,
+  Star,
+  Trash2,
+  Edit3,
+} from 'lucide-react';
+import clsx from 'clsx';
+import type { McpServerStatus, ApiKey } from '@/types';
+import { useApp } from '@/lib/store';
+
+interface Props {
+  open: boolean;
+  onClose: () => void;
+}
+
+// Keep this in sync with `electron/anthropic.ts` DEFAULT_MODEL. The `[1m]`
+// suffix is the Claude Code convention for opting into the 1M-context
+// window — at sub-1M sizes the 200K cap forces aggressive compaction.
+const DEFAULT_MODEL = 'claude-opus-4-7[1m]';
+
+export function SettingsModal({ open, onClose }: Props) {
+  const [model, setModel] = useState<string>(DEFAULT_MODEL);
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  // `mcpMsg` reuses the previous reset-banner area to surface MCP
+  // sign-in / sign-out failures so the user has somewhere to see them.
+  const [mcpMsg, setMcpMsg] = useState<string | null>(null);
+  const [mcpServers, setMcpServers] = useState<McpServerStatus[]>([]);
+  const [signingIn, setSigningIn] = useState<string | null>(null);
+
+  // Multi-key support lives in the global store so the Sidebar's budget pill
+  // and the SessionContextMenu can share the same source of truth without an
+  // extra IPC round-trip.
+  const apiKeys = useApp((s) => s.apiKeys);
+  const refreshApiKeys = useApp((s) => s.refreshApiKeys);
+
+  // Track whether the current "click" started inside the modal panel. If so,
+  // we don't dismiss on backdrop click. Without this, dragging a text
+  // selection from an input out into the backdrop area causes the modal to
+  // close mid-edit (the `click` event lands on the backdrop, not the panel).
+  const mouseDownInside = useRef(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      const m = await window.api.settings.get('model');
+      if (cancelled) return;
+      setModel(m && m.trim() ? m : DEFAULT_MODEL);
+      setSavedAt(null);
+      setMcpMsg(null);
+      // Make sure the keys list is fresh whenever the user opens
+      // Settings (a key may have been added/removed via another path).
+      refreshApiKeys();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, refreshApiKeys]);
+
+  // Pull MCP status while open, poll every 3s in case a sign-in completes.
+  const refreshMcp = useCallback(async () => {
+    try {
+      const r = await window.api.mcp.list();
+      setMcpServers(r);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    refreshMcp();
+    const t = setInterval(refreshMcp, 3000);
+    return () => clearInterval(t);
+  }, [open, refreshMcp]);
+
+  if (!open) return null;
+
+  const onSave = async () => {
+    // The Settings modal only persists the model now. Per-key budgets and
+    // the keys themselves are stored as the user edits them via the
+    // ApiKeysSection (each row's save button), so they're already on disk
+    // by the time the user clicks the modal's Save. Keeping a single Save
+    // for the model preserves the previous "edit-then-commit" feel for
+    // the one global setting that still works that way.
+    setSaving(true);
+    try {
+      await window.api.settings.set('model', model.trim() || DEFAULT_MODEL);
+      // Legacy fallback values exist in the old settings table — if the
+      // user landed here from a pre-migration build we want any in-flight
+      // single-budget config to be cleared so the new per-key values are
+      // the only source of truth going forward. This is idempotent.
+      await window.api.settings.set('budget.rollingHourCapUsd', '');
+      setSavedAt(Date.now());
+      // Settings saved successfully — dismiss the modal. The user expects a
+      // single click to commit-and-close; sticking around forces a second click.
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onSignIn = async (name: string) => {
+    setSigningIn(name);
+    try {
+      const r = await window.api.mcp.signIn(name);
+      if (!r.ok) {
+        setMcpMsg(`Sign-in to ${name} failed: ${r.error ?? 'unknown error'}`);
+      }
+    } finally {
+      setSigningIn(null);
+      refreshMcp();
+    }
+  };
+
+  const onSignOut = async (name: string) => {
+    if (
+      !window.confirm(
+        `Sign out of ${name}?\n\nThis clears the saved OAuth tokens and disconnects the server. You'll need to sign in again to use it (which is the right flow after editing scope in your .mcp.json).`
+      )
+    ) {
+      return;
+    }
+    try {
+      const r = await window.api.mcp.signOut(name);
+      if (!r.ok) {
+        setMcpMsg(`Sign-out of ${name} failed: ${r.error ?? 'unknown error'}`);
+      }
+    } finally {
+      refreshMcp();
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      onMouseDown={(e) => {
+        // Only treat clicks that BEGAN on the backdrop as dismiss intent.
+        // Clicks that began inside the panel (e.g. drag-selecting text out
+        // of an input) should not close the modal.
+        if (e.target === e.currentTarget) mouseDownInside.current = false;
+      }}
+      onClick={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (mouseDownInside.current) {
+          mouseDownInside.current = false;
+          return;
+        }
+        onClose();
+      }}
+    >
+      <div
+        className="w-[520px] max-w-[90vw] max-h-[90vh] flex flex-col rounded-lg border border-border bg-bg-panel shadow-xl"
+        onMouseDown={() => {
+          mouseDownInside.current = true;
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+          <h2 className="text-sm font-semibold text-text">Settings</h2>
+          <button
+            onClick={onClose}
+            className="p-1 rounded text-text-dim hover:text-text hover:bg-bg-hover"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+        </header>
+
+        <div className="px-4 py-4 space-y-5 flex-1 min-h-0 overflow-y-auto">
+          <Field
+            icon={<Cpu size={14} />}
+            label="Model"
+            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-opus-4-7[1m]) — strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless."
+          >
+            <input
+              type="text"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
+              placeholder={DEFAULT_MODEL}
+            />
+          </Field>
+
+          <ApiKeysSection keys={apiKeys} />
+
+          {mcpMsg && (
+            <div className="pt-2 border-t border-border">
+              <p className="text-[11px] text-text-dim leading-snug">{mcpMsg}</p>
+            </div>
+          )}
+
+          <McpServersSection
+            servers={mcpServers}
+            signingIn={signingIn}
+            onSignIn={onSignIn}
+            onSignOut={onSignOut}
+          />
+        </div>
+
+        <footer className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border shrink-0">
+          {savedAt && (
+            <span className="text-[11px] text-text-dim mr-auto">Saved.</span>
+          )}
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 text-[12px] rounded-md text-text-dim hover:text-text hover:bg-bg-hover"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onSave}
+            disabled={saving}
+            className={clsx(
+              'inline-flex items-center gap-1.5 px-3 py-1.5 text-[12px] rounded-md font-medium transition-colors',
+              saving
+                ? 'bg-bg-hover text-text-dim'
+                : 'bg-accent text-white hover:bg-accent-dim'
+            )}
+          >
+            <Save size={12} />
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function McpServersSection({
+  servers,
+  signingIn,
+  onSignIn,
+  onSignOut,
+}: {
+  servers: McpServerStatus[];
+  signingIn: string | null;
+  onSignIn: (name: string) => void;
+  onSignOut: (name: string) => void;
+}) {
+  // Sort: needs-auth first (action items), then connected, then disabled, then errors.
+  const order: Record<McpServerStatus['status'], number> = {
+    'needs-auth': 0,
+    connecting: 1,
+    connected: 2,
+    error: 3,
+    disabled: 4,
+  };
+  const sorted = [...servers].sort(
+    (a, b) => order[a.status] - order[b.status] || a.name.localeCompare(b.name)
+  );
+
+  return (
+    <div className="pt-2 border-t border-border">
+      <div className="flex items-center gap-1.5 text-[12px] font-medium text-text mb-1.5">
+        <Plug size={14} className="text-text-dim" />
+        Integrations
+      </div>
+      <p className="text-[11px] text-text-dim leading-snug mb-2">
+        MCP servers from <code className="font-mono">~/.claude.json</code> and
+        installed Claude Code plugins. Enable a plugin by adding its name to{' '}
+        <code className="font-mono">~/.guycode/mcp.json</code> under{' '}
+        <code className="font-mono">enabledPlugins</code>, or set{' '}
+        <code className="font-mono">autoEnableAllPlugins: true</code> to load
+        every installed plugin. Restart to apply.
+      </p>
+      <p className="text-[11px] text-text-dim leading-snug mb-2">
+        <strong className="text-text-muted">Can't write to Confluence / Jira?</strong> The
+        Atlassian MCP server defaults to read-only scopes. Add an explicit{' '}
+        <code className="font-mono">oauth.scope</code> to its entry in{' '}
+        <code className="font-mono">~/.guycode/mcp.json</code> — e.g.{' '}
+        <code className="font-mono break-all">
+          "read:jira-work write:jira-work read:confluence-content.all
+          write:confluence-content write:confluence-space offline_access"
+        </code>{' '}
+        — then click "Sign out" below and "Sign in" again. The granted scopes
+        are logged when tokens are saved (check the Electron logs).
+      </p>
+      {sorted.length === 0 ? (
+        <p className="text-[11px] text-text-dim italic">
+          No MCP servers detected. Add one to{' '}
+          <code className="font-mono">~/.guycode/mcp.json</code>.
+        </p>
+      ) : (
+        <div className="space-y-1">
+          {sorted.map((s) => (
+            <McpRow
+              key={s.name}
+              s={s}
+              busy={signingIn === s.name}
+              onSignIn={() => onSignIn(s.name)}
+              onSignOut={() => onSignOut(s.name)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function McpRow({
+  s,
+  busy,
+  onSignIn,
+  onSignOut,
+}: {
+  s: McpServerStatus;
+  busy: boolean;
+  onSignIn: () => void;
+  onSignOut: () => void;
+}) {
+  // Expandable details panel: tool names, configured scope, source path.
+  // Collapsed by default; the user opens it when investigating something
+  // (typical case: "why doesn't this server have write tools?").
+  const [expanded, setExpanded] = useState(false);
+  let icon: React.ReactNode;
+  let label: string;
+  let labelCls = 'text-text-muted';
+  switch (s.status) {
+    case 'connected':
+      icon = <CheckCircle2 size={12} className="text-state-success" />;
+      label = `${s.toolCount} tool${s.toolCount === 1 ? '' : 's'}`;
+      break;
+    case 'needs-auth':
+      icon = <LogIn size={12} className="text-state-attention" />;
+      label = 'Sign-in required';
+      labelCls = 'text-state-attention';
+      break;
+    case 'connecting':
+      icon = <Loader2 size={12} className="text-text-dim animate-spin" />;
+      label = 'Connecting…';
+      break;
+    case 'error':
+      icon = <AlertCircle size={12} className="text-state-error" />;
+      label = s.error ? s.error.slice(0, 60) : 'Error';
+      labelCls = 'text-state-error';
+      break;
+    case 'disabled':
+      icon = <X size={12} className="text-text-dim" />;
+      label = 'Disabled';
+      labelCls = 'text-text-dim';
+      break;
+  }
+  // Probe for write tools — used to color the diagnostics hint when a
+  // server has read tools but no write tools (the classic Atlassian
+  // read-only-scope symptom).
+  const hasWriteTools = s.toolNames.some((t) => /write|create|update|delete|post|put|patch/i.test(t));
+  const showWriteHint =
+    s.status === 'connected' &&
+    s.toolNames.length > 0 &&
+    !hasWriteTools &&
+    s.needsOAuth;
+  return (
+    <div className="rounded-md border border-border bg-bg/50 text-[12px]">
+      <div
+        className="flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-bg-hover/40"
+        onClick={() => setExpanded((v) => !v)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
+      >
+        <div className="shrink-0">{icon}</div>
+        <div className="flex-1 min-w-0">
+          <div className="font-mono text-text truncate">{s.name}</div>
+          <div className={clsx('text-[10px] truncate', labelCls)}>{label}</div>
+        </div>
+        {/* Sign in (retry-able) button is shown for any state where signing
+            in makes sense: needs-auth (no tokens yet) and error (last
+            sign-in attempt failed). For error we surface BOTH Sign in and
+            Sign out — Sign in is the natural retry, Sign out is the
+            "nuke saved state" escape hatch. The previous build was hiding
+            the Sign in button on error, leaving the user stuck with only
+            Sign out (which wipes tokens that might already be gone) and
+            no way to retry the flow without restarting the app. */}
+        {(s.status === 'needs-auth' || s.status === 'error') && s.needsOAuth && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onSignIn();
+            }}
+            disabled={busy}
+            className={clsx(
+              'shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border',
+              busy
+                ? 'border-border text-text-dim'
+                : 'border-state-attention/50 text-state-attention hover:bg-state-attention/10'
+            )}
+            title={
+              s.status === 'error'
+                ? `Retry sign-in for ${s.name}. The last attempt failed: ${s.error ?? 'unknown error'}.`
+                : `Open your browser to sign in to ${s.name}. Tokens are saved locally.`
+            }
+          >
+            {busy ? <Loader2 size={10} className="animate-spin" /> : <LogIn size={10} />}
+            {busy ? 'Signing in…' : s.status === 'error' ? 'Retry' : 'Sign in'}
+          </button>
+        )}
+        {(s.status === 'connected' || s.status === 'error') && s.needsOAuth && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onSignOut();
+            }}
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border text-text-dim hover:text-text hover:border-border-strong"
+            title={`Clear saved OAuth tokens for ${s.name}. Use after editing scope in your .mcp.json so the next sign-in requests the new scopes, or after a failed sign-in to wipe stale state before retrying.`}
+          >
+            Sign out
+          </button>
+        )}
+      </div>
+      {expanded && (
+        <div className="px-2 pb-2 pt-1 border-t border-border/60 space-y-1.5">
+          <div className="text-[10px] text-text-dim">
+            <span className="text-text-muted">source:</span>{' '}
+            <code className="font-mono">{s.source}</code>
+          </div>
+          {s.needsOAuth && (
+            <div className="text-[10px] text-text-dim">
+              <span className="text-text-muted">configured scope:</span>{' '}
+              {s.configuredScope ? (
+                <code className="font-mono break-all">{s.configuredScope}</code>
+              ) : (
+                <span className="italic">
+                  (none — using server defaults, may be read-only)
+                </span>
+              )}
+            </div>
+          )}
+          {s.toolNames.length > 0 && (
+            <div className="text-[10px] text-text-dim">
+              <span className="text-text-muted">tools ({s.toolNames.length}):</span>{' '}
+              <span className="font-mono">{s.toolNames.join(', ')}</span>
+            </div>
+          )}
+          {showWriteHint && (
+            <div className="text-[10px] text-state-attention bg-state-attention/5 border border-state-attention/30 rounded p-1.5">
+              <strong>No write-looking tools exposed.</strong> If you expected
+              to be able to write/create/update, the OAuth tokens may have
+              been granted read-only scopes. Edit{' '}
+              <code className="font-mono">~/.guycode/mcp.json</code> to add an
+              explicit <code className="font-mono">oauth.scope</code>, then
+              click "Sign out" and re-sign in.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Field({
+  icon,
+  label,
+  hint,
+  children,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <label className="flex items-center gap-1.5 text-[12px] font-medium text-text mb-1">
+        <span className="text-text-dim">{icon}</span>
+        {label}
+      </label>
+      {children}
+      {hint && (
+        <p className="mt-1 text-[11px] text-text-dim leading-snug">{hint}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Multi-API-key management UI. Each key is an editable row with its own
+ * daily budget. One row is the "Default" (marked with a Star) — that's
+ * what new sessions inherit. Sessions can override their key via the
+ * sidebar's right-click context menu.
+ *
+ * Adding a key reveals an inline form (key string, name, optional budget
+ * caps). Editing a row toggles it into the same form layout. The same
+ * keystroke-stopPropagation that the SessionContextMenu uses isn't
+ * required here since the modal already swallows keyboard events at the
+ * panel boundary.
+ */
+function ApiKeysSection({ keys }: { keys: ApiKey[] }) {
+  const createKey = useApp((s) => s.createApiKey);
+  const updateKey = useApp((s) => s.updateApiKey);
+  const deleteKey = useApp((s) => s.deleteApiKey);
+  const setDefault = useApp((s) => s.setDefaultApiKey);
+  const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  return (
+    <div className="pt-1 border-t border-border">
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="flex items-center gap-1.5 text-[12px] font-medium text-text">
+          <KeyRound size={14} className="text-text-dim" />
+          API keys & budgets
+        </div>
+        <button
+          onClick={() => {
+            setAdding(true);
+            setEditingId(null);
+          }}
+          className="inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded-md border border-border text-text-muted hover:text-text hover:bg-bg-hover"
+          title="Add a new Anthropic API key"
+        >
+          <Plus size={12} />
+          Add key
+        </button>
+      </div>
+      <p className="text-[11px] text-text-dim leading-snug mb-2">
+        Each key has its own daily budget. The
+        <Star size={10} className="inline -mt-0.5 mx-0.5 text-state-attention" />
+        is the default — new sessions inherit it. Right-click any
+        session in the sidebar to switch which key it uses.
+      </p>
+
+      {keys.length === 0 && !adding && (
+        <div className="text-[11px] text-text-dim italic px-2 py-3 border border-dashed border-border rounded-md">
+          No API keys configured yet. Click <strong>Add key</strong> to
+          paste your first sk-ant-... key.
+        </div>
+      )}
+
+      <div className="space-y-1.5">
+        {keys.map((k) =>
+          editingId === k.id ? (
+            <KeyEditor
+              key={k.id}
+              initial={k}
+              busy={busyId === k.id}
+              onCancel={() => setEditingId(null)}
+              onSave={async (patch) => {
+                setBusyId(k.id);
+                try {
+                  const ok = await updateKey(k.id, patch);
+                  if (ok) setEditingId(null);
+                  return ok;
+                } finally {
+                  setBusyId(null);
+                }
+              }}
+            />
+          ) : (
+            <KeyRow
+              key={k.id}
+              k={k}
+              busy={busyId === k.id}
+              onEdit={() => {
+                setEditingId(k.id);
+                setAdding(false);
+              }}
+              onMakeDefault={async () => {
+                setBusyId(k.id);
+                try {
+                  await setDefault(k.id);
+                } finally {
+                  setBusyId(null);
+                }
+              }}
+              onDelete={async () => {
+                if (
+                  !window.confirm(
+                    `Delete API key "${k.name}"?\n\nThis is irreversible. Sessions currently bound to this key will fall back to the default key on their next turn.`
+                  )
+                ) {
+                  return;
+                }
+                setBusyId(k.id);
+                try {
+                  await deleteKey(k.id);
+                } finally {
+                  setBusyId(null);
+                }
+              }}
+            />
+          )
+        )}
+        {adding && (
+          <KeyEditor
+            initial={null}
+            busy={false}
+            onCancel={() => setAdding(false)}
+            onSave={async (patch) => {
+              if (!patch.plain || !patch.plain.trim()) return false;
+              const id = await createKey({
+                name: patch.name ?? 'API key',
+                plain: patch.plain,
+                dailyBudgetUsd: patch.dailyBudgetUsd ?? null,
+                setDefault: keys.length === 0,
+              });
+              if (id) setAdding(false);
+              return !!id;
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function KeyRow({
+  k,
+  busy,
+  onEdit,
+  onMakeDefault,
+  onDelete,
+}: {
+  k: ApiKey;
+  busy: boolean;
+  onEdit: () => void;
+  onMakeDefault: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-bg/40">
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5 text-[12px] text-text">
+          {k.is_default && (
+            <Star
+              size={11}
+              className="text-state-attention shrink-0"
+              fill="currentColor"
+              aria-label="default key"
+            />
+          )}
+          <span className="truncate font-medium">{k.name}</span>
+          {k.preview && (
+            <span className="text-[10px] font-mono text-text-dim truncate">
+              {k.preview}
+            </span>
+          )}
+        </div>
+        <div className="text-[10px] font-mono text-text-dim">
+          {k.daily_budget_usd != null
+            ? `daily $${k.daily_budget_usd.toFixed(2)}`
+            : 'no daily cap'}
+        </div>
+      </div>
+      <div className="flex items-center gap-1 shrink-0">
+        {!k.is_default && (
+          <button
+            onClick={onMakeDefault}
+            disabled={busy}
+            className="px-1.5 py-0.5 text-[10px] rounded border border-border text-text-dim hover:text-state-attention hover:border-state-attention/40"
+            title="Make this the default for new sessions"
+          >
+            Set default
+          </button>
+        )}
+        <button
+          onClick={onEdit}
+          disabled={busy}
+          className="p-1 rounded text-text-dim hover:text-text hover:bg-bg-hover"
+          title="Edit name / budget / key"
+        >
+          <Edit3 size={11} />
+        </button>
+        <button
+          onClick={onDelete}
+          disabled={busy}
+          className="p-1 rounded text-text-dim hover:text-state-error hover:bg-state-error/10"
+          title="Delete this key"
+        >
+          {busy ? (
+            <Loader2 size={11} className="animate-spin" />
+          ) : (
+            <Trash2 size={11} />
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+interface KeyEditorPatch {
+  name?: string;
+  plain?: string;
+  dailyBudgetUsd?: number | null;
+}
+
+function KeyEditor({
+  initial,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  /** Null for an Add form, an ApiKey row for an Edit form. */
+  initial: ApiKey | null;
+  busy: boolean;
+  onSave: (patch: KeyEditorPatch) => Promise<boolean>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? '');
+  const [plain, setPlain] = useState('');
+  const [daily, setDaily] = useState<string>(
+    initial?.daily_budget_usd != null ? String(initial.daily_budget_usd) : ''
+  );
+  const [err, setErr] = useState<string | null>(null);
+
+  const isAdd = initial === null;
+
+  const onClickSave = async () => {
+    setErr(null);
+    const patch: KeyEditorPatch = {};
+    if (name.trim() && name.trim() !== initial?.name) patch.name = name.trim();
+    if (plain.trim()) {
+      if (!plain.trim().startsWith('sk-')) {
+        setErr("API key must start with 'sk-'.");
+        return;
+      }
+      patch.plain = plain.trim();
+    } else if (isAdd) {
+      setErr('Paste an sk-ant-... key to create.');
+      return;
+    }
+    // Empty input means "no cap" (null). Otherwise parse as a positive
+    // number. NaN / negative falls back to null with a friendly message
+    // rather than silently storing garbage.
+    const dailyTrim = daily.trim();
+    if (dailyTrim) {
+      const n = Number(dailyTrim);
+      if (!Number.isFinite(n) || n < 0) {
+        setErr('Daily budget must be a positive number (or blank).');
+        return;
+      }
+      patch.dailyBudgetUsd = n > 0 ? n : null;
+    } else {
+      patch.dailyBudgetUsd = null;
+    }
+    const ok = await onSave(patch);
+    if (!ok) {
+      setErr(
+        isAdd
+          ? 'Could not create the key — see DevTools console for details.'
+          : 'Could not update the key — see DevTools console for details.'
+      );
+    }
+  };
+
+  return (
+    <div className="rounded-md border border-accent/40 bg-bg-elevated/50 px-2.5 py-2 space-y-1.5">
+      <div className="text-[10px] uppercase tracking-wider text-text-dim font-mono">
+        {isAdd ? 'Add API key' : `Edit "${initial?.name ?? ''}"`}
+      </div>
+      <div className="flex gap-1.5">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Name (e.g. Work)"
+          className="flex-1 rounded border border-border bg-bg px-2 py-1 text-[12px] text-text focus:outline-none focus:border-accent"
+        />
+      </div>
+      <input
+        type="password"
+        value={plain}
+        onChange={(e) => setPlain(e.target.value)}
+        placeholder={isAdd ? 'sk-ant-...' : 'Leave blank to keep current key, or paste a new one'}
+        className="w-full rounded border border-border bg-bg px-2 py-1 text-[12px] font-mono text-text focus:outline-none focus:border-accent"
+      />
+      <div className="flex gap-1.5">
+        <input
+          inputMode="decimal"
+          value={daily}
+          onChange={(e) => setDaily(e.target.value)}
+          placeholder="Daily $ (blank = no cap)"
+          className="flex-1 rounded border border-border bg-bg px-2 py-1 text-[12px] font-mono text-text focus:outline-none focus:border-accent"
+          title="Daily budget in USD for this key. When today's spend on this key hits the cap, new turns pause until the next local-day rollover (or until you raise the cap). Blank = no governor (unlimited)."
+        />
+      </div>
+      {err && (
+        <div className="text-[10px] text-state-error">{err}</div>
+      )}
+      <div className="flex justify-end gap-1">
+        <button
+          onClick={onCancel}
+          className="px-2 py-0.5 text-[11px] text-text-muted hover:text-text rounded hover:bg-bg-hover"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onClickSave}
+          disabled={busy}
+          className={clsx(
+            'px-2 py-0.5 text-[11px] rounded inline-flex items-center gap-1',
+            busy
+              ? 'bg-bg-hover text-text-dim'
+              : 'bg-accent text-white hover:bg-accent-dim'
+          )}
+        >
+          {busy && <Loader2 size={10} className="animate-spin" />}
+          {isAdd ? 'Add' : 'Save'}
+        </button>
+      </div>
+    </div>
+  );
+}

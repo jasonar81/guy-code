@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* CSS variables drive both light and dark themes via Tailwind color tokens.
+   The values are RGB triplets (e.g. "255 255 255") so Tailwind alpha syntax
+   like `bg-bg/80` works through `rgb(var(--c-bg) / <alpha-value>)`. */
+:root {
+  --c-bg: 255 255 255;
+  --c-bg-panel: 247 248 250;
+  --c-bg-elevated: 240 242 246;
+  --c-bg-hover: 230 233 239;
+  --c-border: 218 222 230;
+  --c-border-strong: 195 200 211;
+  --c-text: 24 28 35;
+  --c-text-muted: 88 95 109;
+  --c-text-dim: 132 138 150;
+  --c-accent: 99 81 230;
+  --c-accent-dim: 75 60 200;
+  --c-state-running: 22 163 74;
+  --c-state-waiting: 37 99 235;
+  --c-state-attention: 217 119 6;
+  --c-state-error: 220 38 38;
+  --c-state-idle: 130 137 150;
+  --c-state-sleeping: 124 99 230;
+
+  --c-scrollbar-thumb: 195 200 211;
+  --c-scrollbar-thumb-hover: 165 170 185;
+}
+
+.dark {
+  --c-bg: 14 15 18;
+  --c-bg-panel: 21 23 28;
+  --c-bg-elevated: 26 29 36;
+  --c-bg-hover: 34 38 47;
+  --c-border: 42 46 56;
+  --c-border-strong: 58 64 80;
+  --c-text: 228 230 235;
+  --c-text-muted: 139 145 158;
+  --c-text-dim: 91 97 112;
+  --c-accent: 124 92 255;
+  --c-accent-dim: 88 64 216;
+  --c-state-running: 34 197 94;
+  --c-state-waiting: 59 130 246;
+  --c-state-attention: 245 158 11;
+  --c-state-error: 239 68 68;
+  --c-state-idle: 107 114 128;
+  --c-state-sleeping: 167 139 250;
+
+  --c-scrollbar-thumb: 42 46 56;
+  --c-scrollbar-thumb-hover: 58 64 80;
+}
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+  input, textarea {
+    user-select: text;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--c-scrollbar-thumb));
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--c-scrollbar-thumb-hover));
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  .pill {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-mono;
+    @apply bg-bg-elevated text-text-muted border border-border;
+  }
+  .row-hover {
+    @apply transition-colors duration-75;
+  }
+}
+
+@keyframes pulse-running {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.glyph-running {
+  animation: pulse-running 1.6s ease-in-out infinite;
+}

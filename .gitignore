@@ -1,0 +1,26 @@
+node_modules/
+dist/
+dist-electron/
+out/
+release/
+.vite/
+*.log
+npm-install.log
+.env
+.env.local
+.DS_Store
+Thumbs.db
+*.tsbuildinfo
+
+# Test artifacts
+coverage/
+.tsc-out.txt
+
+# IDE
+.vscode/
+.idea/
+.windsurf/
+
+# Local diagnostic / scratch files
+.tmp-procs.txt
+progress.txt
