@@ -56,7 +56,6 @@
 
 import {
   db,
-  setSessionState,
   listSessionsByState,
   setSessionPending,
   getApiKeyRow,
@@ -66,7 +65,7 @@ import {
   resetApiKeyBudgetAdjustment,
   type ApiKeyRow,
 } from './db';
-import { broadcastAgentEvent, broadcastStateChanged } from './agentEvents';
+import { broadcastAgentEvent } from './agentEvents';
 import log from 'electron-log';
 
 const MICROS_PER_USD = 1_000_000;
@@ -74,7 +73,19 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
 let _resumeTimer: NodeJS.Timeout | null = null;
-const _bypassNextCall = new Set<string>();
+/**
+ * Force-resume grace map: sessionId → epoch-ms timestamp. Until that
+ * timestamp, every precheck for the session ALLOWS regardless of
+ * spend. Replaces the older one-shot Set semantics: a single bypass
+ * just kicked off the next API call, but a turn typically fires many
+ * back-to-back calls (tool round-trip, follow-up reasoning, more
+ * tool calls), so the agent paused again on call #2 and the user
+ * had to spam the button. A time-window grant lets the user hit
+ * Force Resume once, get ~60 seconds of progress, and then re-pause
+ * cleanly — by which point either the work is done or they have
+ * something visible to react to.
+ */
+const _bypassUntil = new Map<string, number>();
 
 // ---- Time helpers -------------------------------------------------------
 
@@ -350,17 +361,30 @@ export function precheckCall(
     return { allowed: true, reason: '', capMicros: 0, spentMicros: 0, nextRetryTs };
   }
 
-  // Step 2. One-shot bypass for "Force resume".
-  if (sessionId && _bypassNextCall.has(sessionId)) {
-    _bypassNextCall.delete(sessionId);
-    log.info(`[budget] bypass consumed for ${sessionId}`);
-    return {
-      allowed: true,
-      reason: 'force-resume bypass',
-      capMicros: cap,
-      spentMicros: currentHourSpendMicros(now, apiKeyId),
-      nextRetryTs,
-    };
+  // Step 2. Force-resume grace window. The user clicked Force Resume,
+  // which set `_bypassUntil[sessionId] = now + 60s`. While inside that
+  // window, EVERY API call for the session is allowed regardless of
+  // spend — so a multi-call turn (model output → tool → tool result
+  // → more model output → more tools) doesn't re-pause halfway
+  // through. Once the window expires we lazy-clean the entry; a
+  // future Force Resume will overwrite it.
+  if (sessionId) {
+    const until = _bypassUntil.get(sessionId);
+    if (until !== undefined) {
+      if (now < until) {
+        return {
+          allowed: true,
+          reason: 'force-resume grace',
+          capMicros: cap,
+          spentMicros: currentHourSpendMicros(now, apiKeyId),
+          nextRetryTs,
+        };
+      }
+      // Window expired — clean up so the map doesn't grow unbounded
+      // across days of usage. Important for long-running sessions.
+      _bypassUntil.delete(sessionId);
+      log.info(`[budget] force-resume grace expired for ${sessionId}`);
+    }
   }
 
   const spent = currentHourSpendMicros(now, apiKeyId);
@@ -403,13 +427,59 @@ export const precheckTurn = precheckCall;
 // ---- Force resume ------------------------------------------------------
 
 /**
- * Mark a session to bypass the NEXT precheck. One-shot — once consumed,
- * subsequent calls are gated normally. Wired to the sidebar's "Force
- * resume" button for the "I need this critical turn done now even
- * though I'm over budget" escape hatch.
+ * Default Force Resume grace window: 60 seconds. Long enough for a
+ * realistic agent turn (model output streamed, 1-3 tool round-trips,
+ * follow-up model reasoning) to actually finish, short enough that
+ * the user doesn't accidentally blow far past the cap if they
+ * forgot they clicked Resume. Exported so tests can override.
  */
-export function setBypassNextTurn(sessionId: string): void {
-  _bypassNextCall.add(sessionId);
+export const FORCE_RESUME_GRACE_MS = 60_000;
+
+/**
+ * Open a 60-second grace window during which every precheck for this
+ * session ALLOWS regardless of spend. Wired to the sidebar's "Force
+ * resume" button. The window starts at the moment of the call; a
+ * second click within an active window REPLACES the timestamp,
+ * extending the grace from now (NOT cumulative — we don't want
+ * double-clicking to grant 120s of bypass).
+ *
+ * Why a window and not a one-shot:
+ *   A user-visible "turn" is one model output, but under the hood it
+ *   may be many discrete API calls — model produces tool_use, agent
+ *   runs tool, sends tool_result back, model emits more output, etc.
+ *   With a one-shot bypass, only the FIRST of those calls escapes
+ *   the budget gate; the second pauses the session again,
+ *   immediately, before the user has even seen anything happen.
+ *   That's the bug the user reported. A short time window covers
+ *   the whole multi-call turn in a single click.
+ */
+export function setBypassNextTurn(
+  sessionId: string,
+  graceMs: number = FORCE_RESUME_GRACE_MS,
+  now: number = Date.now()
+): void {
+  _bypassUntil.set(sessionId, now + graceMs);
+  log.info(
+    `[budget] force-resume grace opened for ${sessionId} (${graceMs}ms)`
+  );
+}
+
+/**
+ * Test/debug helper: read the current grace window expiration for a
+ * session, or undefined if no window is active. Not surfaced in the
+ * UI; the renderer only ever toggles the button.
+ */
+export function getBypassUntil(sessionId: string): number | undefined {
+  return _bypassUntil.get(sessionId);
+}
+
+/**
+ * Test helper: clear all grace windows. Used in tests to reset
+ * singleton state between runs. Not exported through any module
+ * boundary outside tests.
+ */
+export function _resetBypassForTests(): void {
+  _bypassUntil.clear();
 }
 
 // ---- Reset --------------------------------------------------------------
@@ -478,13 +548,39 @@ async function resumeSweep() {
     }
     if (!canWake) continue;
 
-    setSessionState(s.id, 'idle');
-    broadcastStateChanged(s.id, 'idle');
+    // State transition belongs to runUserTurn, not the sweep.
+    //
+    // Earlier versions of this code did
+    //   setSessionState(s.id, 'idle');
+    //   broadcastStateChanged(s.id, 'idle');
+    // here, BEFORE firing runUserTurn. That created a window where:
+    //   • The session shows as `idle` to the renderer for a few
+    //     hundred ms (the time between this sync DB write and the
+    //     async runUserTurn awakening to set state='running').
+    //   • If runUserTurn errored or exited early without work
+    //     (the mid-flight pause case where the JSONL is already
+    //     drained), state stayed permanently at `idle` — the user
+    //     came back to "idle" when they expected to see the original
+    //     `sleeping-budget`. The queued message was orphaned.
+    //
+    // The fix: leave state as `sleeping-budget` until runUserTurn
+    // confirms it's actually working. runUserTurn sets state to
+    // `running` at line 473 (just before the first stream call), so
+    // the success path produces the same UX. If runUserTurn fails or
+    // re-blocks immediately (precheckCall says budget is still
+    // exhausted), state stays at `sleeping-budget` and the next
+    // sweep tick (or user gesture) gets another shot at waking it
+    // — which is exactly the desired "comes back exactly as I left
+    // it" behavior.
     broadcastAgentEvent({ type: 'budget_woke', sessionId: s.id });
 
     const pending = s.pending_user_text?.trim();
     if (pending) {
       // Pre-turn pause: never started, fresh user text waiting.
+      // Clear the pending marker BEFORE runUserTurn so a re-block
+      // inside runUserTurn (precheckCall says budget is gone again
+      // on a tight race) doesn't see the stale marker — runUserTurn
+      // would itself re-park the text anyway.
       setSessionPending(s.id, null, null);
       log.info(`[budget] auto-resuming ${s.id} with pending message (fresh turn)`);
       runUserTurn({
@@ -493,7 +589,22 @@ async function resumeSweep() {
         cwd: s.cwd ?? '',
         userText: pending,
         seedFromJsonl: s.jsonl_path,
-      }).catch((e) => log.error(`[budget] auto-resume of ${s.id} failed`, e));
+      }).catch((e) => {
+        log.error(`[budget] auto-resume of ${s.id} failed`, e);
+        // runUserTurn rejected before reaching its own state-
+        // management code (e.g., a synchronous import / setup
+        // throw). Leave state as sleeping-budget AND restore the
+        // pending text so the next sweep can retry. Without this
+        // restore, the user's queued message is silently dropped.
+        try {
+          setSessionPending(s.id, pending, Date.now());
+        } catch (e2) {
+          log.error(
+            `[budget] failed to restore pending text after auto-resume failure for ${s.id}`,
+            e2
+          );
+        }
+      });
     } else {
       // Mid-flight pause: JSONL has the truth. Continue without
       // injecting a new user message.
@@ -505,7 +616,9 @@ async function resumeSweep() {
         userText: '',
         continueExisting: true,
         seedFromJsonl: s.jsonl_path,
-      }).catch((e) => log.error(`[budget] auto-resume of ${s.id} failed`, e));
+      }).catch((e) =>
+        log.error(`[budget] auto-resume of ${s.id} failed`, e)
+      );
     }
   }
 }

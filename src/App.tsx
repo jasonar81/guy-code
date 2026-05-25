@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { PanesContainer } from './components/PanesContainer';
+import { UpdateBanner } from './components/UpdateBanner';
 import { useApp } from './lib/store';
 
 export default function App() {
@@ -55,9 +56,12 @@ export default function App() {
   }, []);
 
   return (
-    <div className="h-screen w-screen flex bg-bg text-text overflow-hidden">
-      <Sidebar />
-      <PanesContainer />
+    <div className="h-screen w-screen flex flex-col bg-bg text-text overflow-hidden">
+      <UpdateBanner />
+      <div className="flex-1 flex overflow-hidden">
+        <Sidebar />
+        <PanesContainer />
+      </div>
     </div>
   );
 }

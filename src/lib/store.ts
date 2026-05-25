@@ -113,38 +113,88 @@ type TodoItem = {
  * Returns null if no TodoWrite has been issued in this session.
  */
 function findLatestTodos(messages: ChatMessage[]): TodoItem[] | null {
+  // Walk the message list backward, tracking the most recent
+  // PlanState lifecycle event seen (none / complete / abandon /
+  // start_new). The panel state on reload should reflect that
+  // lifecycle, NOT just the last raw TodoWrite — otherwise, e.g.,
+  // a session that ended with `PlanState{action:"complete"}` but no
+  // final TodoWrite reloads showing 2/11 instead of the celebratory
+  // 11/11 the user actually saw live. Same shape as the live
+  // reducer's PlanState handling above; keep them in sync.
+  type Lifecycle = 'complete' | 'abandon' | 'start_new' | null;
+  let lifecycle: Lifecycle = null;
+  let lifecycleSteps: TodoItem[] | null = null; // populated for start_new
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== 'assistant') continue;
     for (let j = m.content.length - 1; j >= 0; j--) {
       const b = m.content[j];
-      if (b.type !== 'tool_use' || b.name !== 'TodoWrite') continue;
-      const todos = (b.input as Record<string, unknown> | undefined)?.todos;
-      if (Array.isArray(todos)) {
-        // Coerce to our typed shape, dropping anything that doesn't look
-        // like a valid todo. Keeps the panel resilient against partial /
-        // malformed inputs (e.g. a streaming-truncated JSON that
-        // happened to parse).
-        const out: TodoItem[] = [];
-        for (const t of todos) {
-          if (!t || typeof t !== 'object') continue;
-          const o = t as Record<string, unknown>;
-          if (typeof o.id !== 'string') continue;
-          if (typeof o.content !== 'string') continue;
-          if (
-            o.status !== 'pending' &&
-            o.status !== 'in_progress' &&
-            o.status !== 'completed'
-          ) {
-            continue;
-          }
-          out.push({ id: o.id, content: o.content, status: o.status });
+      if (b.type !== 'tool_use') continue;
+      // First (most recent) lifecycle wins.
+      if (b.name === 'PlanState' && lifecycle === null) {
+        const action = (b.input as Record<string, unknown> | undefined)?.action;
+        if (action === 'complete' || action === 'abandon') {
+          lifecycle = action;
+        } else if (action === 'start_new') {
+          lifecycle = 'start_new';
+          const nextSteps = (b.input as Record<string, unknown> | undefined)?.next_steps;
+          lifecycleSteps = coerceTodos(nextSteps);
         }
-        return out.length > 0 ? out : null;
+        // For 'abandon' we can short-circuit — no TodoWrite before
+        // it is relevant to the panel state.
+        if (lifecycle === 'abandon') return null;
+        // For 'start_new' we already have the items inline; same.
+        if (lifecycle === 'start_new') return lifecycleSteps;
+        // For 'complete' we still need the most recent TodoWrite
+        // BEFORE this PlanState to know which items to mark done.
+        continue;
       }
+      if (b.name !== 'TodoWrite') continue;
+      const todos = (b.input as Record<string, unknown> | undefined)?.todos;
+      const out = coerceTodos(todos);
+      if (out === null) continue;
+      // If we passed a PlanState{complete} on the way back, every
+      // step in the latest TodoWrite is now completed.
+      if (lifecycle === 'complete') {
+        return out.map((t) => ({ ...t, status: 'completed' as const }));
+      }
+      return out;
     }
   }
+  // No TodoWrite found in history. Lifecycle handling above already
+  // short-circuited for 'start_new' / 'abandon', so if we get here
+  // there's nothing meaningful to show — `lifecycleSteps` is unused
+  // and `lifecycle` is at most 'complete' (which needed a TodoWrite
+  // to act on). Suppress the unused-var by referencing it once.
+  void lifecycleSteps;
   return null;
+}
+
+/**
+ * Helper for `findLatestTodos`: coerces an unknown value (typically
+ * `b.input.todos`) into a typed `TodoItem[]` (or null if the value
+ * isn't a usable array). Same coercion the live reducer applies via
+ * `todosFromInput`, but as a free function so we can call it from
+ * the message-walking loop without constructing a fake input object.
+ */
+function coerceTodos(raw: unknown): TodoItem[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: TodoItem[] = [];
+  for (const t of raw) {
+    if (!t || typeof t !== 'object') continue;
+    const o = t as Record<string, unknown>;
+    if (typeof o.id !== 'string') continue;
+    if (typeof o.content !== 'string') continue;
+    if (
+      o.status !== 'pending' &&
+      o.status !== 'in_progress' &&
+      o.status !== 'completed'
+    ) {
+      continue;
+    }
+    out.push({ id: o.id, content: o.content, status: o.status });
+  }
+  return out.length > 0 ? out : null;
 }
 
 /**
@@ -797,6 +847,41 @@ export const useApp = create<AppState>((set, get) => ({
             // `[…]`  → wholesale replacement of the plan.
             if (todos !== null) {
               next.currentTodos = todos.length > 0 ? todos : null;
+            }
+          } else if (e.name === 'PlanState') {
+            // PlanState is the lifecycle tool (complete / abandon /
+            // start_new). The model often calls it to wrap a turn
+            // WITHOUT first issuing a final TodoWrite that marks
+            // every step complete — leaving the plan panel stuck at
+            // e.g. "2/11" even though the user just watched the
+            // agent finish all 11 items. Mirror the lifecycle into
+            // the panel state so the visible state matches reality
+            // even if the model was sloppy about marking steps.
+            const action = (e.input as Record<string, unknown> | undefined)?.action;
+            if (action === 'complete') {
+              // Mark every remaining step complete so the panel
+              // shows the celebratory "all done" state — that's the
+              // truth the user just experienced.
+              if (next.currentTodos) {
+                next.currentTodos = next.currentTodos.map((t) => ({
+                  ...t,
+                  status: 'completed' as const,
+                }));
+              }
+            } else if (action === 'abandon') {
+              // Plan abandoned mid-flight — hide the panel (no
+              // active plan now). Items remain in history; the
+              // model is expected to start a fresh plan if it
+              // continues working.
+              next.currentTodos = null;
+            } else if (action === 'start_new') {
+              // start_new ships its own next_steps array. Treat that
+              // as the new plan's seed so the panel updates in lock-
+              // step with the lifecycle event, not on the next
+              // TodoWrite that may not arrive for several turns.
+              const nextSteps = (e.input as Record<string, unknown> | undefined)?.next_steps;
+              const seeded = todosFromInput({ todos: nextSteps });
+              next.currentTodos = seeded && seeded.length > 0 ? seeded : null;
             }
           }
           break;

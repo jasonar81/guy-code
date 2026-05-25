@@ -41,13 +41,29 @@ import { getDefaultApiKeyId } from './secret';
 import { computeCostMicros } from './pricing';
 import { loadMemory } from './memory';
 import { precheckCall } from './budget';
+import { maybeSummarize } from './toolSummarizer';
+import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
+import { renderActivePlanBlock } from './planManager';
 import { broadcastAgentEvent, broadcastStateChanged } from './agentEvents';
-// Note: client-side `ephemeralizeMessages` and `maybeCompact` are no
-// longer called from the agent loop — `streamMessage` now relies on
-// Anthropic's server-side `clear_tool_uses_20250919` to micro-compact
-// older tool results. The source files remain in the codebase as a
-// fallback for future use (e.g. legacy models without context-management
-// support). See `electron/anthropic.ts:streamMessage`.
+// Server-side `clear_tool_uses_20250919` micro-compaction handles the
+// common case of old tool_results bloating context. But it has two
+// failure modes:
+//   1. It only clears tool_use *results* — user attachments, system
+//      prompt, assistant text, and tool_use blocks themselves are
+//      untouched.
+//   2. It keeps the most recent N tool_uses verbatim. If any single
+//      one is huge (multi-MB Read, big Bash output, screenshot), we
+//      can still bust the cap.
+// So we wrap streamMessage with a client-side pre-flight (run
+// `preflightCompactIfNeeded` before sending) and a reactive catch (on
+// "prompt is too long" 400, run `emergencyCompact` and retry once).
+// Both helpers are in `compaction.ts`.
+import {
+  preflightCompactIfNeeded,
+  emergencyCompact,
+  isPromptTooLongError,
+  estimateTokens,
+} from './compaction';
 
 export type AgentEvent =
   | { type: 'turn_start'; sessionId: string; userText: string }
@@ -350,7 +366,33 @@ function broadcast(e: AgentEvent) {
  * inside this one call; each contributes a usage_event row.
  */
 export async function runUserTurn(args: RunArgs): Promise<void> {
-  const { sessionId, projectId, cwd, userText, seedFromJsonl } = args;
+  const { sessionId, projectId, cwd, seedFromJsonl } = args;
+  // Slash-command rewriting: a leading `/skill-name [args]` becomes a
+  // synthetic user message instructing the model to call the Skill
+  // tool with the matched name. We do this before anything else so
+  // the JSONL records the canonical (rewritten) form rather than the
+  // raw `/feature-spec ...` shorthand. If the slash doesn't match a
+  // known skill, the original text passes through unchanged so the
+  // user can still type `/path/like/this` as plain text.
+  let userText = args.userText;
+  if (userText && userText.trimStart().startsWith('/') && !args.continueExisting) {
+    try {
+      const reg = loadSkills(cwd);
+      const match = parseSlashCommand(userText, reg);
+      if (match) {
+        const rewritten = rewriteSlashCommand(match);
+        log.info(
+          `[agent] slash command "/${match.skill.name}" rewritten (${userText.length}\u2192${rewritten.length} chars)`
+        );
+        userText = rewritten;
+      }
+    } catch (e) {
+      // Slash parsing is non-critical; if anything throws we just
+      // pass the raw text through. Skill loading errors are also
+      // logged inside loadSkills().
+      log.warn('[agent] slash-command parse threw; passing raw userText', e);
+    }
+  }
   const attachments = normalizeAttachments(args.attachments);
   if (activeRuns.has(sessionId)) {
     log.warn(`[agent] turn already running for ${sessionId}; ignoring`);
@@ -505,12 +547,24 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         `[agent] loaded memory: ${memory.sources.length} files, ${memory.text.length}b (truncated ${memory.truncatedBytes}b)`
       );
     }
+    // Skills loaded from ~/.guycode/skills, <cwd>/.guycode/skills, and
+    // imported from ~/.claude/skills + <cwd>/.claude/skills. The
+    // resulting block enumerates name + description so the model can
+    // pick by description match. Bodies are fetched on-demand via the
+    // Skill tool (see tools.ts).
+    const skillRegistry = loadSkills(cwd);
+    if (skillRegistry.skills.length > 0) {
+      log.info(
+        `[agent] loaded ${skillRegistry.skills.length} skill(s) (${skillRegistry.shadowed.length} shadowed by name collision)`
+      );
+    }
     const systemBlocks = buildSystemBlocks({
       sessionId,
       cwd,
       date: new Date(),
       platform: platformShortName(),
       memoryText: memory.text,
+      skillsBlock: renderSkillsBlock(skillRegistry),
       // Anchor the user's prompt as a system-level "current task" reminder
       // so the model never loses track of what it's working on, even after
       // many tool rounds where compaction may have summarized away the
@@ -635,20 +689,42 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       const partials = new Map<number, { id: string; name: string; input: string }>();
       let pendingText = '';
 
-      // Per-iteration: only sanitize (defensive backstop for tool pairing
-      // and unknown-tool filtering). Ephemeralize/compact are gone —
-      // server handles them now.
+      // Per-iteration: sanitize first (defensive backstop for tool pairing
+      // and unknown-tool filtering), then run the client-side pre-flight
+      // compaction. The pre-flight is a no-op when we're under the safety
+      // threshold (~95% of the model's cap); when it fires, it shrinks
+      // the head into a summary so the request stays under the cap.
+      //
+      // We mutate `messages` only when compaction actually changed
+      // anything (preflighted !== sanitized) so the compacted form is
+      // what gets used by subsequent loop iterations. The on-disk JSONL
+      // is the canonical source of truth and is unchanged — compaction
+      // is purely a runtime projection.
       const sanitized = sanitizeMessages(messages, knownToolNames);
-      const messagesToSend = withConversationCacheBreakpoint(sanitized);
+      let preflighted: Anthropic.MessageParam[] = sanitized;
+      try {
+        preflighted = await preflightCompactIfNeeded(sanitized, model);
+      } catch (e) {
+        log.warn('[agent] preflight compaction failed; sending uncompacted', e);
+        preflighted = sanitized;
+      }
+      if (preflighted !== sanitized) {
+        // Compaction actually fired. Re-sanitize because the compaction
+        // boundary can leave orphaned tool pairings, and replace the
+        // working `messages` so subsequent loop iterations see the
+        // smaller form.
+        messages = sanitizeMessages(preflighted, knownToolNames);
+        preflighted = messages;
+      }
+      let messagesToSend = withConversationCacheBreakpoint(preflighted);
 
       // Surface the API call to the UI so the "thinking..." gap is visible.
-      // Estimate input tokens from JSON character count (~4 chars/token is
-      // the standard rule of thumb for English; tool_results pad it but
-      // it's good enough for "is this 50K or 700K"). We measure on the
-      // serialized payload because that's what the API actually counts.
+      // Use `estimateTokens` (the same estimator compaction uses) so the
+      // surfaced number is consistent with the safety threshold the
+      // pre-flight checks against.
       let estTokens = 0;
       try {
-        estTokens = Math.round(JSON.stringify(messagesToSend).length / 4);
+        estTokens = estimateTokens(messagesToSend);
       } catch {
         estTokens = 0;
       }
@@ -664,14 +740,42 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         messageCount: messagesToSend.length,
       });
 
-      const response = await streamMessage({
-        model,
-        system: systemBlocks,
-        tools,
-        messages: messagesToSend,
-        signal: ctrl.signal,
-        apiKeyId: resolvedApiKeyId,
-        onEvent: (sev) => {
+      // Re-render systemBlocks with the LATEST active plan + currentTask
+      // before each call. The skills + memory + intro slots are stable
+      // (cached); only the active-plan slot (3.6) and currentTask
+      // (slot 4) change frequently. Rebuilding the whole array is
+      // cheap (string concat) and keeps the cache prefix valid.
+      const refreshedSystemBlocks = buildSystemBlocks({
+        sessionId,
+        cwd,
+        date: new Date(),
+        platform: platformShortName(),
+        memoryText: memory.text,
+        skillsBlock: renderSkillsBlock(skillRegistry),
+        activePlanBlock: renderActivePlanBlock(sessionId),
+        currentTask: userText,
+      });
+      // One-shot prompt-too-long recovery loop. The pre-flight above
+      // catches the common case, but it can miss when the estimator
+      // under-counts (e.g. base64 image attachments, or a system
+      // prompt that itself eats a big chunk of the cap). When the
+      // API rejects with "prompt is too long", `emergencyCompact`
+      // shrinks aggressively and we retry once. If the retry still
+      // fails — or if compaction made no progress — propagate the
+      // original error so the outer catch can surface it cleanly.
+      let response: Anthropic.Message;
+      let promptTooLongAttempts = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          response = await streamMessage({
+            model,
+            system: refreshedSystemBlocks,
+            tools,
+            messages: messagesToSend,
+            signal: ctrl.signal,
+            apiKeyId: resolvedApiKeyId,
+            onEvent: (sev) => {
           // First server event of this round → time-to-first-token
           // landmark. Fire `response_started` exactly once so the UI
           // can swap the "thinking..." indicator for live streaming.
@@ -747,6 +851,72 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           }
         },
       });
+          break; // success — exit retry loop
+        } catch (err: any) {
+          // AbortError: user cancelled mid-stream. Re-throw so the
+          // outer catch handles it normally (no compaction recovery).
+          if (err?.name === 'AbortError') throw err;
+          const ptl = isPromptTooLongError(err);
+          if (!ptl.hit || promptTooLongAttempts >= 1) throw err;
+          promptTooLongAttempts++;
+          log.warn(
+            `[agent] prompt-too-long: API reported ${ptl.tokens} tokens > cap; emergency-compacting and retrying`
+          );
+          // Emergency-compact and retry. If compaction can't shrink
+          // the payload meaningfully, propagate the original error so
+          // the user sees the real failure (not a misleading "still
+          // too long" loop). We compare TOKEN estimates, not message
+          // count — `ephemeralizeMessages` (the cheap stage 1 of
+          // emergency compaction) preserves length while shrinking
+          // content, so a length-only check would falsely conclude
+          // "no progress" even when content shrank by 90%.
+          const beforeTokens = estimateTokens(messages);
+          let recovered: Anthropic.MessageParam[];
+          try {
+            recovered = await emergencyCompact(messages);
+          } catch (compactErr) {
+            log.error('[agent] emergency compact failed during recovery', compactErr);
+            throw err;
+          }
+          const afterTokens = estimateTokens(recovered);
+          // Require at least a 5% reduction. Anything less and the
+          // retry is doomed — better to surface the error than to
+          // burn another round-trip.
+          if (afterTokens >= Math.floor(beforeTokens * 0.95)) {
+            log.error(
+              `[agent] emergency compact made no progress (${beforeTokens} → ${afterTokens} tokens); propagating original prompt-too-long error`
+            );
+            throw err;
+          }
+          log.info(
+            `[agent] emergency compact: ${beforeTokens} → ${afterTokens} tokens`
+          );
+          messages = sanitizeMessages(recovered, knownToolNames);
+          messagesToSend = withConversationCacheBreakpoint(messages);
+          // Reset stream-local state so the retry's `awaiting_response` /
+          // `response_started` semantics stay correct in the UI.
+          partials.clear();
+          pendingText = '';
+          firstEventAt = 0;
+          // Re-fire awaiting_response so the UI knows we're still
+          // working (the user would otherwise see the streaming
+          // spinner pause for the duration of the haiku summarizer
+          // round-trip with no explanation).
+          let retryEstTokens = 0;
+          try {
+            retryEstTokens = estimateTokens(messagesToSend);
+          } catch {
+            retryEstTokens = 0;
+          }
+          onEv({
+            type: 'awaiting_response',
+            sessionId,
+            estimatedInputTokens: retryEstTokens,
+            messageCount: messagesToSend.length,
+          });
+          // Loop back to retry.
+        }
+      }
 
       // Round complete — log timing so the user can see in the console
       // whether slowness was server-side TTFT, generation, or tool work.
@@ -1024,7 +1194,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         }
 
         const start = Date.now();
-        const { content, isError } = await executeTool(tu.name, tu.input, {
+        const raw = await executeTool(tu.name, tu.input, {
           sessionId,
           cwd,
           projectId,
@@ -1036,8 +1206,48 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           apiKeyId: resolvedApiKeyId,
         });
         const ms = Date.now() - start;
-        // Audit row for this tool call. Output is summarized to keep DB
-        // small; full content lives in the JSONL.
+        // Two-track output:
+        //   • `content` (string or content-block array) → the model, via
+        //     the next tool_result on the wire.
+        //   • `uiSummary` (always a string) → the renderer's tool-call
+        //     card AND our audit log.
+        // For 99% of tools these are identical. The exception is
+        // BrowserScreenshot, which returns a content-block array
+        // carrying the actual image bytes; its uiSummary is a short
+        // line like "Screenshot taken — 12 elements labeled" so the
+        // UI doesn't have to choke on a 200KB base64 in a div.
+        let content: string | Array<unknown> = raw.content;
+        let uiSummary: string = raw.uiSummary;
+        let isError = raw.isError;
+
+        // Tool result summarization only applies when the model-facing
+        // content is a plain string. Large Bash dumps, big Reads, and
+        // sprawling Greps get archived to disk and replaced with a
+        // head+tail+stats summary the model sees instead. The original
+        // is recoverable via Read on the archive path embedded in the
+        // summary. We deliberately skip this path for structured
+        // (image-bearing) results: there's nothing to summarize, and
+        // the image is the whole point.
+        if (typeof content === 'string') {
+          const summarized = maybeSummarize({
+            toolName: tu.name,
+            toolInput: tu.input,
+            sessionId,
+            toolUseId: tu.id,
+            rawContent: content,
+            isError,
+          });
+          content = summarized.content;
+          uiSummary = summarized.content;
+          isError = summarized.isError;
+          if (summarized.archivePath) {
+            log.info(
+              `[agent] tool=${tu.name} archived ${summarized.originalChars.toLocaleString()} chars to ${summarized.archivePath}`
+            );
+          }
+        }
+        // Audit row for this tool call. We use uiSummary because the
+        // audit DB is sized for short text rows, not image base64.
         try {
           insertAuditEvent({
             ts: start,
@@ -1045,7 +1255,8 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
             sessionId,
             tool: tu.name,
             inputJson: safeStringify(tu.input),
-            outputRef: content.length > 256 ? content.slice(0, 256) + '…' : content,
+            outputRef:
+              uiSummary.length > 256 ? uiSummary.slice(0, 256) + '…' : uiSummary,
             status: isError ? 'error' : 'ok',
             durationMs: ms,
           });
@@ -1060,7 +1271,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           type: 'tool_result',
           sessionId,
           id: tu.id,
-          content,
+          content: uiSummary,
           isError,
           ms,
         });
@@ -1144,10 +1355,25 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       log.error('[agent] error', e);
       setSessionState(sessionId, 'error');
       broadcastStateChanged(sessionId, 'error');
+      // Translate raw "prompt is too long" 400s into something the
+      // user can actually do something about. Pre-flight + emergency
+      // compact catch the vast majority of these; reaching the outer
+      // catch means the session has so much un-compactable content
+      // (e.g. one giant attachment that even ephemeralization can't
+      // shrink, or a tail that's already minimal) that no automated
+      // strategy works. Tell the user to fork.
+      const ptl = isPromptTooLongError(e);
+      const message = ptl.hit
+        ? `Context overflow: this turn would have sent ${ptl.tokens.toLocaleString()} tokens, ` +
+          `over the model's input cap. The auto-compactor couldn't shrink the conversation enough ` +
+          `to fit. To continue, start a new session — your existing JSONL is preserved on disk and ` +
+          `can be re-opened later. You can also try a shorter follow-up message; if your last user ` +
+          `message contained large attachments, removing them may be enough on its own.`
+        : (e?.message ?? String(e));
       onEv({
         type: 'error',
         sessionId,
-        message: e?.message ?? String(e),
+        message,
       });
     }
   } finally {

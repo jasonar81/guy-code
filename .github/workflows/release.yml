@@ -1,0 +1,102 @@
+# Release workflow for Guy Code.
+#
+# Trigger:  push of a `v*` tag (e.g. `v0.1.1`, `v1.0.0`).
+# Effect:   build installers on macOS + Windows + Linux runners,
+#           publish them to a GitHub Release named after the tag.
+#
+# Matrix design rationale:
+#   • macOS runs on `macos-latest` (Apple Silicon by default).
+#     `electron-builder --mac` cross-compiles the x64 arch from
+#     ARM, producing a Universal binary. Building on a Linux or
+#     Windows runner would NOT work — only Apple's xcrun
+#     toolchain can produce signed/notarized .app bundles.
+#   • Windows runs on `windows-latest`. NSIS installer + portable
+#     .exe come out of the box.
+#   • Linux runs on `ubuntu-latest`. AppImage + .deb.
+#
+# Auto-update integration:
+#   electron-updater reads `latest-mac.yml`, `latest.yml` (Win),
+#   `latest-linux.yml` from the release assets. We pass
+#   `GH_TOKEN` to electron-builder during `--publish always` so it
+#   can attach those files to the release alongside the
+#   installers. Without those YAML manifests, the in-app
+#   "Restart to install" flow can't verify the update.
+#
+# Drafts vs published:
+#   The first run on a tag creates a DRAFT release. After all
+#   three platforms have uploaded their artifacts, you (the
+#   maintainer) review the draft on github.com/jasonar81/guy-code/
+#   releases and click "Publish release" to flip it live. Users'
+#   apps then see the new version on their next 4-hour poll.
+#   Override: set `electronBuildPublishOptions.releaseType: 'release'`
+#   in package.json `build.publish` to publish directly.
+#
+# Code signing (deferred):
+#   When we want to add signing later:
+#     • macOS: provide CSC_LINK (base64 .p12) + CSC_KEY_PASSWORD
+#       via repo secrets; add notarization step with APPLE_ID,
+#       APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID secrets.
+#     • Windows: same CSC_LINK + CSC_KEY_PASSWORD pattern.
+#   electron-builder picks them up automatically from env vars,
+#   no workflow changes needed beyond adding them to env: below.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Required for electron-builder to attach assets to the release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      # Don't fail-fast — if Windows breaks, we still want the mac
+      # and linux artifacts so users on those platforms aren't
+      # blocked. The maintainer can decide to ship from the draft
+      # release with whatever's there, or fix and re-tag.
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          # Match local dev (Node 22 LTS at the time of writing).
+          # If we move dev to a newer LTS, bump this in lockstep so
+          # the build matrix matches what we test against.
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        # `npm ci` rather than `npm install` — reproducible builds
+        # honor the lockfile exactly. If the lockfile is stale, the
+        # build fails loudly here rather than silently drifting.
+        run: npm ci
+
+      - name: Run tests
+        # Belt-and-suspenders: even though tests run on every PR via
+        # a separate workflow (when added), gate the release on a
+        # passing test suite so a tag push to a broken commit can't
+        # accidentally ship.
+        run: npm run test
+
+      - name: Build & publish
+        # `electron-builder --publish always` builds installers AND
+        # uploads them to a GitHub Release matching the current tag.
+        # Creates a DRAFT release — maintainer reviews and publishes
+        # manually. The token lets electron-builder authenticate
+        # with the GitHub API for upload.
+        env:
+          # Standard GH_TOKEN provided by Actions. No PAT needed.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run release

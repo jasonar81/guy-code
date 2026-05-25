@@ -193,6 +193,22 @@ export interface AuditEventRow {
   duration_ms: number | null;
 }
 
+/**
+ * Slim skill summary surfaced to the renderer for the slash-command
+ * autocomplete menu. Bodies stay on the main side — they're large
+ * and only the model needs them (via the Skill tool).
+ */
+export interface SkillSummary {
+  name: string;
+  description: string;
+  /**
+   * Where this skill came from. Determines the sort/badge in the
+   * autocomplete menu so the user can tell at a glance whether they're
+   * picking a Guy-native skill, a Claude-imported one, etc.
+   */
+  source: 'guy-user' | 'guy-project' | 'claude-user' | 'claude-project' | 'claude-commands';
+}
+
 export interface McpServerStatus {
   name: string;
   status: 'connected' | 'needs-auth' | 'error' | 'disabled' | 'connecting';
@@ -340,6 +356,9 @@ declare global {
         signIn: (name: string) => Promise<{ ok: boolean; error?: string }>;
         signOut: (name: string) => Promise<{ ok: boolean; error?: string }>;
       };
+      skills: {
+        list: (cwd: string | null) => Promise<{ skills: SkillSummary[] }>;
+      };
       imports: {
         run: () => Promise<ImportProgress>;
         onProgress: (cb: (p: ImportProgress) => void) => () => void;
@@ -350,6 +369,36 @@ declare global {
       };
       dialog: {
         pickDirectory: (defaultPath?: string) => Promise<string | null>;
+      };
+      chrome: {
+        status: () => Promise<{
+          status: 'disconnected' | 'connecting' | 'connected' | 'error';
+          port: number | null;
+          error: string | null;
+          connectedAt: number | null;
+          tabCount: number;
+        }>;
+        connect: (port?: number) => Promise<{
+          ok: boolean;
+          error?: string;
+          status: {
+            status: 'disconnected' | 'connecting' | 'connected' | 'error';
+            port: number | null;
+            error: string | null;
+            connectedAt: number | null;
+            tabCount: number;
+          };
+        }>;
+        disconnect: () => Promise<{
+          ok: boolean;
+          status: {
+            status: 'disconnected' | 'connecting' | 'connected' | 'error';
+            port: number | null;
+            error: string | null;
+            connectedAt: number | null;
+            tabCount: number;
+          };
+        }>;
       };
       agent: {
         loadMessages: (
@@ -382,8 +431,41 @@ declare global {
         isRunning: (sessionId: string) => Promise<boolean>;
         onEvent: (cb: (e: AgentEvent) => void) => () => void;
       };
+      update: {
+        status: () => Promise<UpdateState>;
+        check: () => Promise<UpdateState | { error: string }>;
+        install: () => Promise<{
+          ok: boolean;
+          error?: string;
+          state?: UpdateState;
+          drainedAfterMs?: number;
+        }>;
+        onEvent: (cb: (state: UpdateState) => void) => () => void;
+      };
     };
   }
+}
+
+/**
+ * Auto-updater state machine snapshot. Exposed as a top-level type
+ * because both `electron/autoUpdater.ts` (the source of truth) and
+ * the renderer's `UpdateBanner` component use it. Keep this in
+ * lockstep with `UpdateState` in `electron/autoUpdater.ts`.
+ */
+export interface UpdateState {
+  state:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'downloaded'
+    | 'error'
+    | 'disabled';
+  availableVersion: string | null;
+  currentVersion: string;
+  error: string | null;
+  downloadPercent: number;
+  lastCheckedAt: number | null;
 }
 
 export {};

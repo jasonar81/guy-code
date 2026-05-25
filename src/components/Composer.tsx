@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import clsx from 'clsx';
 import { Send, Square, AlertTriangle, X, Zap, Paperclip, FileText } from 'lucide-react';
 import { useApp } from '@/lib/store';
 import { formatUsdMicros, formatTokens } from '@/lib/format';
-import type { Attachment } from '@/types';
+import type { Attachment, SkillSummary } from '@/types';
+import { SlashCommandMenu } from './SlashCommandMenu';
+import { detectSlashContext, filterSkills, applySkillPick } from '@/lib/slashMenu';
 
 interface Props {
   sessionId: string;
@@ -143,6 +145,75 @@ export function Composer({ sessionId, visible }: Props) {
   const sleeping = sessionRow?.state === 'sleeping-budget';
   const sleepingSince = sessionRow?.sleeping_since ?? null;
 
+  // ---- Slash-command autocomplete --------------------------------------
+  //
+  // When the user types `/` at the start of the message, we pop a menu
+  // listing skills from `~/.guycode/skills` + the imported Claude env.
+  // Behavior is meant to feel like the Claude Desktop slash menu:
+  //   • Filters live as the user types more letters.
+  //   • ↑ / ↓ navigate, Enter / Tab pick, Esc dismisses.
+  //   • Disappears the moment the cursor leaves the slash word.
+  //
+  // The skills list is loaded once per cwd (cheap filesystem scan on
+  // the main side) and cached in component state. We do NOT re-fetch
+  // on every keystroke — only on cwd change.
+  const cwd = sessionRow?.cwd ?? null;
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    window.api.skills
+      .list(cwd)
+      .then((r) => {
+        if (!cancelled) setSkills(r.skills);
+      })
+      .catch(() => {
+        // Skill loading is non-critical. If it fails the menu just
+        // stays empty; the user can still type normally.
+        if (!cancelled) setSkills([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd]);
+
+  // Cursor position drives slash detection. We track it via a separate
+  // state because React doesn't expose the textarea's selectionStart
+  // through a controlled-input pattern — we sample it on every change
+  // and selection event.
+  const [caret, setCaret] = useState(0);
+  const slashCtx = useMemo(() => detectSlashContext(text, caret), [text, caret]);
+  const filteredSkills = useMemo(
+    () => (slashCtx ? filterSkills(skills, slashCtx.query) : []),
+    [slashCtx, skills]
+  );
+  const menuOpen = slashCtx !== null && skills.length > 0;
+  const [menuIndex, setMenuIndex] = useState(0);
+  // Reset highlight to the top whenever the filtered list changes —
+  // otherwise the highlight could point past the end after a filter
+  // that shrinks the list.
+  useEffect(() => {
+    setMenuIndex(0);
+  }, [filteredSkills.length, slashCtx?.query]);
+
+  /** Pick a skill: splice it into the text and refocus the textarea. */
+  const pickSkill = (idx: number) => {
+    if (!slashCtx) return;
+    const skill = filteredSkills[idx];
+    if (!skill) return;
+    const { newText, newCursor } = applySkillPick(text, slashCtx, skill.name);
+    setText(newText);
+    // Defer the selection update one tick so React has flushed the
+    // new value into the textarea — otherwise setSelectionRange races
+    // with the controlled-update and lands at the wrong offset.
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(newCursor, newCursor);
+      setCaret(newCursor);
+    });
+  };
+
   // Auto-grow textarea
   useEffect(() => {
     const ta = taRef.current;
@@ -274,11 +345,63 @@ export function Composer({ sessionId, visible }: Props) {
     await sendMessage(sessionId, t, sending);
   };
 
+  // Esc-to-dismiss state for the slash menu. We don't unmount the menu
+  // by clearing the slash context (that would require mutating the
+  // textarea); instead we just hide it until the user types again.
+  // Reset whenever the slash query changes — typing more letters means
+  // the user is still actively engaging with the menu.
+  const [menuDismissed, setMenuDismissed] = useState(false);
+  useEffect(() => {
+    setMenuDismissed(false);
+  }, [slashCtx?.query]);
+
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // ---- Slash-command menu navigation ---------------------------------
+    // When the menu is open, we steal a small set of keys for navigation.
+    // Everything else (typing letters, backspace) passes through so the
+    // textarea updates normally and our useMemo re-filters the list.
+    if (menuOpen && !menuDismissed) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMenuIndex((i) => Math.min(i + 1, Math.max(0, filteredSkills.length - 1)));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMenuIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+        if (filteredSkills.length > 0) {
+          e.preventDefault();
+          pickSkill(menuIndex);
+          return;
+        }
+        // Empty list: fall through to the normal Enter (submit) behavior
+        // so the user isn't trapped with a useless menu.
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMenuDismissed(true);
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
+  };
+
+  /**
+   * Track caret position. We sample on every event that can move the
+   * caret because React's controlled-textarea pattern doesn't expose
+   * `selectionStart` as a tracked value. Sampling on `onChange`,
+   * `onKeyUp`, `onClick`, and `onSelect` covers typing, arrow-key
+   * movement, mouse clicks, and programmatic selection changes.
+   */
+  const syncCaret = () => {
+    const ta = taRef.current;
+    if (ta) setCaret(ta.selectionStart ?? 0);
   };
 
   return (
@@ -402,7 +525,16 @@ export function Composer({ sessionId, visible }: Props) {
         </div>
       )}
 
-      <div className="px-3 pb-3 flex items-end gap-2">
+      <div className="px-3 pb-3 flex items-end gap-2 relative">
+        {menuOpen && !menuDismissed && (
+          <SlashCommandMenu
+            items={filteredSkills}
+            activeIndex={menuIndex}
+            query={slashCtx?.query ?? ''}
+            onPick={pickSkill}
+            onHover={setMenuIndex}
+          />
+        )}
         <input
           ref={fileInputRef}
           type="file"
@@ -428,8 +560,17 @@ export function Composer({ sessionId, visible }: Props) {
         <textarea
           ref={taRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            // Sample selectionStart from the same event so the slash
+            // detector sees the post-update caret position on this
+            // tick. Without this we'd be one keystroke behind.
+            setCaret(e.target.selectionStart ?? 0);
+          }}
           onKeyDown={onKey}
+          onKeyUp={syncCaret}
+          onClick={syncCaret}
+          onSelect={syncCaret}
           onPaste={onPaste}
           rows={1}
           placeholder={

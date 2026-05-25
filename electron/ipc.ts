@@ -47,6 +47,7 @@ import {
   getDefaultApiKeyId,
 } from './secret';
 import { resetClient } from './anthropic';
+import { loadSkills } from './skills';
 import {
   ensureOurPathSeeded,
   loadMessagesFromJsonl,
@@ -281,28 +282,50 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
   ipcMain.handle('mcp:signIn', (_e, name: string) => signInMcp(name));
   ipcMain.handle('mcp:signOut', (_e, name: string) => signOutMcp(name));
 
-  // Force-resume a session even if its daily cap is full. One-shot bypass.
-  // The session is moved out of `sleeping-budget` and its pending message is
-  // re-fired through the normal turn flow.
+  // Force-resume a session even if its daily cap is full. Opens a 60s
+  // budget grace window (see budget.ts FORCE_RESUME_GRACE_MS) so the
+  // model's whole multi-call turn can complete instead of pausing
+  // again on the next API call. Mirrors the resume sweep's two-mode
+  // logic: pending user text → fresh turn, otherwise → continue the
+  // in-flight loop using the JSONL as truth. Without the second case,
+  // a mid-turn pause (where the model stopped between API calls but
+  // the user hadn't typed anything new) couldn't be unstuck — the
+  // user clicked Force Resume but nothing happened.
   ipcMain.handle('budget:forceResume', (_e, sessionId: string) => {
     const pending = getSessionPending(sessionId);
     setBypassNextTurn(sessionId);
     setSessionState(sessionId, 'idle');
     // Clear pending so the resume sweep doesn't double-fire later.
     setSessionPending(sessionId, null, null);
-    if (pending?.pending_user_text && pending.pending_user_text.trim()) {
-      const sess = listSessionsAll().find((s) => s.id === sessionId);
-      if (sess) {
-        runUserTurn({
-          sessionId,
-          projectId: sess.project_id,
-          cwd: sess.cwd ?? '',
-          userText: pending.pending_user_text,
-          seedFromJsonl: sess.jsonl_path,
-        }).catch(() => {
-          /* error is broadcast as agent:event */
-        });
-      }
+    const sess = listSessionsAll().find((s) => s.id === sessionId);
+    if (!sess) return { ok: true };
+    const pendingText = pending?.pending_user_text?.trim() ?? '';
+    if (pendingText) {
+      // Fresh-turn case: the user typed something while sleeping
+      // (or before it slept) and that text was parked. Send it now.
+      runUserTurn({
+        sessionId,
+        projectId: sess.project_id,
+        cwd: sess.cwd ?? '',
+        userText: pendingText,
+        seedFromJsonl: sess.jsonl_path,
+      }).catch(() => {
+        /* error is broadcast as agent:event */
+      });
+    } else {
+      // Mid-flight case: the model paused mid-turn (between API
+      // calls). JSONL has the partial state; keep going with no
+      // new user message.
+      runUserTurn({
+        sessionId,
+        projectId: sess.project_id,
+        cwd: sess.cwd ?? '',
+        userText: '',
+        continueExisting: true,
+        seedFromJsonl: sess.jsonl_path,
+      }).catch(() => {
+        /* error is broadcast as agent:event */
+      });
     }
     return { ok: true };
   });
@@ -477,6 +500,139 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
       return { id, projectId, cwd, apiKeyId };
     }
   );
+
+  // ---- Skills (slash-command autocomplete) -----------------------------
+  // Returns the skill list visible from a given cwd. The renderer caches
+  // this per-cwd and uses it to populate the slash-command menu in the
+  // Composer. Cheap to call; loadSkills is just a small filesystem scan.
+  ipcMain.handle('skills:list', (_e, cwd: string | null) => {
+    const reg = loadSkills(cwd ?? null);
+    // Strip body from the wire payload — bodies can be large and the
+    // autocomplete UI only needs name + description. The model still
+    // gets bodies via the Skill tool when it actually invokes one.
+    return {
+      skills: reg.skills.map((s) => ({
+        name: s.name,
+        description: s.description,
+        source: s.source,
+      })),
+    };
+  });
+
+  // ---- Chrome connector ----------------------------------------------
+  //
+  // Status / connect / disconnect surface the singleton in
+  // chromeBridge.ts. The Settings UI polls `chrome:status` while open
+  // (same pattern as MCP) so the user sees the connection light flip
+  // green/red as Chrome is launched / killed in the background.
+  //
+  // We import lazily so the rest of the IPC layer can boot even if
+  // playwright-core is missing (a packaging mistake or a stripped
+  // distribution would otherwise crash the main process at module
+  // load time, taking the whole app with it).
+  ipcMain.handle('chrome:status', async () => {
+    const { getStatus } = await import('./chromeBridge');
+    return getStatus();
+  });
+  ipcMain.handle('chrome:connect', async (_e, port?: number) => {
+    const { connect, getStatus } = await import('./chromeBridge');
+    try {
+      await connect(typeof port === 'number' ? port : undefined);
+      // Sticky auto-reconnect: remember the port the user just
+      // connected to. The next app start checks this setting from
+      // `main.ts` and auto-reconnects in the background. The user's
+      // explicit Connect click IS the opt-in — clicking Disconnect
+      // clears the setting (see handler below) so they can turn it
+      // off without any extra UI.
+      setSetting(
+        'chrome.autoConnectPort',
+        String(typeof port === 'number' ? port : '')
+      );
+      return { ok: true, status: getStatus() };
+    } catch (e: any) {
+      return {
+        ok: false,
+        error: e?.message ?? String(e),
+        status: getStatus(),
+      };
+    }
+  });
+  ipcMain.handle('chrome:disconnect', async () => {
+    const { disconnect, getStatus } = await import('./chromeBridge');
+    await disconnect();
+    // Clear the sticky-reconnect preference so the next app start
+    // honors the user's "I want this off" intent. They can re-enable
+    // by clicking Connect again.
+    setSetting('chrome.autoConnectPort', '');
+    return { ok: true, status: getStatus() };
+  });
+
+  // ---- Auto-updater --------------------------------------------------
+  //
+  // Bridges the renderer to electron-updater. The actual subsystem
+  // is initialized in `main.ts` (it needs the BrowserWindow handle
+  // for broadcasting events), but the IPC surface lives here.
+  //
+  // Lazy import: in dev mode, electron-updater can warn loudly about
+  // missing manifest files even on module load. Dynamic import
+  // inside the handlers means dev runs without those warnings unless
+  // the user explicitly clicks "Check for updates."
+  ipcMain.handle('update:status', async () => {
+    const { getUpdateState } = await import('./autoUpdater');
+    return getUpdateState();
+  });
+  ipcMain.handle('update:check', async () => {
+    const { checkForUpdates } = await import('./autoUpdater');
+    try {
+      return await checkForUpdates();
+    } catch (e: any) {
+      // Re-shape into a structured response so the renderer can
+      // distinguish "checked, no update" (returns state) from
+      // "check itself errored" (rejected promise → error message).
+      return {
+        error: e?.message ?? String(e),
+      };
+    }
+  });
+  ipcMain.handle('update:install', async () => {
+    const { installDownloadedUpdate, getUpdateState } = await import(
+      './autoUpdater'
+    );
+    const { drainBeforeQuit } = await import('./quiesceManager');
+    const startedAt = Date.now();
+    try {
+      // Wait for in-flight agent turns to reach a quiescent state
+      // (idle / waiting-on-user / sleeping-budget / error). Bounded
+      // by the manager's own timeout (default 30 s) so a stuck tool
+      // call can't permanently block the install.
+      await drainBeforeQuit();
+    } catch (e: any) {
+      // Drain timed out — the user might prefer "force install"
+      // over "stuck waiting forever." We surface the error and let
+      // the renderer ask "Install anyway?" If they confirm, the
+      // renderer can call `update:install` again with the override
+      // (TODO: wire force flag once we ship the UI).
+      return {
+        ok: false,
+        error: `quiesce timed out: ${e?.message ?? e}`,
+        state: getUpdateState(),
+      };
+    }
+    const drainedAfterMs = Date.now() - startedAt;
+    const ok = installDownloadedUpdate();
+    if (!ok) {
+      return {
+        ok: false,
+        error:
+          'no update is downloaded yet — refresh status and try again',
+        state: getUpdateState(),
+        drainedAfterMs,
+      };
+    }
+    // We never get here in practice — quitAndInstall terminates the
+    // process — but the promise needs to resolve in case of a race.
+    return { ok: true, drainedAfterMs };
+  });
 }
 
 /** Encode a Windows/Unix cwd path the same way Claude Code does. */

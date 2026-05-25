@@ -14,6 +14,9 @@ import {
   Trash2,
   Edit3,
   RotateCcw,
+  Globe,
+  Copy,
+  Check,
 } from 'lucide-react';
 import clsx from 'clsx';
 import type { McpServerStatus, ApiKey } from '@/types';
@@ -195,6 +198,8 @@ export function SettingsModal({ open, onClose }: Props) {
 
           <ApiKeysSection keys={apiKeys} />
 
+          <ChromeConnectorSection open={open} />
+
           {mcpMsg && (
             <div className="pt-2 border-t border-border">
               <p className="text-[11px] text-text-dim leading-snug">{mcpMsg}</p>
@@ -304,6 +309,262 @@ function McpServersSection({
             />
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Chrome connector controls — extension transport version.
+ *
+ * Previously this section walked the user through launching Chrome
+ * with `--remote-debugging-port`. Chrome 136+ silently disables that
+ * flag on default signed-in profiles (anti-cookie-theft measure) so
+ * the CDP approach no longer works for the primary use case (driving
+ * the user's already-logged-in Chrome).
+ *
+ * The replacement: a small unpacked Chrome extension at
+ * `chrome-extension/` in the repo, which connects out to a WebSocket
+ * server we run in the Electron main process on port 9223. Once the
+ * extension is loaded into Chrome (one-time setup), the user clicks
+ * Connect here and our server waits for the extension to attach.
+ * Everything else — listTabs / openTab / extract / screenshot /
+ * waitFor / click / type / press / scroll / eval — runs through the
+ * extension's `chrome.tabs.*` and `chrome.scripting.*` APIs.
+ *
+ * Polling: when the modal is open, we re-fetch status every 3s so the
+ * UI catches out-of-band changes (the user disables the extension →
+ * the WS server sees the close and resets state). We do NOT poll
+ * while closed so a backgrounded modal doesn't keep IPC noise high.
+ */
+function ChromeConnectorSection({ open }: { open: boolean }) {
+  const [status, setStatus] = useState<{
+    status: 'disconnected' | 'connecting' | 'connected' | 'error';
+    port: number | null;
+    error: string | null;
+    connectedAt: number | null;
+    tabCount: number;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  // Local error message — Chrome connector errors are user-actionable
+  // (port already in use, extension not loaded, etc.) and we want
+  // them inline with the controls, not dumped into the shared mcpMsg.
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+  // Stored separately from `status.port` so the user can edit the
+  // textbox even when not connected. Default 9223 = our WS server's
+  // listen port; the extension's service worker has the same default
+  // baked in, so 99% of users never touch this input.
+  const [portInput, setPortInput] = useState<string>('9223');
+  // Brief "Copied!" affordance on the chrome://extensions/ copy
+  // button — same UX pattern as the old launch-command Copy.
+  const [copied, setCopied] = useState(false);
+
+  const onCopyExtensionsUrl = async () => {
+    // chrome:// URLs can't be opened from a non-privileged origin
+    // (Chromium security policy), so the best the app can do is put
+    // the URL on the clipboard and tell the user to paste it.
+    const url = 'chrome://extensions/';
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API can fail when the window isn't focused — rare
+      // in an Electron modal but the fallback is cheap. Same approach
+      // as the old launch-command copy.
+      const ta = document.createElement('textarea');
+      ta.value = url;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      } catch {
+        /* nothing else to try; the user can paste from the visible code box */
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+  };
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await window.api.chrome.status();
+      setStatus(r);
+    } catch {
+      /* ignore — keep last good */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    refresh();
+    const t = setInterval(refresh, 3000);
+    return () => clearInterval(t);
+  }, [open, refresh]);
+
+  const onConnect = async () => {
+    setBusy(true);
+    setErrMsg(null);
+    try {
+      const portNum = Number(portInput.trim());
+      const port = Number.isFinite(portNum) && portNum > 0 ? portNum : 9223;
+      const r = await window.api.chrome.connect(port);
+      setStatus(r.status ?? null);
+      if (!r.ok && r.error) setErrMsg(r.error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const onDisconnect = async () => {
+    setBusy(true);
+    setErrMsg(null);
+    try {
+      const r = await window.api.chrome.disconnect();
+      setStatus(r.status ?? null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const s = status?.status ?? 'disconnected';
+  let pillIcon: React.ReactNode;
+  let pillLabel: string;
+  let pillCls = 'text-text-dim';
+  switch (s) {
+    case 'connected':
+      pillIcon = <CheckCircle2 size={12} className="text-state-success" />;
+      pillLabel = `Connected · ${status?.tabCount ?? 0} tab${
+        status?.tabCount === 1 ? '' : 's'
+      }`;
+      pillCls = 'text-state-success';
+      break;
+    case 'connecting':
+      // "Connecting" in the new flow really means "WS server is up,
+      // waiting for the extension to call in". User-facing copy
+      // reflects that — they need to know to load/enable the extension.
+      pillIcon = <Loader2 size={12} className="text-text-dim animate-spin" />;
+      pillLabel = 'Waiting for extension…';
+      break;
+    case 'error':
+      pillIcon = <AlertCircle size={12} className="text-state-error" />;
+      pillLabel = 'Error';
+      pillCls = 'text-state-error';
+      break;
+    default:
+      pillIcon = <X size={12} className="text-text-dim" />;
+      pillLabel = 'Disconnected';
+      break;
+  }
+
+  return (
+    <div className="pt-2 border-t border-border">
+      <div className="flex items-center gap-1.5 text-[12px] font-medium text-text mb-1.5">
+        <Globe size={14} className="text-text-dim" />
+        Chrome connector
+      </div>
+      <p className="text-[11px] text-text-dim leading-snug mb-2">
+        Drive your existing logged-in Chrome (Gmail, Slack, Outlook, etc.)
+        from the agent via a small browser extension. One-time setup; the
+        extension reconnects automatically afterwards.
+      </p>
+      <ol className="text-[11px] text-text-dim leading-snug mb-2 list-decimal pl-4 space-y-0.5">
+        <li>
+          Open <code className="font-mono">chrome://extensions/</code> in
+          Chrome (chrome:// URLs can't be opened from here — click Copy
+          and paste into Chrome's address bar).
+        </li>
+        <li>
+          Turn on <strong>Developer mode</strong> (toggle, top-right).
+        </li>
+        <li>
+          Click <strong>Load unpacked</strong> and pick the{' '}
+          <code className="font-mono">chrome-extension</code> folder inside
+          your Guy Code checkout.
+        </li>
+        <li>Come back here and click Connect.</li>
+      </ol>
+      {/* chrome://extensions/ URL display + Copy button. Selectable so
+          the user can manual-copy as a fallback; Copy is the primary
+          path. Same `select-text` + `stopPropagation` story as the old
+          launch-command box. */}
+      <div className="flex items-stretch gap-1.5 mb-2">
+        <code
+          className="flex-1 select-text text-[10px] font-mono bg-bg border border-border rounded p-1.5 overflow-x-auto whitespace-nowrap"
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          chrome://extensions/
+        </code>
+        <button
+          onClick={onCopyExtensionsUrl}
+          className={clsx(
+            'shrink-0 inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded border transition-colors',
+            copied
+              ? 'border-state-success/50 text-state-success bg-state-success/10'
+              : 'border-border text-text-muted hover:text-text hover:border-border-strong'
+          )}
+          title="Copy chrome://extensions/ to the clipboard"
+        >
+          {copied ? <Check size={11} /> : <Copy size={11} />}
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <div className="flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-bg/40">
+        <div className="shrink-0">{pillIcon}</div>
+        <div className="flex-1 min-w-0">
+          <div className={clsx('text-[12px] truncate', pillCls)}>{pillLabel}</div>
+          {status?.error && (
+            <div className="text-[10px] text-state-error truncate" title={status.error}>
+              {status.error}
+            </div>
+          )}
+        </div>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={portInput}
+          onChange={(e) => setPortInput(e.target.value)}
+          disabled={s === 'connected' || s === 'connecting' || busy}
+          className="w-16 rounded border border-border bg-bg px-1.5 py-0.5 text-[11px] font-mono text-text disabled:opacity-50 focus:outline-none focus:border-accent"
+          title="WebSocket port. Default 9223. The extension uses the same default."
+          placeholder="9223"
+        />
+        {s === 'connected' ? (
+          <button
+            onClick={onDisconnect}
+            disabled={busy}
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border text-text-dim hover:text-text hover:border-border-strong"
+          >
+            {busy ? <Loader2 size={10} className="animate-spin" /> : null}
+            Disconnect
+          </button>
+        ) : (
+          <button
+            onClick={onConnect}
+            disabled={busy || s === 'connecting'}
+            className={clsx(
+              'shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border',
+              busy || s === 'connecting'
+                ? 'border-border text-text-dim'
+                : 'border-state-attention/50 text-state-attention hover:bg-state-attention/10'
+            )}
+          >
+            {busy || s === 'connecting' ? (
+              <Loader2 size={10} className="animate-spin" />
+            ) : (
+              <Plug size={10} />
+            )}
+            {s === 'connecting' || busy ? 'Waiting…' : 'Connect'}
+          </button>
+        )}
+      </div>
+      {errMsg && (
+        <p className="mt-1.5 text-[10px] text-state-error leading-snug">
+          {errMsg}
+        </p>
       )}
     </div>
   );

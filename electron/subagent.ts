@@ -41,6 +41,7 @@ import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { getClient, DEFAULT_MODEL, parseExtendedContext } from './anthropic';
 import { TOOLS, executeTool, type ToolContext } from './tools';
+import { maybeSummarize } from './toolSummarizer';
 import { getMcpToolSchemas } from './mcp';
 import { computeCostMicros } from './pricing';
 import { insertUsageEvent } from './db';
@@ -79,6 +80,13 @@ const ROLE_TOOLSETS: Record<SubagentRole, string[]> = {
     'list_skills',
     'read_skill',
     'search_conversation',
+    // Plan often needs to look things up — Anthropic docs, npm
+    // README, Stack Overflow. WebSearch + WebFetch are gated to
+    // plan/general; Execute and Review stay focused on the local
+    // codebase. Both are local tools (no Anthropic server-side
+    // dependency), so they work for every org.
+    'WebSearch',
+    'WebFetch',
   ],
   execute: [
     'Read',
@@ -123,6 +131,26 @@ const ROLE_TOOLSETS: Record<SubagentRole, string[]> = {
     'read_skill',
     'search_conversation',
     'save_memory',
+    'WebSearch',
+    'WebFetch',
+    // Browser* tools drive the user's running Chrome over CDP. Only
+    // the `general` role gets them — `plan`/`review` are read-only
+    // investigation roles where opening a real-world tab would be
+    // surprising, and `execute` should be focused on the local
+    // codebase. The tools self-error with a clear "not connected"
+    // message if Chrome isn't attached, so listing them here is safe
+    // even when the user hasn't set up the connector.
+    'BrowserList',
+    'BrowserOpen',
+    'BrowserAttach',
+    'BrowserExtract',
+    'BrowserScreenshot',
+    'BrowserWaitFor',
+    'BrowserClick',
+    'BrowserType',
+    'BrowserPress',
+    'BrowserScroll',
+    'BrowserEval',
   ],
 };
 
@@ -480,12 +508,40 @@ export async function runSubagent(
       }
       log.info(`[${tag}] tool=${tu.name}`);
       const r = await executeTool(tu.name, tu.input, toolCtx);
-      toolResultBlocks.push({
-        type: 'tool_result',
-        tool_use_id: tu.id,
-        content: r.content,
-        is_error: r.isError,
-      });
+      // Subagents can call BrowserScreenshot (general role only), which
+      // returns content as an Anthropic content-block array (text +
+      // image) rather than a plain string. Skip the text-summarizer
+      // for that case — there's nothing to summarize, and the image
+      // is the whole point. Plain-string results go through the same
+      // archive-large-outputs machinery the parent uses.
+      if (typeof r.content === 'string') {
+        const summarized = maybeSummarize({
+          toolName: tu.name,
+          toolInput: tu.input,
+          sessionId: parent.sessionId,
+          toolUseId: tu.id,
+          rawContent: r.content,
+          isError: r.isError,
+        });
+        if (summarized.archivePath) {
+          log.info(
+            `[${tag}] archived ${summarized.originalChars.toLocaleString()} chars to ${summarized.archivePath}`
+          );
+        }
+        toolResultBlocks.push({
+          type: 'tool_result',
+          tool_use_id: tu.id,
+          content: summarized.content,
+          is_error: summarized.isError,
+        });
+      } else {
+        toolResultBlocks.push({
+          type: 'tool_result',
+          tool_use_id: tu.id,
+          content: r.content as any,
+          is_error: r.isError,
+        });
+      }
     }
 
     messages.push({ role: 'user', content: toolResultBlocks });

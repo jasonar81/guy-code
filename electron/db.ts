@@ -586,6 +586,37 @@ function migrate(d: Database) {
         ALTER TABLE api_keys ADD COLUMN adjustment_hour_ts INTEGER NOT NULL DEFAULT 0;
       `,
     },
+    {
+      version: 6,
+      // Persistent dynamic plans. The model uses the Plan tool to
+      // update/start/complete/abandon plans across a session. Each
+      // session can have many plans over its lifetime, but at most
+      // ONE in 'active' state at any time (enforced by the partial
+      // unique index below).
+      //
+      // steps_json is a serialized array of {id, text, status, notes}
+      // so the schema doesn't have to change every time we tweak the
+      // step shape. The Plan UI panel and the system-prompt injector
+      // both read it via the same JSON parse path.
+      //
+      // outcome_summary is set when the plan transitions to completed
+      // or abandoned. For active plans it stays NULL.
+      up: `
+        CREATE TABLE plans (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('active', 'completed', 'abandoned')),
+          steps_json TEXT NOT NULL,
+          outcome_summary TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX idx_plans_session ON plans(session_id);
+        CREATE UNIQUE INDEX idx_plans_one_active_per_session
+          ON plans(session_id) WHERE state = 'active';
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -1304,6 +1335,179 @@ export function resetApiKeyBudgetAdjustment(id: string, nowHourTs: number): void
       `UPDATE api_keys SET adjustment_micros = 0, adjustment_hour_ts = ? WHERE id = ?`
     )
     .run(Math.round(nowHourTs), id);
+}
+
+// ---- Plans (dynamic, persistent) ---------------------------------------
+
+/**
+ * One step within a plan. `id` is stable so step status survives a
+ * `Plan{action: update}` call that replaces the steps wholesale —
+ * matched by id, status preserved when text changed.
+ */
+export interface PlanStep {
+  id: string;
+  text: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+  notes?: string;
+}
+
+export type PlanState = 'active' | 'completed' | 'abandoned';
+
+export interface PlanRow {
+  id: string;
+  session_id: string;
+  title: string;
+  state: PlanState;
+  steps: PlanStep[];
+  outcome_summary: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface RawPlanRow {
+  id: string;
+  session_id: string;
+  title: string;
+  state: PlanState;
+  steps_json: string;
+  outcome_summary: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function parsePlanRow(r: RawPlanRow): PlanRow {
+  let steps: PlanStep[] = [];
+  try {
+    const parsed = JSON.parse(r.steps_json);
+    if (Array.isArray(parsed)) steps = parsed.filter((s) => s && typeof s.id === 'string');
+  } catch {
+    // Corrupted JSON — log and treat as empty plan rather than throw.
+    // Worst case the model re-issues a Plan{update} and we recover.
+    log.warn(`[db] plan ${r.id} has invalid steps_json; treating as empty`);
+  }
+  return {
+    id: r.id,
+    session_id: r.session_id,
+    title: r.title,
+    state: r.state,
+    steps,
+    outcome_summary: r.outcome_summary,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  };
+}
+
+const PLAN_COLS =
+  'id, session_id, title, state, steps_json, outcome_summary, created_at, updated_at';
+
+/** Active plan for a session, or null. */
+export function getActivePlan(sessionId: string): PlanRow | null {
+  const row = db()
+    .prepare(
+      `SELECT ${PLAN_COLS} FROM plans WHERE session_id = ? AND state = 'active' LIMIT 1`
+    )
+    .get<RawPlanRow>(sessionId);
+  return row ? parsePlanRow(row) : null;
+}
+
+/** All plans for a session, newest first. */
+export function listPlansForSession(sessionId: string): PlanRow[] {
+  const rows = db()
+    .prepare(
+      `SELECT ${PLAN_COLS} FROM plans WHERE session_id = ? ORDER BY created_at DESC`
+    )
+    .all<RawPlanRow>(sessionId);
+  return rows.map(parsePlanRow);
+}
+
+/** Insert a brand-new plan in 'active' state. */
+export function createPlan(args: {
+  id: string;
+  sessionId: string;
+  title: string;
+  steps: PlanStep[];
+  ts: number;
+}): void {
+  db()
+    .prepare(
+      `INSERT INTO plans (id, session_id, title, state, steps_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, ?, ?)`
+    )
+    .run(
+      args.id,
+      args.sessionId,
+      args.title,
+      JSON.stringify(args.steps),
+      args.ts,
+      args.ts
+    );
+}
+
+/** Replace the steps of an existing plan (any state). */
+export function updatePlanSteps(args: {
+  id: string;
+  steps: PlanStep[];
+  ts: number;
+}): void {
+  db()
+    .prepare(`UPDATE plans SET steps_json = ?, updated_at = ? WHERE id = ?`)
+    .run(JSON.stringify(args.steps), args.ts, args.id);
+}
+
+/**
+ * Transition a plan to a terminal state with an optional outcome
+ * summary. Once a plan is `completed` or `abandoned` it cannot
+ * transition again — calling this on a non-active plan is a no-op
+ * with a warning.
+ */
+export function setPlanState(args: {
+  id: string;
+  state: 'completed' | 'abandoned';
+  summary: string | null;
+  ts: number;
+}): void {
+  db()
+    .prepare(
+      `UPDATE plans SET state = ?, outcome_summary = ?, updated_at = ? WHERE id = ? AND state = 'active'`
+    )
+    .run(args.state, args.summary, args.ts, args.id);
+}
+
+/** Insert a new active plan AFTER finalizing any existing active one. */
+export function rotateActivePlan(args: {
+  newId: string;
+  sessionId: string;
+  newTitle: string;
+  newSteps: PlanStep[];
+  previousOutcome: 'completed' | 'abandoned';
+  previousSummary: string | null;
+  ts: number;
+}): void {
+  // Finalize current active (if any), then insert new. Must be
+  // atomic so the unique-active-per-session index never sees two
+  // active rows.
+  const d = db();
+  d.exec('BEGIN');
+  try {
+    d.prepare(
+      `UPDATE plans SET state = ?, outcome_summary = ?, updated_at = ? WHERE session_id = ? AND state = 'active'`
+    ).run(args.previousOutcome, args.previousSummary, args.ts, args.sessionId);
+    d.prepare(
+      `INSERT INTO plans (id, session_id, title, state, steps_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, ?, ?)`
+    ).run(
+      args.newId,
+      args.sessionId,
+      args.newTitle,
+      JSON.stringify(args.newSteps),
+      args.ts,
+      args.ts
+    );
+    d.exec('COMMIT');
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 /** Insert a new API key row. */

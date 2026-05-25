@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Guy Code Bridge",
+  "version": "0.1.0",
+  "description": "Lets the Guy Code desktop app read and drive your Chrome tabs without --remote-debugging-port. Talks to the app over a localhost WebSocket on 127.0.0.1:9223.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "activeTab",
+    "alarms",
+    "storage",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Guy Code Bridge",
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

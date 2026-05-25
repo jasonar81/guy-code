@@ -52,15 +52,101 @@ export interface ToolContext {
   apiKeyId?: string | null;
 }
 
+/**
+ * Image content block for tool results. Mirrors the Anthropic API
+ * shape exactly so we can pass it through to the SDK without
+ * conversion. PNG / JPEG / GIF / WebP are the supported media types
+ * (the same set Anthropic accepts in user-uploaded images).
+ */
+export type ToolResultImageBlock = {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+    data: string;
+  };
+};
+
+export type ToolResultTextBlock = { type: 'text'; text: string };
+
+/**
+ * Structured tool result. Lets a tool ship images (or other rich
+ * blocks) to the model while giving the UI a plain-text summary
+ * for the tool-call card. The model sees `modelContent` verbatim;
+ * the UI sees `uiSummary`.
+ *
+ * Used today by `BrowserScreenshot` so the model receives the
+ * actual image bytes instead of a file path. Most tools should
+ * keep returning a plain string — only reach for this shape when
+ * the model genuinely needs to see binary data.
+ */
+export interface StructuredToolResult {
+  modelContent: Array<ToolResultTextBlock | ToolResultImageBlock>;
+  uiSummary: string;
+}
+
 export interface ToolDef {
   schema: Anthropic.Tool;
-  /** Returns the string content that goes into the tool_result. */
-  execute: (input: any, ctx: ToolContext) => Promise<string>;
+  /**
+   * Returns the content that goes into the tool_result. A plain
+   * string is the common case; return a `StructuredToolResult`
+   * when the model needs to see images or other rich blocks.
+   */
+  execute: (input: any, ctx: ToolContext) => Promise<string | StructuredToolResult>;
   /** If true, the agent loop ends after this tool with no follow-up. */
   endsTurn?: boolean;
 }
 
+/** Narrow type guard for structured results. */
+export function isStructuredToolResult(
+  v: unknown
+): v is StructuredToolResult {
+  return (
+    !!v &&
+    typeof v === 'object' &&
+    Array.isArray((v as StructuredToolResult).modelContent) &&
+    typeof (v as StructuredToolResult).uiSummary === 'string'
+  );
+}
+
 const isWin = process.platform === 'win32';
+
+/**
+ * One-time WSL availability probe at module load.
+ *
+ * On Windows we want to expose a dedicated `WSL` tool *only* when the
+ * user has WSL installed and at least one distro registered. Probing
+ * once at startup keeps the per-call cost zero and makes the tool
+ * registry static (so the schemas the model sees don't change
+ * mid-session).
+ *
+ * `wsl.exe --status` exits 0 on a healthy install, non-zero (or fails
+ * to spawn) otherwise. We give it a small timeout because Microsoft's
+ * own launcher occasionally takes ~1 s to respond on a cold boot, and
+ * we don't want a wedged probe to block the whole electron startup.
+ *
+ * Linux/macOS: never available, short-circuit before spawning.
+ */
+const isWslAvailable: boolean = (() => {
+  if (!isWin) return false;
+  try {
+    // Lazy require so non-Windows platforms don't even pay the
+    // import cost. spawnSync is the only way to get a synchronous
+    // "available?" answer at module evaluation time.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+    const res = spawnSync('wsl.exe', ['--status'], {
+      timeout: 2000,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+    // status === null when the spawn failed entirely (ENOENT, timeout)
+    // or > 0 when wsl reported an error (no distros, service down).
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+})();
 
 /**
  * Resolve a possibly-relative path against the session's cwd. When the
@@ -252,7 +338,23 @@ const SHELL: ToolDef = {
       const args = isWin
         ? ['-NoProfile', '-NonInteractive', '-Command', input.command]
         : ['-lc', input.command];
-      const p = spawn(cmd, args, { cwd, env: process.env });
+      // stdin: 'ignore' (= /dev/null) is critical. Without it, child
+      // processes that read stdin (most notably ssh, but also things
+      // like sudo, gpg, and any CLI that prompts on first run) block
+      // on the empty pipe forever. The user's interactive shell has a
+      // TTY which lets those tools detect "no input now, but maybe
+      // later" and skip the read; a piped stdin with no writer is
+      // indistinguishable to the child from "input pending", so it
+      // waits. The symptom we hit: `ssh net1 'echo alive; date'`
+      // hanging at 30+ seconds in the app while working instantly
+      // from PowerShell. With stdin closed, ssh sees EOF and either
+      // skips interactive auth methods or fails fast — both are
+      // strictly better than hanging.
+      const p = spawn(cmd, args, {
+        cwd,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
       let out = '';
       let timedOut = false;
       let abortedByUser = false;
@@ -267,6 +369,100 @@ const SHELL: ToolDef = {
       const onAbort = () => {
         abortedByUser = true;
         log.info(`[tools] SHELL aborted by user pid=${p.pid}`);
+        killProcessTree(p);
+      };
+      ctx.signal?.addEventListener('abort', onAbort, { once: true });
+      p.stdout.on('data', (b) => (out += b.toString()));
+      p.stderr.on('data', (b) => (out += b.toString()));
+      p.on('close', (code) => {
+        clearTimeout(timer);
+        ctx.signal?.removeEventListener('abort', onAbort);
+        const status = abortedByUser
+          ? 'aborted by user'
+          : timedOut
+            ? `timed out after ${timeout}ms`
+            : `exit ${code}`;
+        resolve(trimOutput(`[${status}]\n${out}`));
+      });
+      p.on('error', (e) => {
+        clearTimeout(timer);
+        ctx.signal?.removeEventListener('abort', onAbort);
+        resolve(`error: ${e.message}`);
+      });
+    });
+  },
+};
+
+// ---- WSL (Windows-only, registered iff a working WSL install is found) ----
+//
+// On Windows the SHELL tool above runs PowerShell. That's the right
+// default — it's the OS-native shell — but a non-trivial slice of
+// useful CLI work is simpler in bash: jq filters, find with -exec,
+// grep -P, tar pipelines, anything that uses Unix path separators
+// natively, anything from the Linux-only ecosystem (some MCP servers,
+// `code .` from a WSL-installed VS Code, etc.).
+//
+// Rather than make the agent prefix every command with `wsl --` from
+// PowerShell (which works but mangles non-ASCII output through
+// PowerShell's UTF-16 stdout) we expose WSL as a peer tool. The agent
+// picks whichever shell suits the task — the description below lays
+// out the choice explicitly.
+//
+// Tool is only registered when `wsl.exe --status` returned 0 at
+// module load (see `isWslAvailable` above), so on a Windows machine
+// without WSL the model never sees a tool that wouldn't work.
+
+const WSL: ToolDef = {
+  schema: {
+    name: 'WSL',
+    description:
+      "Run a bash command inside WSL (Windows Subsystem for Linux). Returns combined stdout+stderr in UTF-8. Default timeout 120s, max 600s.\n\n" +
+      "When to use this vs PowerShell:\n" +
+      "  • WSL: Unix tools (jq, sed -E, grep -P, awk, find -exec), pipelines that depend on Unix utility flags, anything that needs a real Linux environment (Docker-in-WSL, snap, apt). Output is clean UTF-8 — non-ASCII characters survive intact.\n" +
+      "  • PowerShell: Windows-native cmdlets (Get-Process, Get-ChildItem, Active Directory, Windows registry), .NET, COM, anything that touches Windows paths with backslashes that bash would mangle.\n\n" +
+      "Cwd handling: the cwd you pass (or the session cwd) is interpreted as a Windows path. WSL auto-mounts the Windows filesystem under /mnt/<drive>, so `cwd: c:\\\\Users\\\\you\\\\proj` becomes `/mnt/c/Users/you/proj` inside bash automatically. To run inside the WSL filesystem (`/home/...`), `cd` to it as the first thing in the command — passing a WSL path as cwd doesn't work because spawn's cwd is Windows-resolved.\n\n" +
+      "Login shell semantics: we invoke `bash -lc`, so your `~/.bashrc`, `~/.profile`, and PATH are loaded the same way an interactive WSL shell sees them.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        timeout_ms: { type: 'integer', description: 'Default 120000.' },
+        cwd: {
+          type: 'string',
+          description:
+            'Override session cwd. Pass a Windows path (e.g. c:\\path); WSL auto-mounts it.',
+        },
+      },
+      required: ['command'],
+    },
+  },
+  async execute(input, ctx) {
+    const timeout = Math.min(600_000, Math.max(1000, input.timeout_ms ?? 120_000));
+    const cwd = input.cwd ? resolveCwd(input.cwd, ctx.cwd) : defaultLaunchCwd(ctx.cwd);
+    return await new Promise<string>((resolve) => {
+      // `wsl.exe -- bash -lc <cmd>`:
+      //   • The bare `--` tells wsl.exe to stop interpreting its own
+      //     flags and pass everything after to the default distro.
+      //   • `bash -lc` runs as a login shell so rc files are sourced
+      //     and PATH / aliases / pyenv / nvm shims all work.
+      // Same `stdio: ['ignore', 'pipe', 'pipe']` rationale as SHELL —
+      // closing stdin prevents wedged-on-prompt hangs (gpg, ssh, sudo).
+      const p = spawn('wsl.exe', ['--', 'bash', '-lc', input.command], {
+        cwd,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let out = '';
+      let timedOut = false;
+      let abortedByUser = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killProcessTree(p);
+      }, timeout);
+      const onAbort = () => {
+        abortedByUser = true;
+        log.info(`[tools] WSL aborted by user pid=${p.pid}`);
         killProcessTree(p);
       };
       ctx.signal?.addEventListener('abort', onAbort, { once: true });
@@ -431,7 +627,7 @@ const TODOWRITE: ToolDef = {
   schema: {
     name: 'TodoWrite',
     description:
-      'Set the current todo list for this session. Each todo has content, status (pending|in_progress|completed), and id. Display only — does not affect execution.',
+      'Set the current todo list for this session. Each todo has content, status (pending|in_progress|completed), and id. The active plan is persisted to the database — survives compaction, restarts, and budget pauses, and is re-injected at the top of every API call so you stay oriented after long autonomous runs. To finalize a plan and start a new one in the same session, use the `PlanState` tool. Optional `title` sets the human-readable label for the active plan (auto-derived from first incomplete step if omitted).',
     input_schema: {
       type: 'object',
       properties: {
@@ -443,16 +639,92 @@ const TODOWRITE: ToolDef = {
               id: { type: 'string' },
               content: { type: 'string' },
               status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+              notes: {
+                type: 'string',
+                description: 'Optional inline note for this step (e.g. blockers, decisions).',
+              },
             },
             required: ['id', 'content', 'status'],
           },
+        },
+        title: {
+          type: 'string',
+          description:
+            'Optional plan title. Set on the first TodoWrite of a new plan; ignored thereafter. Defaults to the first incomplete step if omitted.',
         },
       },
       required: ['todos'],
     },
   },
-  async execute(input) {
-    return `noted ${input.todos.length} todo(s)`;
+  async execute(input, ctx) {
+    const { persistTodoWrite } = await import('./planManager');
+    return persistTodoWrite({
+      sessionId: ctx.sessionId,
+      todos: Array.isArray(input.todos) ? input.todos : [],
+      title: typeof input.title === 'string' ? input.title : null,
+    });
+  },
+};
+
+// ---- PlanState (lifecycle: complete / abandon / start_new) ------------
+
+const PLAN_STATE: ToolDef = {
+  schema: {
+    name: 'PlanState',
+    description:
+      'Manage the LIFECYCLE of the session\'s active plan (created via TodoWrite). Use this when:\n  • The current plan is fully delivered → action="complete" with an outcome_summary.\n  • You\'re abandoning the current plan (user redirected, plan turned out infeasible) → action="abandon" with a reason.\n  • You\'re starting a fresh plan in the same session → action="start_new" with the previous plan\'s outcome AND the new plan\'s title + initial steps.\nOnce a plan is completed or abandoned, its row stays in the DB for history; only the steps of the ACTIVE plan are re-injected into your context. Distinct from the `Plan` subagent tool, which spawns a planner subagent in fresh context.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['complete', 'abandon', 'start_new'],
+        },
+        outcome_summary: {
+          type: 'string',
+          description:
+            'One-paragraph summary of how the previous plan ended. Required for complete/abandon; recorded as `previous_outcome` for start_new.',
+        },
+        previous_outcome: {
+          type: 'string',
+          enum: ['completed', 'abandoned'],
+          description:
+            'For action=start_new only: how the OUTGOING plan ended. Required.',
+        },
+        next_title: {
+          type: 'string',
+          description: 'For action=start_new only: title for the new plan.',
+        },
+        next_steps: {
+          type: 'array',
+          description:
+            'For action=start_new only: initial steps for the new plan, same shape as TodoWrite.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              content: { type: 'string' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+              notes: { type: 'string' },
+            },
+            required: ['id', 'content', 'status'],
+          },
+        },
+      },
+      required: ['action'],
+    },
+  },
+  async execute(input, ctx) {
+    const { handlePlanState } = await import('./planManager');
+    return handlePlanState({
+      sessionId: ctx.sessionId,
+      action: String(input?.action ?? '') as any,
+      outcomeSummary: typeof input?.outcome_summary === 'string' ? input.outcome_summary : null,
+      previousOutcome:
+        typeof input?.previous_outcome === 'string' ? (input.previous_outcome as any) : null,
+      nextTitle: typeof input?.next_title === 'string' ? input.next_title : null,
+      nextSteps: Array.isArray(input?.next_steps) ? input.next_steps : null,
+    });
   },
 };
 
@@ -1049,6 +1321,618 @@ const READ_SKILL: ToolDef = {
   },
 };
 
+// ---- Skill (fetch the body of a registered skill for execution) ----
+
+const SKILL_TOOL: ToolDef = {
+  schema: {
+    name: 'Skill',
+    description:
+      'Fetch the full instruction body of a skill registered under ~/.guycode/skills, <cwd>/.guycode/skills, or imported from ~/.claude/skills. The skill names available are listed in the system prompt under "Available skills". Pass the EXACT name. Returns the markdown body verbatim — read it, then follow its instructions for the rest of the turn (or until the user changes direction).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        SkillName: {
+          type: 'string',
+          description:
+            'Exact skill name as listed in the Available skills system block (e.g. "feature-spec", "drafting-commits").',
+        },
+      },
+      required: ['SkillName'],
+    },
+  },
+  async execute(input, ctx) {
+    const { loadSkills } = await import('./skills');
+    const name = String(input?.SkillName ?? '').trim();
+    if (!name) return 'error: SkillName is required';
+    const registry = loadSkills(ctx.cwd);
+    const skill = registry.skills.find((s) => s.name === name);
+    if (!skill) {
+      const known = registry.skills.map((s) => s.name).slice(0, 20).join(', ');
+      return `error: no skill named "${name}". Known skills: ${known}${registry.skills.length > 20 ? ', ...' : ''}`;
+    }
+    return [
+      `# Skill: ${skill.name}`,
+      `Source: ${skill.source}`,
+      `Path: ${skill.path}`,
+      `Supporting files dir: ${skill.dir}`,
+      ``,
+      skill.body,
+    ].join('\n');
+  },
+};
+
+// ---- WebSearch + WebFetch (both client-side; run locally) ----
+//
+// We deliberately do NOT use Anthropic's server-side
+// `web_search_20250305` tool. That capability is gated per-organization;
+// orgs without it enabled return a 400 on every turn the tool is
+// registered. A local DuckDuckGo-backed search works for every user and
+// doesn't bill against Anthropic's per-search fee.
+
+const WEB_SEARCH: ToolDef = {
+  schema: {
+    name: 'WebSearch',
+    description:
+      'Search the web via DuckDuckGo and return the top results (title + URL + snippet for each). Use this when you need to find information you don\'t already have — current docs, recent news, code examples, error explanations, comparisons. After picking a relevant result, call WebFetch on its URL to read the full page. 15s timeout, returns up to 10 results by default (cap 25). The output starts with a `Search results for: <query>` header followed by numbered entries.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            'The search query. Phrase it like you would in a search engine — plain keywords work better than full natural-language sentences for most queries.',
+        },
+        max_results: {
+          type: 'integer',
+          description:
+            'Maximum number of results to return. Defaults to 10. Hard cap of 25.',
+          minimum: 1,
+          maximum: 25,
+        },
+      },
+      required: ['query'],
+    },
+  },
+  async execute(input) {
+    const { webSearch } = await import('./webSearch');
+    return await webSearch({
+      query: String(input?.query ?? ''),
+      max_results:
+        typeof input?.max_results === 'number' ? input.max_results : undefined,
+    });
+  },
+};
+
+const WEB_FETCH: ToolDef = {
+  schema: {
+    name: 'WebFetch',
+    description:
+      'Fetch a single URL and return its readable text content (extracted via Mozilla Readability for HTML; verbatim for plain text / JSON / markdown). Use after WebSearch when you need the actual content of a result, or when the user gives you a specific URL. Has a 15s timeout, follows redirects, caps body at 5 MB. Output begins with `Title:` and `URL:` lines, then the extracted body. NOT suitable for binary downloads or for paginating a site — fetches one URL once.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description:
+            'Absolute http(s) URL to fetch. The tool follows redirects automatically.',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  async execute(input) {
+    const { webFetch } = await import('./webFetch');
+    // webFetch returns either content or an `error: ...` string. We
+    // surface either verbatim — `executeTool` wraps real exceptions
+    // separately, and the `error:` text-prefix convention is what
+    // every other tool here uses to convey domain errors without
+    // setting the API-level is_error flag.
+    return await webFetch({ url: String(input?.url ?? '') });
+  },
+};
+
+// ---- Browser* (Chrome connector) ----
+//
+// These tools drive the user's running Chrome over CDP via
+// `playwright-core`. The user must launch Chrome with
+// `--remote-debugging-port=9222` (and a profile dir) once, then click
+// Connect in Settings → Chrome connector. After that the tools can
+// read AND write to the user's actual logged-in tabs (Gmail, Slack,
+// Outlook, etc.) without a separate login per site, which is the
+// whole point.
+//
+// Read tools (BrowserList, BrowserOpen, BrowserExtract,
+// BrowserScreenshot, BrowserWaitFor) are intentionally split from
+// write tools (BrowserClick, BrowserType, BrowserPress,
+// BrowserScroll, BrowserEval) so a future per-write confirmation
+// gate can be added without affecting passive inspection. Today
+// there's no gate — connection itself is the user's affirmative
+// consent, registered through the Settings UI.
+
+const BROWSER_LIST: ToolDef = {
+  schema: {
+    name: 'BrowserList',
+    description:
+      "List all currently open tabs in the connected Chrome browser. Returns each tab's id, URL, and page title.\n\nWhen to call this: ONLY when the user has explicitly told you to look at one of their existing tabs (\"check my Gmail\", \"summarize the article I have open\"). The returned tabIds may then be passed to READ tools (BrowserExtract, BrowserScreenshot, BrowserWaitFor) which work without authorization.\n\nWhen NOT to call this: as a routine first step before doing any browser work. The default workflow is BrowserOpen with a fresh URL — that gives you a clean tab the user isn't using, auto-authorized for write operations, with no permission prompts. Calling BrowserList speculatively and then BrowserAttach-ing to whatever you find is the wrong workflow and the user has flagged it as annoying.\n\nRequires the user to have Chrome running with --remote-debugging-port=9222 and to have clicked Connect in Settings → Chrome connector.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  async execute() {
+    const { listTabs } = await import('./chromeBridge');
+    const tabs = await listTabs();
+    if (tabs.length === 0) return '(no open tabs)';
+    return tabs
+      .map((t) => `${t.id}\t${t.url}\n    ${t.title || '(no title)'}`)
+      .join('\n');
+  },
+};
+
+const BROWSER_OPEN: ToolDef = {
+  schema: {
+    name: 'BrowserOpen',
+    description:
+      "Open a URL in a new tab in the connected Chrome browser and AUTO-AUTHORIZE that tab for you to drive. Returns the new tab's id, final URL (after redirects), and title. The new tab opens in the user's logged-in profile, so site-level auth is already handled.\n\nThis is the PREFERRED way to do browser work: open your own tab and operate inside it. Never reach into the user's existing tabs (Gmail, Slack, etc.) for write actions — those require explicit user permission via BrowserAttach.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'Absolute http(s) URL to open. Must include scheme.',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  async execute(input) {
+    const { openTab } = await import('./chromeBridge');
+    const tab = await openTab(String(input?.url ?? ''));
+    return [
+      `Opened ${tab.id} (auto-authorized — you can click/type/etc here)`,
+      `  URL: ${tab.url}`,
+      `  Title: ${tab.title || '(no title)'}`,
+    ].join('\n');
+  },
+};
+
+const BROWSER_ATTACH: ToolDef = {
+  schema: {
+    name: 'BrowserAttach',
+    description:
+      "Request authorization to DRIVE (click, type, press, scroll, eval, screenshot) one of the user's existing Chrome tabs.\n\nDEFAULT: do not call this. The user has explicitly flagged speculative BrowserAttach as a UX bug. Every invocation pops a native modal interrupting the user, and they don't want to be asked unless they've already told you to work in a specific existing tab.\n\nThe ONLY valid trigger for calling BrowserAttach is the user saying — in plain English — something like \"use the Gmail tab I have open\", \"work in my Slack window\", \"the Outlook tab I'm looking at\". An ambient mention of Gmail/Outlook/etc in the conversation is NOT consent. \"Send a Slack message to Bob\" is NOT consent — open your own Slack tab with BrowserOpen. If you find yourself reasoning \"the user probably wants me to use their existing tab to save a step\", you are about to ship the bug; stop and call BrowserOpen.\n\nWhen in doubt, BrowserOpen. It creates a fresh tab in the same Chrome profile (so the user is already logged in to whatever site you need) and auto-authorizes it without bothering the user. There is no scenario where BrowserOpen is wrong but BrowserAttach is right — the user can always tell you to switch to their existing tab afterward if they prefer.\n\nIf the user denies the modal, the call fails with a clear error — fall back to BrowserOpen, do NOT retry BrowserAttach on the same tab. The authorization (if approved) lasts until the Chrome connector is disconnected.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: {
+          type: 'string',
+          description: 'Tab id from BrowserList (e.g. tab-12345).',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  async execute(input) {
+    const { authorizeTab } = await import('./chromeBridge');
+    const tab = await authorizeTab(String(input?.tabId ?? ''));
+    return [
+      `Authorized ${tab.id} — you may now drive it.`,
+      `  URL: ${tab.url}`,
+      `  Title: ${tab.title || '(no title)'}`,
+    ].join('\n');
+  },
+};
+
+const BROWSER_EXTRACT: ToolDef = {
+  schema: {
+    name: 'BrowserExtract',
+    description:
+      'Extract readable text from a tab. By default returns the full body innerText (hidden / display:none nodes filtered out). Pass a CSS selector to narrow — useful for SPAs like Gmail / Slack / Outlook where the meaningful content is nested. 200K char hard cap; if hit, narrow with a more specific selector. Output begins with `Title:` and `URL:` headers like WebFetch so the model treats the two interchangeably for downstream consumption.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: {
+          type: 'string',
+          description: 'Tab id from BrowserList or BrowserOpen (e.g. tab-1).',
+        },
+        selector: {
+          type: 'string',
+          description:
+            'Optional CSS selector. Use to narrow to a Gmail thread, a Slack channel scroll, an Outlook message body. Multiple matches are joined with double-newlines.',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  async execute(input) {
+    const { extractTab } = await import('./chromeBridge');
+    return await extractTab({
+      tabId: String(input?.tabId ?? ''),
+      selector:
+        typeof input?.selector === 'string' && input.selector.trim()
+          ? input.selector
+          : undefined,
+    });
+  },
+};
+
+const BROWSER_SCREENSHOT: ToolDef = {
+  schema: {
+    name: 'BrowserScreenshot',
+    description:
+      "Take a screenshot of a tab's current viewport and return TWO images plus a label table:\n\n" +
+        "  • A clean image of the page as the user sees it — READ this one for page content, text, layout.\n" +
+        "  • An ANNOTATED image with numbered colored boxes drawn over every clickable / focusable element. PICK targets from this one.\n" +
+        "  • A label table mapping each number to its element: tag, role, visible text, aria-label, a CSS selector, and bbox.\n\n" +
+        'Workflow: read the clean image to understand what\'s on the page; find the label number of the thing you want to interact with on the annotated image; then drive the page with BrowserClick / BrowserType / BrowserPress passing the corresponding `selector` or `text` from the label table. Labels are renumbered on every screenshot.\n\n' +
+        "If the page extends below the fold (`pageInfo.fullSize.height > viewport.height`), call BrowserScroll then re-shoot to see more.\n\n" +
+        'Defaults to viewport (the only supported `area`). `annotate=false` skips the overlay pass and returns only the clean image — use that when overlays would confuse you (page already has numbered UI, you only need to read content, etc.). Privileged URLs (chrome://, file://, about:) cannot be captured — Chrome blocks captureVisibleTab for those.\n\n' +
+        "Transient capture failures: errors like \"image readback failed\" or \"capture failed\" are usually GPU/compositor hiccups (heavy page mid-paint, tab transitioning out of minimized state). The tool already retries up to 5 times with backoff internally (~16s total), un-minimizes Chrome if needed before each attempt, and falls back to chrome.debugger Page.captureScreenshot if all retries are exhausted (works on background / off-screen / occluded windows that captureVisibleTab can't reach). The user does NOT need to bring Chrome to the foreground — that's handled. If you get an error AFTER all of that, it's a real problem (DRM video, dead renderer, no permission). Wait 30-60s with WaitForTime and retry once before escalating. Don't re-issue immediately in a tight loop; the GPU needs time to settle.\n\n" +
+        'Requires the tab to be authorized (BrowserOpen auto-authorizes; BrowserAttach for user tabs).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        area: {
+          type: 'string',
+          enum: ['viewport'],
+          description:
+            'Only "viewport" is supported by the extension transport. Scroll between shots to see more of a long page.',
+        },
+        annotate: {
+          type: 'boolean',
+          description:
+            'Default true. Set false to skip the Set-of-Marks overlay pass — you\'ll get only the clean image, no label table, and the call is faster (one capture instead of two).',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  async execute(input): Promise<StructuredToolResult> {
+    const { screenshotTab } = await import('./chromeBridge');
+    const annotate = input?.annotate !== false;
+    const r = await screenshotTab({
+      tabId: String(input?.tabId ?? ''),
+      area: 'viewport',
+      annotate,
+    });
+    // Persist both images to disk so the user can open them in their
+    // image viewer to compare with what the model saw. Filename
+    // suffix marks which is which.
+    const dir = join(homedir(), '.guycode', 'browser-screenshots');
+    mkdirSync(dir, { recursive: true });
+    const ts = Date.now();
+    const cleanPath = join(dir, `screenshot-${ts}-clean.png`);
+    writeFileSync(cleanPath, Buffer.from(r.cleanBase64, 'base64'));
+    let annotatedPath: string | null = null;
+    const hasAnnotated =
+      annotate && !!r.annotatedBase64 && r.annotatedBase64 !== r.cleanBase64;
+    if (hasAnnotated) {
+      annotatedPath = join(dir, `screenshot-${ts}-annotated.png`);
+      writeFileSync(annotatedPath, Buffer.from(r.annotatedBase64, 'base64'));
+    }
+
+    // ---- Build the label table string for the model ------------------
+    //
+    // Format chosen for the model's benefit: each label on its own
+    // line, fields fixed-position so a Claude reading it can scan a
+    // big table fast. We include all four identifiers (text / aria /
+    // selector / role) when present, so the model can pick the most
+    // durable one for its BrowserClick call.
+    const labelLines: string[] = [];
+    for (const lab of r.labels) {
+      const parts: string[] = [`[${lab.label}]`, lab.tag];
+      if (lab.role) parts.push(`role=${lab.role}`);
+      if (lab.text) parts.push(`text=${JSON.stringify(lab.text)}`);
+      if (lab.aria && lab.aria !== lab.text)
+        parts.push(`aria=${JSON.stringify(lab.aria)}`);
+      if (lab.selector) parts.push(`css=${lab.selector}`);
+      labelLines.push(parts.join(' '));
+    }
+
+    // ---- Build the model-facing content blocks -----------------------
+    //
+    // Order: leading text (context) → clean image → annotated image →
+    // label table. The model sees them in order so the "this is the
+    // clean one, this is the annotated one" framing lands before the
+    // images themselves.
+    const pi = r.pageInfo;
+    const morePagesHint =
+      pi.fullSize.height > pi.viewport.height + 50
+        ? ` (page continues below — full height ${pi.fullSize.height}px, viewport ${pi.viewport.height}px; scroll and re-shoot to see more)`
+        : '';
+    const intro =
+      `Screenshot of ${pi.url}\n` +
+      `Title: ${pi.title || '(no title)'}\n` +
+      `Viewport ${pi.viewport.width}×${pi.viewport.height} @ DPR ${pi.devicePixelRatio}; scroll ${pi.scroll.x},${pi.scroll.y}${morePagesHint}\n\n` +
+      'CLEAN IMAGE (read this for content/text):';
+    const cleanLabel: ToolResultTextBlock = { type: 'text', text: intro };
+    const cleanImg: ToolResultImageBlock = {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: 'image/png',
+        data: r.cleanBase64,
+      },
+    };
+    const blocks: Array<ToolResultTextBlock | ToolResultImageBlock> = [
+      cleanLabel,
+      cleanImg,
+    ];
+    if (hasAnnotated) {
+      blocks.push({
+        type: 'text',
+        text:
+          '\nANNOTATED IMAGE (numbered boxes mark interactive elements — pick targets from here):',
+      });
+      blocks.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: r.annotatedBase64,
+        },
+      });
+      if (labelLines.length > 0) {
+        blocks.push({
+          type: 'text',
+          text:
+            `\nLABEL TABLE (${r.labels.length} element${r.labels.length === 1 ? '' : 's'}):\n` +
+            labelLines.join('\n') +
+            '\n\nTo act on one of these, call BrowserClick / BrowserType / BrowserPress with the `text`, `selector`, or `tabId` shown above.',
+        });
+      } else {
+        blocks.push({
+          type: 'text',
+          text:
+            '\nLABEL TABLE: (no interactive elements detected in the current viewport).',
+        });
+      }
+    }
+
+    // ---- UI summary ---------------------------------------------------
+    //
+    // The renderer's tool-call card shows this string. Keep it short
+    // and useful for the human: paths to both images + label count.
+    const sizeStr = (bytes: number) =>
+      bytes > 1024
+        ? `${(bytes / 1024).toFixed(1)}KB`
+        : `${bytes.toLocaleString()}B`;
+    const uiParts: string[] = [
+      `Clean: ${cleanPath} (${sizeStr(r.bytesClean)})`,
+    ];
+    if (annotatedPath) {
+      uiParts.push(
+        `Annotated: ${annotatedPath} (${sizeStr(r.bytesAnnotated)})`
+      );
+      uiParts.push(
+        `${r.labels.length} interactive element${r.labels.length === 1 ? '' : 's'} labeled`
+      );
+    }
+    const uiSummary = uiParts.join('\n');
+
+    return { modelContent: blocks, uiSummary };
+  },
+};
+
+const BROWSER_WAIT_FOR: ToolDef = {
+  schema: {
+    name: 'BrowserWaitFor',
+    description:
+      "Wait for a condition on a tab. Provide ONE of: selector (CSS selector to appear), text (visible text to match), or networkIdle (no network activity for 500ms). 15s default timeout. Use after a navigation or a form submission when the next state's appearance is unpredictable. Returns 'OK' on success; throws with a clear timeout message on failure.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        selector: { type: 'string' },
+        text: { type: 'string' },
+        networkIdle: { type: 'boolean' },
+        timeoutMs: {
+          type: 'integer',
+          description: 'Override the default 15000 ms timeout.',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  async execute(input) {
+    const { waitForTab } = await import('./chromeBridge');
+    await waitForTab({
+      tabId: String(input?.tabId ?? ''),
+      selector:
+        typeof input?.selector === 'string' && input.selector.trim()
+          ? input.selector
+          : undefined,
+      text:
+        typeof input?.text === 'string' && input.text.trim()
+          ? input.text
+          : undefined,
+      networkIdle: !!input?.networkIdle,
+      timeoutMs:
+        typeof input?.timeoutMs === 'number' ? input.timeoutMs : undefined,
+    });
+    return 'OK';
+  },
+};
+
+const BROWSER_CLICK: ToolDef = {
+  schema: {
+    name: 'BrowserClick',
+    description:
+      "Click an element in a tab. Provide either `selector` (CSS) or `text` (visible-text matcher). Text is preferred for SPAs whose class hashes change between releases — e.g. clicking the Gmail Compose button by text=\"Compose\" is more durable than chasing a class name. 15 s default timeout.\n\nText match semantics: tries EXACT match first (`innerText.trim() === text`), then SUBSTRING match. The substring match prefers clickish elements (a/button/[role=button|link|option|menuitem|tab]) and picks the smallest containing element when several match. So `text: \"June 3 - CONFIRMED\"` will hit a row whose full label is \"June 3 - CONFIRMED - 2026 Product Vision Meeting\" without you having to know the full string. Pass the SHORTEST distinct fragment of the visible label — that's the most reliable selector and it tolerates trailing UI noise (timestamps, sender names, snippet preview text) the model can't see in advance.\n\nuseDebugger=true — escape hatch for stubborn pages (Outlook search, Shadow DOM custom elements, banks that gate on event.isTrusted). Routes the click through chrome.debugger / CDP Input.dispatchMouseEvent so the page sees a real OS-level click. Cost: Chrome shows a yellow \"started debugging this browser\" banner while attached. Use only when the default synthetic-event click fails to register.\n\nRequires the tab to be authorized — open your own with BrowserOpen, or use BrowserAttach only with explicit user permission.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        selector: { type: 'string' },
+        text: { type: 'string' },
+        timeoutMs: { type: 'integer' },
+        useDebugger: {
+          type: 'boolean',
+          description:
+            'Use chrome.debugger to dispatch a real OS-level click. Default false. Set true only when the synthetic click is being ignored by the page.',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  async execute(input) {
+    const { clickTab } = await import('./chromeBridge');
+    await clickTab({
+      tabId: String(input?.tabId ?? ''),
+      selector:
+        typeof input?.selector === 'string' && input.selector.trim()
+          ? input.selector
+          : undefined,
+      text:
+        typeof input?.text === 'string' && input.text.trim()
+          ? input.text
+          : undefined,
+      timeoutMs:
+        typeof input?.timeoutMs === 'number' ? input.timeoutMs : undefined,
+      useDebugger: !!input?.useDebugger,
+    });
+    return 'OK';
+  },
+};
+
+const BROWSER_TYPE: ToolDef = {
+  schema: {
+    name: 'BrowserType',
+    description:
+      "Type a string into an input/textarea/contenteditable, simulating real keyboard typing. Per character we fire the full keystroke sequence (keydown → beforeinput → value commit → input → keyup) — the same events a real user produces — so autocomplete dropdowns, type-ahead search, and React/Vue/Lit change-tracking all see the input as if a human typed it. After all characters, a single change event fires.\n\nIf selector is given, focuses it first then types; if not, types into whatever is currently focused (use after a BrowserClick that focused the right field).\n\nTO REPLACE EXISTING FIELD CONTENTS, ALWAYS use clearFirst:true on the same BrowserType call. Don't engineer a multi-step clear-then-type — clearFirst handles it correctly:\n  • With useDebugger:false (default): clearFirst does a native-setter wipe + input event.\n  • With useDebugger:true: clearFirst sends real Ctrl+A + Delete keystrokes, which works on EVERY app we've tested including ones where DOM mutation gets reverted by an app model (Outlook, Notion, custom Lit inputs).\nDO NOT try to clear by sending repeated BrowserPress {key:\"Backspace\"} calls — synthetic-event Backspace doesn't delete in most apps, and even with useDebugger it's strictly slower than clearFirst's Ctrl+A + Delete.\n\nWhen to use this vs BrowserPress: BrowserType for typing words/sentences/numeric strings into a field. BrowserPress for one-off keys like Enter, Tab, Escape, Arrow keys, or shortcut combos (Ctrl+K, Cmd+S). Note that BrowserPress on a single printable char (e.g. {key:\"J\"}) ALSO inserts the char into the focused field — so it's fine for the rare \"send one more keystroke\" case.\n\nRequires an authorized tab (BrowserOpen / BrowserAttach).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        selector: {
+          type: 'string',
+          description:
+            'Optional CSS selector for the field. Omit to type into the currently focused element.',
+        },
+        text: {
+          type: 'string',
+          description: 'Literal text to type.',
+        },
+        clearFirst: {
+          type: 'boolean',
+          description: 'Clear the field before typing (only valid with selector).',
+        },
+        timeoutMs: { type: 'integer' },
+        useDebugger: {
+          type: 'boolean',
+          description:
+            'Use chrome.debugger to dispatch real OS-level keystrokes. Default false. Set true for pages where the synthetic-event path types but doesn\'t trigger autocomplete / submit (Outlook search, Lit-based custom inputs).',
+        },
+      },
+      required: ['tabId', 'text'],
+    },
+  },
+  async execute(input) {
+    const { typeTab } = await import('./chromeBridge');
+    await typeTab({
+      tabId: String(input?.tabId ?? ''),
+      selector:
+        typeof input?.selector === 'string' && input.selector.trim()
+          ? input.selector
+          : undefined,
+      text: String(input?.text ?? ''),
+      clearFirst: !!input?.clearFirst,
+      timeoutMs:
+        typeof input?.timeoutMs === 'number' ? input.timeoutMs : undefined,
+      useDebugger: !!input?.useDebugger,
+    });
+    return 'OK';
+  },
+};
+
+const BROWSER_PRESS: ToolDef = {
+  schema: {
+    name: 'BrowserPress',
+    description:
+      "Press a single key on the focused element. Three behavior modes, mirroring a real keyboard:\n\n" +
+      "  • Printable single char with no Ctrl/Alt/Meta (e.g. {key:\"J\"}, {key:\" \"}, {key:\",\"}): fires the full keystroke event sequence AND inserts the character into the focused input/textarea/contenteditable. Same effect as a real keystroke.\n" +
+      "  • Shortcut combo (e.g. {key:\"Control+a\"}, {key:\"Meta+c\"}, {key:\"Shift+Tab\"}): fires keystroke events with the modifier bits set; does NOT insert text — let the page handle the shortcut.\n" +
+      "  • Named key (e.g. {key:\"Enter\"}, {key:\"Escape\"}, {key:\"ArrowDown\"}, {key:\"Backspace\"}, {key:\"Tab\"}): fires keystroke events; the page reacts (Enter submits forms, Escape closes modals, ArrowDown moves selection in autocompletes, etc.).\n\n" +
+      "Use BrowserType for typing whole strings — it's faster and runs the same per-char pipeline. Use BrowserPress for one-off keys: submitting forms (Enter), tabbing between fields (Tab), navigating autocompletes (ArrowDown / Enter), shortcuts (Ctrl+K).\n\n" +
+      "Requires an authorized tab (BrowserOpen / BrowserAttach).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        key: {
+          type: 'string',
+          description: 'Key string in Playwright keyboard syntax.',
+        },
+        useDebugger: {
+          type: 'boolean',
+          description:
+            'Use chrome.debugger to dispatch a real OS-level keystroke. Default false. Set true for pages where Enter doesn\'t submit / Tab doesn\'t move focus despite the synthetic events firing (typically apps gating on event.isTrusted).',
+        },
+      },
+      required: ['tabId', 'key'],
+    },
+  },
+  async execute(input) {
+    const { pressTab } = await import('./chromeBridge');
+    await pressTab({
+      tabId: String(input?.tabId ?? ''),
+      key: String(input?.key ?? ''),
+      useDebugger: !!input?.useDebugger,
+    });
+    return 'OK';
+  },
+};
+
+const BROWSER_SCROLL: ToolDef = {
+  schema: {
+    name: 'BrowserScroll',
+    description:
+      'Scroll a tab. Pass deltaY (relative pixel delta, positive=down) OR toY (absolute Y position; use 0 to jump to top). Defaults to deltaY=600 if neither is given. Useful for paging through Slack channel scroll-back or a long Gmail thread.\n\nRequires an authorized tab (BrowserOpen / BrowserAttach).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        deltaY: { type: 'integer' },
+        toY: { type: 'integer' },
+      },
+      required: ['tabId'],
+    },
+  },
+  async execute(input) {
+    const { scrollTab } = await import('./chromeBridge');
+    await scrollTab({
+      tabId: String(input?.tabId ?? ''),
+      deltaY: typeof input?.deltaY === 'number' ? input.deltaY : undefined,
+      toY: typeof input?.toY === 'number' ? input.toY : undefined,
+    });
+    return 'OK';
+  },
+};
+
+const BROWSER_EVAL: ToolDef = {
+  schema: {
+    name: 'BrowserEval',
+    description:
+      "Evaluate a JS expression in page context. The expression runs inside the page (NOT the agent / electron) and its return value is JSON-serialized back. Use as an escape hatch when the typed Browser* tools don't cover what you need — e.g. reading a custom window property, extracting structured JSON the page already exposes, or checking a computed style. Side-effecting code (mutations, fetch calls) works but should be a last resort: prefer BrowserClick / BrowserType for user-style interactions.\n\nNote: many sites (Gmail, Outlook, GitHub, banks) block `new Function` / eval via Content-Security-Policy. If the call errors out with a CSP-related message, fall back to BrowserExtract with a CSS selector for the data you need.\n\nRequires an authorized tab (BrowserOpen / BrowserAttach).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        expression: {
+          type: 'string',
+          description: 'JS expression. Wrapped in `(...)` automatically.',
+        },
+      },
+      required: ['tabId', 'expression'],
+    },
+  },
+  async execute(input) {
+    const { evalTab } = await import('./chromeBridge');
+    return await evalTab({
+      tabId: String(input?.tabId ?? ''),
+      expression: String(input?.expression ?? ''),
+    });
+  },
+};
+
 // ---- WaitForUser (special: ends turn, surfaces to UI) ----
 
 const WAIT_FOR_USER: ToolDef = {
@@ -1256,9 +2140,15 @@ export const TOOLS: Record<string, ToolDef> = {
   Write: WRITE,
   Edit: EDIT,
   [SHELL.schema.name]: SHELL,
+  // WSL is registered alongside PowerShell on Windows machines that
+  // have a working WSL install (probed once at module load). The
+  // model picks whichever shell suits the task; descriptions on each
+  // tool make the choice explicit.
+  ...(isWslAvailable ? { WSL } : {}),
   Grep: GREP,
   Glob: GLOB,
   TodoWrite: TODOWRITE,
+  PlanState: PLAN_STATE,
   WaitForFile: WAIT_FOR_FILE,
   WaitForProcess: WAIT_FOR_PROCESS,
   WaitForTime: WAIT_FOR_TIME,
@@ -1270,6 +2160,34 @@ export const TOOLS: Record<string, ToolDef> = {
   delete_memory: DELETE_MEMORY,
   list_skills: LIST_SKILLS,
   read_skill: READ_SKILL,
+  Skill: SKILL_TOOL,
+  WebSearch: WEB_SEARCH,
+  WebFetch: WEB_FETCH,
+  // Chrome connector — read/write tools that drive the user's running
+  // Chrome via the Guy Code Bridge extension (see
+  // electron/chromeBridge.ts → chromeExtBridge.ts). The tools
+  // self-error with a clear "not connected" message if the user
+  // hasn't connected yet, so they're safe to expose in the global
+  // TOOLS map even when no Chrome is running.
+  //
+  // Tab-ownership policy is enforced at the bridge layer: write
+  // tools (Click / Type / Press / Scroll / Eval / Screenshot) only
+  // run against tabs the agent itself opened with BrowserOpen, or
+  // tabs the user explicitly told the agent to attach to via
+  // BrowserAttach. Read tools (List / Extract / WaitFor) can read
+  // any tab — passively summarizing a user's open page doesn't
+  // hijack focus or mutate state.
+  BrowserList: BROWSER_LIST,
+  BrowserOpen: BROWSER_OPEN,
+  BrowserAttach: BROWSER_ATTACH,
+  BrowserExtract: BROWSER_EXTRACT,
+  BrowserScreenshot: BROWSER_SCREENSHOT,
+  BrowserWaitFor: BROWSER_WAIT_FOR,
+  BrowserClick: BROWSER_CLICK,
+  BrowserType: BROWSER_TYPE,
+  BrowserPress: BROWSER_PRESS,
+  BrowserScroll: BROWSER_SCROLL,
+  BrowserEval: BROWSER_EVAL,
   WaitForUser: WAIT_FOR_USER,
   Task: TASK,
   Plan: PLAN,
@@ -1278,9 +2196,13 @@ export const TOOLS: Record<string, ToolDef> = {
 };
 
 export function getToolSchemas(): Anthropic.Tool[] {
-  // Native tools sorted alphabetically + MCP tools (also sorted) appended.
-  // Cache stability matters here: the order must be deterministic across
-  // turns within a session. We sort both groups individually then concat.
+  // Native tools sorted alphabetically + MCP tools (also sorted). No
+  // server-side Anthropic tools — `web_search_20250305` is gated per
+  // organization and trips a 400 for orgs without it; we provide a
+  // local equivalent via the `WebSearch` ToolDef registered above.
+  // Cache stability matters here: the order must be deterministic
+  // across turns within a session. We sort each group individually
+  // then concat.
   const native = Object.values(TOOLS)
     .map((t) => t.schema)
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -1288,32 +2210,68 @@ export function getToolSchemas(): Anthropic.Tool[] {
   return [...native, ...mcp];
 }
 
+/**
+ * Tool execution result as seen by the agent loop. `content` is what
+ * goes into the next `tool_result` block on the wire — either a plain
+ * string (the historical case) or an array of Anthropic content blocks
+ * (today only used by `BrowserScreenshot` to ship images). `uiSummary`
+ * is what the renderer shows in the tool-call card. For plain-string
+ * tools the two are equal; for structured tools they differ because
+ * the UI can't render an image inline.
+ */
+export interface ExecutedToolResult {
+  content: string | Array<ToolResultTextBlock | ToolResultImageBlock>;
+  uiSummary: string;
+  isError: boolean;
+}
+
 export async function executeTool(
   name: string,
   input: any,
   ctx: ToolContext
-): Promise<{ content: string; isError: boolean }> {
+): Promise<ExecutedToolResult> {
   // MCP-namespaced tools route through the MCP client, not our local registry.
+  // They only ever return plain strings; widen to the new shape here.
   if (name.startsWith('mcp__')) {
     try {
       log.info(`[tool:${name}] start (mcp)`);
       const r = await invokeMcpTool(name, input);
-      if (r) return r;
-      return { content: `error: unknown MCP tool ${name}`, isError: true };
+      if (r)
+        return { content: r.content, uiSummary: r.content, isError: r.isError };
+      return {
+        content: `error: unknown MCP tool ${name}`,
+        uiSummary: `error: unknown MCP tool ${name}`,
+        isError: true,
+      };
     } catch (e: any) {
+      const msg = `error: ${e?.message || String(e)}`;
       log.warn(`[tool:${name}] mcp threw`, e);
-      return { content: `error: ${e?.message || String(e)}`, isError: true };
+      return { content: msg, uiSummary: msg, isError: true };
     }
   }
   const tool = TOOLS[name];
-  if (!tool) return { content: `error: unknown tool ${name}`, isError: true };
+  if (!tool)
+    return {
+      content: `error: unknown tool ${name}`,
+      uiSummary: `error: unknown tool ${name}`,
+      isError: true,
+    };
   try {
     log.info(`[tool:${name}] start`);
-    const content = await tool.execute(input, ctx);
-    return { content, isError: false };
+    const raw = await tool.execute(input, ctx);
+    if (isStructuredToolResult(raw)) {
+      return {
+        content: raw.modelContent,
+        uiSummary: raw.uiSummary,
+        isError: false,
+      };
+    }
+    // Plain string — keep historical behavior (content === uiSummary).
+    return { content: raw, uiSummary: raw, isError: false };
   } catch (e: any) {
+    const msg = `error: ${e?.message || String(e)}`;
     log.warn(`[tool:${name}] threw`, e);
-    return { content: `error: ${e?.message || String(e)}`, isError: true };
+    return { content: msg, uiSummary: msg, isError: true };
   }
 }
 

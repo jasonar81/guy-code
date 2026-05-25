@@ -113,6 +113,22 @@ export function buildSystemBlocks(args: {
   /** Concatenated CLAUDE.md / MEMORY.md context loaded at session start. */
   memoryText?: string;
   /**
+   * Pre-rendered "Available skills" block from `electron/skills.ts`.
+   * Empty string = no skills loaded; we just skip the slot. Sits in
+   * slot 3.5 between memory and currentTask, cached with 1h TTL like
+   * other static project context because the skill set is stable per
+   * cwd within a session.
+   */
+  skillsBlock?: string;
+  /**
+   * Pre-rendered active-plan block from `electron/planManager.ts`. Empty
+   * string = no active plan; slot is skipped. NOT cached — the plan
+   * mutates frequently within a session as TodoWrite / PlanState calls
+   * land. Sits AFTER all cached blocks so a plan update doesn't
+   * invalidate the cache prefix.
+   */
+  activePlanBlock?: string;
+  /**
    * The user's most recent typed prompt (the message that initiated the
    * current turn). Anchored at the END of the system blocks as an
    * un-cached "current task" reminder, so the model always sees what
@@ -125,7 +141,7 @@ export function buildSystemBlocks(args: {
    */
   currentTask?: string | null;
 }) {
-  const { sessionId, cwd, date, platform, memoryText, currentTask } = args;
+  const { sessionId, cwd, date, platform, memoryText, skillsBlock, activePlanBlock, currentTask } = args;
   const isoDate = date.toISOString().slice(0, 10);
   const isWin = platform === 'win32';
   const shellName = isWin ? 'PowerShell' : 'Bash';
@@ -241,7 +257,12 @@ export function buildSystemBlocks(args: {
           ? `Default working directory for shell commands and relative paths is the cwd above.`
           : `No default working directory. The user works across multiple machines and folders; ask in natural language where they want to operate, or use absolute paths. For remote machines use ssh: \`ssh user@host 'command'\`. Relative paths fall back to the user's home directory but you should prefer absolute paths to avoid ambiguity.`,
       ].join('\n'),
-      cache_control: CACHE_1H,
+      // NOTE: no cache_control here. Anthropic caps a request at 4
+      // cache breakpoints. We need slots for: intro, memory, skills,
+      // and the trailing conversation breakpoint. Env is ~30 tokens
+      // and still gets cached as part of whichever prefix ends at the
+      // NEXT breakpoint (memory or skills), so dropping its dedicated
+      // checkpoint costs nothing in practice.
     },
     // Slot 3: project static context (CLAUDE.md / MEMORY.md). Frozen at
     // session start, never edited mid-session, so cache stays valid.
@@ -251,6 +272,34 @@ export function buildSystemBlocks(args: {
             type: 'text' as const,
             text: memoryText,
             cache_control: CACHE_1H,
+          },
+        ]
+      : []),
+    // Slot 3.5: Available skills enumeration. Stable per cwd within a
+    // session, so cached with the same TTL as memory. The body of any
+    // single skill is fetched on-demand via the Skill tool — we don't
+    // inline bodies here because users typically have 30+ skills and
+    // the bodies would dominate the system prompt.
+    ...(skillsBlock && skillsBlock.trim()
+      ? [
+          {
+            type: 'text' as const,
+            text: skillsBlock,
+            cache_control: CACHE_1H,
+          },
+        ]
+      : []),
+    // Slot 3.6 (un-cached): the session's active plan, re-rendered on
+    // every API call. Lives after the cached blocks so a TodoWrite
+    // landing mid-turn doesn't invalidate the cache prefix. Cheap (a
+    // few hundred fresh tokens) and pays for itself many times over by
+    // keeping the model oriented after compaction or long autonomous
+    // tool runs.
+    ...(activePlanBlock && activePlanBlock.trim()
+      ? [
+          {
+            type: 'text' as const,
+            text: activePlanBlock,
           },
         ]
       : []),
@@ -293,9 +342,11 @@ export function buildSystemBlocks(args: {
  *
  * We mutate a copy; the input array is not modified.
  *
- * Note: Anthropic allows up to 4 cache breakpoints per request. We use 3 in
- * the system block (intro/env/memory) and 1 here = 4 total. If we ever add
- * a 4th system breakpoint, drop the env one (lowest value).
+ * Note: Anthropic allows up to 4 cache breakpoints per request. We use up
+ * to 3 in the system block (intro + optional memory + optional skills) and
+ * 1 here = 4 total. The env block intentionally has NO cache_control to
+ * stay under the cap; it still gets cached as part of the prefix ending at
+ * the next breakpoint.
  */
 export function withConversationCacheBreakpoint(
   messages: Anthropic.MessageParam[]

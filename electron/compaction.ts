@@ -16,9 +16,37 @@
 import Anthropic from '@anthropic-ai/sdk';
 import log from 'electron-log';
 import { getApiKey } from './secret';
+import { parseExtendedContext } from './anthropic';
+import { ephemeralizeMessages } from './ephemeralize';
 
 const CHARS_PER_TOKEN = 4;
 const COMPACT_TRIGGER_TOKENS = 180_000;
+
+/**
+ * Per-model context-window caps. Used by `preflightCompactIfNeeded` and
+ * `isPromptTooLongError` to decide when to shrink before sending or how
+ * aggressively to shrink after a 400. The "1m" suffix on the model id
+ * (parsed by `parseExtendedContext`) opts into the 1M-token window.
+ */
+const CONTEXT_CAP_1M = 1_000_000;
+const CONTEXT_CAP_DEFAULT = 200_000;
+
+/**
+ * Pre-flight safety threshold expressed as a fraction of the model's
+ * cap. Set to 95% so we leave headroom for: (a) the system prompt
+ * (which `estimateTokens` doesn't see — it only counts messages), (b)
+ * char→token estimate noise (real tokenization is not exactly 4
+ * chars/token), and (c) the assistant's `max_tokens` reservation that
+ * the API counts against the context window. 95% empirically clears
+ * those three sources of slack on Opus-4.7 / Sonnet-4.5 without
+ * triggering compaction unnecessarily often.
+ */
+const PREFLIGHT_SAFETY_FRACTION = 0.95;
+
+function modelCap(model: string): number {
+  const { want1m } = parseExtendedContext(model);
+  return want1m ? CONTEXT_CAP_1M : CONTEXT_CAP_DEFAULT;
+}
 /**
  * Compaction tail sizing.
  *
@@ -58,9 +86,16 @@ function isUserInitiatedTurn(m: Anthropic.MessageParam): boolean {
  * Pick the start index of the verbatim tail. Walks backwards looking for the
  * (KEEP_RECENT_USER_TURNS)-th most recent user-initiated turn. Falls back to
  * a message-count slice if not enough user-initiated turns exist, and clamps
- * to [MIN, MAX] message-count bounds for safety.
+ * to [MIN, tailMax] message-count bounds for safety.
+ *
+ * `tailMax` overrides KEEP_RECENT_TURNS_MAX (the default cap of 60). The
+ * emergency-recovery path passes a smaller value to force-shrink the tail
+ * when normal compaction wasn't enough to clear the cap.
  */
-function computeKeepStartIndex(messages: Anthropic.MessageParam[]): number {
+function computeKeepStartIndex(
+  messages: Anthropic.MessageParam[],
+  tailMax: number = KEEP_RECENT_TURNS_MAX
+): number {
   let userTurnsFound = 0;
   let idxAtTargetTurn = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -79,8 +114,8 @@ function computeKeepStartIndex(messages: Anthropic.MessageParam[]): number {
   const tailSize = messages.length - cut;
   if (tailSize < KEEP_RECENT_TURNS_MIN) {
     cut = Math.max(0, messages.length - KEEP_RECENT_TURNS_MIN);
-  } else if (tailSize > KEEP_RECENT_TURNS_MAX) {
-    cut = messages.length - KEEP_RECENT_TURNS_MAX;
+  } else if (tailSize > tailMax) {
+    cut = messages.length - tailMax;
   }
   return cut;
 }
@@ -179,22 +214,48 @@ function findSafeCutIndex(
 }
 
 /**
+ * Options for `maybeCompact` to override its trigger / tail-size limits.
+ *
+ * Used by `preflightCompactIfNeeded` (which forces a compaction at our
+ * 95% safety threshold) and `emergencyCompact` (which always compacts
+ * AND tightens the verbatim tail) so we don't have to re-implement the
+ * core compaction flow in three places.
+ */
+export interface CompactOpts {
+  /**
+   * Override the default 180K trigger. Set to `1` to force compaction
+   * regardless of estimated size.
+   */
+  triggerTokens?: number;
+  /**
+   * Override the default 60-message verbatim tail cap. Tightening this
+   * during emergency recovery is what actually reduces the payload —
+   * the head summary is fixed-size, so the tail is the only knob.
+   */
+  keepRecentTurnsMax?: number;
+}
+
+/**
  * Returns a possibly-compacted copy of `messages`. If under the trigger, the
  * input is returned as-is. Otherwise calls a cheap summarizer model and
  * replaces the older slice with one synthetic user message.
  */
 export async function maybeCompact(
-  messages: Anthropic.MessageParam[]
+  messages: Anthropic.MessageParam[],
+  opts?: CompactOpts
 ): Promise<Anthropic.MessageParam[]> {
+  const trigger = opts?.triggerTokens ?? COMPACT_TRIGGER_TOKENS;
+  const tailMax = opts?.keepRecentTurnsMax ?? KEEP_RECENT_TURNS_MAX;
   const tokens = estimateTokens(messages);
-  if (tokens < COMPACT_TRIGGER_TOKENS) return messages;
+  if (tokens < trigger) return messages;
   if (messages.length <= KEEP_RECENT_TURNS_MIN + 2) return messages;
 
   // Pick the verbatim-tail start by preserving the last N user-initiated
   // turns (so the model always sees the user's current question and one
   // prior turn for continuity), then nudge to the nearest safe cut so we
-  // don't split a tool_use/tool_result pair.
-  const desiredCut = computeKeepStartIndex(messages);
+  // don't split a tool_use/tool_result pair. `tailMax` lets the caller
+  // shrink the tail further than the default during emergency recovery.
+  const desiredCut = computeKeepStartIndex(messages, tailMax);
   const safeCut = findSafeCutIndex(messages, desiredCut);
   if (safeCut === 0) {
     log.warn(
@@ -240,6 +301,108 @@ export async function maybeCompact(
     } as Anthropic.MessageParam,
     ...tail,
   ];
+}
+
+/**
+ * Pattern-match the Anthropic API's "prompt too long" 400 error.
+ *
+ * The SDK surfaces this as an `Anthropic.APIError` (or sometimes a
+ * plain Error from the SSE transport) with a message like:
+ *   `400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1008265 tokens > 1000000 maximum"},"request_id":"req_..."}`
+ *
+ * We detect by the literal "prompt is too long" string because the
+ * SDK's typed error fields (`status`, `error.type`) aren't always
+ * populated when the failure happens during streaming. Returns the
+ * estimated input token count from the error message when parseable
+ * (handy for logging "we were 8K over"), or 0 when not.
+ */
+export function isPromptTooLongError(e: unknown): { hit: boolean; tokens: number } {
+  if (!e) return { hit: false, tokens: 0 };
+  const message = (e as any)?.message ?? String(e);
+  const text = typeof message === 'string' ? message : '';
+  if (!text.includes('prompt is too long')) return { hit: false, tokens: 0 };
+  const m = text.match(/(\d{4,})\s*tokens?\s*>\s*\d+/);
+  const tokens = m ? Number(m[1]) : 0;
+  return { hit: true, tokens };
+}
+
+/**
+ * Pre-flight: if estimated tokens exceed the safety threshold for the
+ * model's context window, compact in place. Returns the (possibly
+ * compacted) message array.
+ *
+ * This is the proactive guard. It fires before we hit the cap so the
+ * vast majority of long sessions never see a 400. The reactive
+ * `emergencyCompact` is the fallback for cases this misses (e.g. the
+ * estimate was off because of attachment base64 or a pile of tool_use
+ * blocks the estimator under-counts).
+ */
+export async function preflightCompactIfNeeded(
+  messages: Anthropic.MessageParam[],
+  model: string
+): Promise<Anthropic.MessageParam[]> {
+  const cap = modelCap(model);
+  const safety = Math.floor(cap * PREFLIGHT_SAFETY_FRACTION);
+  const tokens = estimateTokens(messages);
+  if (tokens < safety) return messages;
+  log.info(
+    `[compaction] preflight: estimated ${tokens} tokens >= safety ${safety} (cap ${cap}); compacting`
+  );
+  return await maybeCompact(messages, { triggerTokens: 1 });
+}
+
+/**
+ * Emergency: aggressively shrink the message array. Called after we
+ * actually hit a "prompt is too long" 400 from the API.
+ *
+ * Two-stage strategy (each stage handles a different failure mode):
+ *
+ *  1. **Ephemeralize tool_results.** A single huge tool_result (e.g. a
+ *     Read of a multi-MB file, a Bash output with millions of chars,
+ *     a screenshot) can blow the cap by itself even when message
+ *     count is small. `ephemeralizeMessages` truncates anything > 32KB
+ *     to a deterministic synopsis like
+ *     `[Read#3 8.4MB ref:tr_a1b2c3d4] (first non-empty line)`,
+ *     surfacing enough that the model can choose to re-read if it
+ *     genuinely needs the data.
+ *
+ *  2. **Aggressive head compaction.** Bypass the trigger (always
+ *     compact), tighten KEEP_RECENT_TURNS_MAX so even a small head
+ *     gets a tighter tail. If the summarizer itself fails we still
+ *     return a truncated array (not the original) — leaving the
+ *     original means the retry will 400 again.
+ *
+ * The two stages are independent: ephemeralization can fix the
+ * "one fat tool_result" case without compaction firing, and vice
+ * versa. We run both because we don't know which one is the cause —
+ * we just hit a 400 and need to shrink something.
+ */
+export async function emergencyCompact(
+  messages: Anthropic.MessageParam[]
+): Promise<Anthropic.MessageParam[]> {
+  if (messages.length === 0) return messages;
+  const beforeTokens = estimateTokens(messages);
+  log.warn(
+    `[compaction] emergency: bypass trigger, ephemeralize+aggressive-tail (${messages.length} msgs, ~${beforeTokens} tokens in)`
+  );
+
+  // Stage 1: ephemeralize. Cheap (no API call) — pure local string
+  // truncation. Often resolves the entire problem when the cause was
+  // one outlier tool_result, in which case compaction is a no-op.
+  const ephemeralized = ephemeralizeMessages(messages);
+  const afterEphemTokens = estimateTokens(ephemeralized);
+  log.info(
+    `[compaction] emergency stage 1 (ephemeralize): ~${beforeTokens} → ~${afterEphemTokens} tokens`
+  );
+
+  // Stage 2: aggressive head compaction. If ephemeralization already
+  // got us comfortably under, compaction may also no-op (which is
+  // fine — the override trigger=1 still calls maybeCompact, which
+  // skips when messages.length is too short to safely cut).
+  return await maybeCompact(ephemeralized, {
+    triggerTokens: 1,
+    keepRecentTurnsMax: Math.min(KEEP_RECENT_TURNS_MAX, 20),
+  });
 }
 
 async function summarize(messages: Anthropic.MessageParam[]): Promise<string | null> {

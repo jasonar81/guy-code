@@ -13,6 +13,13 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
+              // sql.js and electron-log both use Node-native paths or
+              // dynamic require() under the hood and must NOT be
+              // bundled through Rollup — they're loaded directly from
+              // node_modules at runtime by Electron's real `require()`.
+              // (playwright-core lived here previously for the same
+              // reason; the Chrome connector is now extension-based
+              // and no longer imports it, so it's been removed.)
               external: ['sql.js', 'electron-log'],
             },
           },

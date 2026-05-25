@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import clsx from 'clsx';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useApp } from '@/lib/store';
@@ -6,6 +6,7 @@ import { ToolCallCard } from './ToolCallCard';
 import { RichText } from './RichText';
 import { LinkifyText } from './LinkifyText';
 import { absoluteTime } from '@/lib/format';
+import { decideScrollWatchdog } from '@/lib/scrollWatchdog';
 import type { ChatMessage, ContentBlock } from '@/types';
 
 interface Props {
@@ -21,6 +22,36 @@ interface Props {
    */
   visible: boolean;
 }
+
+/**
+ * Scroll behavior invariants (the user's stated rules — DO NOT regress):
+ *
+ *   1. Switching to a session ALWAYS lands at the latest message.
+ *      Implemented via `visKey` bump + Virtuoso's
+ *      `initialTopMostItemIndex={index:'LAST', align:'end'}`.
+ *
+ *   2. If the user is at the bottom AND new content is being written
+ *      AND they aren't actively interacting with the scroller, follow
+ *      it down. Implemented via `followOutput` (Virtuoso) + the
+ *      streaming keep-up rAF nudge in this component. Both are gated
+ *      on `mouseDownRef.current` so a drag-to-select doesn't get
+ *      yanked back to bottom.
+ *
+ *   3. If the user is NOT at the bottom AND new content is being
+ *      written, do nothing. They're rereading older content; we leave
+ *      them alone. Implemented via `atBottomRef.current` checks in
+ *      both the keep-up effect and the followOutput callback.
+ *
+ *   4. The scroll watchdog (see `@/lib/scrollWatchdog`) protects against
+ *      Virtuoso re-measurement bugs that yank the user toward the top
+ *      without their consent. It treats user gestures (wheel, touch,
+ *      keydown, scrollbar drag, content drag) as authoritative and
+ *      only fires on UNINTENTIONAL upward jumps.
+ *
+ * If you find yourself fighting these invariants, you're probably
+ * adding a special case the user doesn't want. Push back on the
+ * requirement instead.
+ */
 
 type ResultsById = Map<string, Extract<ContentBlock, { type: 'tool_result' }>>;
 
@@ -128,6 +159,43 @@ export function MessageList({ sessionId, visible }: Props) {
   // the last item grows mid-stream (followOutput only fires on data
   // array length change; mid-item height growth doesn't trigger it).
   const atBottomRef = useRef(true);
+  // Underlying DOM scroller (the element Virtuoso owns). Captured via
+  // the `scrollerRef` callback prop so the scroll-top watchdog below
+  // can attach listeners and read/restore scrollTop directly. Virtuoso
+  // also exposes Window as a possible scroller in the type union, but
+  // we never use customScrollParent / useWindowScroll, so it's always
+  // an HTMLElement in practice; we still narrow defensively.
+  const scrollerElRef = useRef<HTMLElement | null>(null);
+  // Timestamp of the last *user-driven* scroll gesture (wheel, touch,
+  // keydown PageDown/Up, mouse drag on the scrollbar). The watchdog
+  // uses this to distinguish intentional scroll-to-top (which we
+  // never fight) from spurious scrollTop=0 transitions caused by
+  // Virtuoso re-measurements during parent layout shifts.
+  const lastUserScrollAtRef = useRef(0);
+  // Last observed scrollTop for the watchdog to restore from. Updated
+  // on every scroll event. We snapshot ALL scrollTops (not just
+  // non-zero ones) so the restore target is the position the user
+  // was just looking at — not some stale value from minutes ago.
+  const lastScrollTopRef = useRef(0);
+  // Cumulative-drift baseline: the scrollTop at the last user
+  // gesture. Updated on every gesture (wheel/touch/keydown/scrollbar
+  // mousedown), and during the gesture's grace window so a wheel
+  // landing slightly after the keydown also pulls the baseline
+  // forward. The cumulative-drift watchdog rule (scrollWatchdog.ts
+  // v3) uses this to detect slow, multi-event upward yanks that
+  // individually slip under the per-event 150 px threshold but
+  // collectively shift the user hundreds of px from where they were.
+  const noGestureBaselineRef = useRef(0);
+  // Timestamp (ms via Date.now) of the most recent scroller-element
+  // mount, captured by the `scrollerRef` callback when Virtuoso
+  // hands us its underlying DOM node. The watchdog uses this to
+  // identify scroll events arriving in the post-mount window
+  // (typically the first 500 ms after a remount) and apply tighter
+  // rules — Virtuoso can briefly land at scrollTop=0 in that window
+  // before its `initialTopMostItemIndex` directive runs, and on
+  // short conversations the v3 "items > 10" floor lets that
+  // through. See `scrollWatchdog.ts` v4 changelog.
+  const mountAtRef = useRef(0);
 
   // followOutput tells Virtuoso how to behave when the data array
   // grows: 'auto' = jump to bottom; false = leave the user where they
@@ -136,8 +204,23 @@ export function MessageList({ sessionId, visible }: Props) {
   // late" feeling the user reported. The boolean arg is Virtuoso's
   // own atBottom signal, more accurate than our state in the moment
   // of the data change.
+  //
+  // Suppress while the user has the mouse held down on the scroller.
+  // Virtuoso's followOutput races the browser's native auto-scroll-
+  // during-text-selection — Virtuoso writes scrollTop directly via
+  // scrollToIndex while the browser tries to scroll a few px per
+  // frame, and Virtuoso wins. Result without this gate: drag-to-
+  // select-upward from the bottom can't extend past the viewport
+  // edge because every text_delta reanchors to bottom faster than
+  // the browser can scroll up. The mouseDownRef tracks both content
+  // drags and scrollbar drags, so this defers to native behavior in
+  // both cases. The closure resolves mouseDownRef at CALL time
+  // (Virtuoso invokes this callback after render), so forward-
+  // referencing the ref declared further down the function body is
+  // safe.
   const followOutput = useCallback(
     (isAtBottom: boolean): false | 'smooth' | 'auto' => {
+      if (mouseDownRef.current) return false;
       return isAtBottom ? 'auto' : false;
     },
     []
@@ -147,85 +230,62 @@ export function MessageList({ sessionId, visible }: Props) {
     atBottomRef.current = atBottom;
   }, []);
 
-  // Tracks the previous `visible` flag across renders so we can detect
-  // false→true transitions (session switch arriving at this pane).
-  const wasVisibleRef = useRef(false);
-  // Tracks the previous items count so we can detect empty→populated
-  // transitions (history loaded async after the visible flip). Both of
-  // these conditions force a scroll-to-bottom; nothing else does.
-  const prevItemCountRef = useRef(0);
-
   /**
-   * Fire scrollToIndex(LAST, 'end') across `frames` consecutive rAFs.
+   * Visibility-remount key. Increments every time the pane goes
+   * false→true so the Virtuoso instance below remounts. We tried
+   * keeping a single Virtuoso instance and firing scrollToIndex over
+   * many rAF frames after the visibility flip, but the
+   * display:none↔display:block transition (driven by the parent
+   * SessionPane's `hidden` attribute) leaves Virtuoso's internal
+   * ResizeObserver measurements stale, and scrollToIndex with
+   * align:'end' would clamp scrollTop to 0 mid-retry — which is
+   * exactly the "snaps to top on session switch" UX bug.
    *
-   * Why retry across multiple frames? Virtuoso uses ResizeObserver and
-   * IntersectionObserver to measure item heights. The first paint
-   * after a visibility flip or an empty→populated transition often
-   * happens BEFORE measurement has settled — if we ask Virtuoso to
-   * scroll to the last item with `align:'end'` at that moment, the
-   * offset math uses default item heights and may clamp scrollTop=0
-   * (i.e. the visual top). Firing on multiple consecutive frames
-   * guarantees that at least one of them lands AFTER measurement
-   * settles. 8-12 frames (~133-200ms at 60fps, longer if the renderer
-   * is busy) is generous enough for the worst tall-image / heavy-
-   * markdown case we've actually observed, and short enough that the
-   * user can still cancel by scrolling up immediately.
-   *
-   * Each tick reads the FRESHEST items length (via the items.length
-   * dep on the closure) so a streaming delta arriving mid-retry
-   * targets the new last index, not a stale one.
-   *
-   * Returns a cleanup function the caller can run in a useEffect
-   * cleanup to cancel the in-flight retry.
+   * Remounting forces `initialTopMostItemIndex={LAST, end}` to apply
+   * fresh, with measurements taken AFTER the parent has flipped to
+   * display:block. The cost is re-measuring all currently-rendered
+   * items on the next tick; for typical session sizes this is
+   * sub-frame, and it matches the existing UX intent ("switching
+   * sessions always lands at the latest message").
    */
-  const fireScrollToBottom = useCallback((frames = 8) => {
-    let raf = 0;
-    let left = frames;
-    const tick = () => {
-      const lastIndex = items.length - 1;
-      if (lastIndex < 0) return;
-      virtuosoRef.current?.scrollToIndex({
-        index: lastIndex,
-        align: 'end',
-        behavior: 'auto',
-      });
-      left--;
-      if (left > 0) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [items.length]);
-
-  /**
-   * Mount / visibility / history-loaded scroll-to-bottom effect.
-   *
-   * Fires on:
-   *  (1) Pane just became visible (false→true). Session switch landed
-   *      here; user expects newest material in view.
-   *  (2) Items just transitioned from 0 to N while already visible.
-   *      History loaded async after the visible flip — common on
-   *      first-open of a session whose JSONL hadn't been read yet.
-   *
-   * Does NOT fire during in-session streaming or when items grow by 1+
-   * during normal use — those are handled by the keep-up effect below,
-   * which respects atBottomRef so a deliberate scroll-up survives.
-   */
+  const [visKey, setVisKey] = useState(0);
   useEffect(() => {
-    const prevCount = prevItemCountRef.current;
-    prevItemCountRef.current = items.length;
-    if (!visible) {
-      wasVisibleRef.current = false;
-      return;
+    if (visible) {
+      // Diagnostic: log every visKey bump so if a user reports
+      // "session flipped to bottom unexpectedly" we have evidence
+      // of how many remounts fired and when. visKey bumps are
+      // SUPPOSED to fire only on a real session-pane visibility
+      // flip (false→true), but a parent component re-render that
+      // briefly toggles `visible` would cause a spurious bump.
+      // Cheap: one console line per real session switch.
+      // eslint-disable-next-line no-console
+      console.info(
+        `[MessageList] visKey bump for session ${sessionId.slice(0, 8)} → Virtuoso will remount and land at LAST/end`
+      );
+      setVisKey((k) => k + 1);
     }
-    const justBecameVisible = !wasVisibleRef.current;
-    wasVisibleRef.current = true;
-    if (items.length === 0) return;
-    const transitionedFromEmpty = prevCount === 0 && items.length > 0;
-    if (!justBecameVisible && !transitionedFromEmpty) return;
-    return fireScrollToBottom(12);
-  }, [visible, items.length, fireScrollToBottom]);
+  }, [visible, sessionId]);
+
+  /**
+   * Bottom-pin nudge for streaming. When the last assistant message
+   * grows mid-stream (text_delta / tool_use_input_delta clones) the
+   * `data` array reference changes but its length stays the same, so
+   * Virtuoso's `followOutput` doesn't fire. We have to manually nudge.
+   *
+   * One-shot per items reference change — no multi-frame retry. The
+   * remount above already handles the "measurements not settled" case,
+   * so this only runs when Virtuoso is already mounted-and-measured
+   * and we just need a small nudge to keep the streaming tail in view.
+   */
+  const fireScrollToBottom = useCallback(() => {
+    const lastIndex = items.length - 1;
+    if (lastIndex < 0) return;
+    virtuosoRef.current?.scrollToIndex({
+      index: lastIndex,
+      align: 'end',
+      behavior: 'auto',
+    });
+  }, [items.length]);
 
   /**
    * Streaming keep-up effect.
@@ -240,13 +300,259 @@ export function MessageList({ sessionId, visible }: Props) {
    * reference change. If they scrolled up to read history,
    * `atBottomRef.current` flipped false and we leave them alone —
    * fighting that gesture is the worst possible UX.
+   *
+   * Coalesced via rAF: a fast text_delta stream produces 50–200
+   * items-reference updates per second, each of which would otherwise
+   * fire `scrollToIndex`. That's enough to occasionally race with
+   * Virtuoso's internal re-measure pass and produce a wrong scrollTop.
+   * The rAF gate collapses any number of updates within a single
+   * frame into one nudge — same UX, far less pressure on the layout
+   * engine.
    */
+  const scrollNudgePendingRef = useRef(false);
   useEffect(() => {
     if (!streaming) return;
     if (!atBottomRef.current) return;
     if (items.length === 0) return;
-    return fireScrollToBottom(4);
+    // Suppress the auto-keep-up nudge while the user has the mouse
+    // held down on the scroller. Otherwise a drag-to-select
+    // upward gets fought back to bottom on every text_delta — the
+    // user can't extend the selection past the viewport edge
+    // because the keep-up effect re-anchors faster than the
+    // browser's native auto-scroll-during-selection can drag away.
+    // mouseDownRef is reset on mouseup, so the keep-up resumes the
+    // moment the user releases.
+    if (mouseDownRef.current) return;
+    if (scrollNudgePendingRef.current) return;
+    scrollNudgePendingRef.current = true;
+    const id = requestAnimationFrame(() => {
+      scrollNudgePendingRef.current = false;
+      // Re-check atBottom AND mouseDown inside the rAF — the user
+      // may have scrolled up OR started a drag between the effect
+      // firing and the frame landing.
+      if (!atBottomRef.current) return;
+      if (mouseDownRef.current) return;
+      fireScrollToBottom();
+    });
+    return () => {
+      cancelAnimationFrame(id);
+      scrollNudgePendingRef.current = false;
+    };
   }, [items, streaming, fireScrollToBottom]);
+
+  /**
+   * Mid-session scroll-to-top watchdog.
+   *
+   * Symptom: while the user is sitting in a session (NOT switching),
+   * the chat occasionally snaps to the top of the conversation. The
+   * underlying cause is some combination of (a) Virtuoso v4.18.x
+   * re-measurements when the parent flex layout shrinks (Composer
+   * textarea growing as the user types, CurrentPlanPanel
+   * appearing/collapsing on TodoWrite), (b) above-viewport item
+   * height changes during streaming, and (c) `data` reference churn
+   * during fast text_delta storms. None of these reliably reproduce
+   * in isolation.
+   *
+   * Rather than chase each cause individually, install a defense:
+   *
+   *   - Track the user's intentional scroll gestures (wheel, touch,
+   *     keydown, scrollbar drag → mousedown on the scroller). Any
+   *     scrollTop change within 200ms of one of those is "intended"
+   *     and we leave it alone, even if it lands at 0.
+   *
+   *   - Snapshot scrollTop on every scroll event.
+   *
+   *   - When scrollTop transitions to 0 (or near-0) WITHOUT a recent
+   *     user gesture AND the list has more than a handful of items,
+   *     restore the previous scrollTop. This is a defensive write —
+   *     if Virtuoso was about to re-paint anyway, our restoration
+   *     gets the user back to where they were before the next paint
+   *     lands.
+   *
+   * The threshold (10 items) avoids false-positive restoration on
+   * tiny lists where scrollTop=0 is a legitimate resting state.
+   */
+  // True between mousedown and mouseup ON the scroller — i.e., while
+  // the user is actively dragging the scrollbar handle. The watchdog
+  // uses this as an unconditional "honor every scroll" override:
+  // dragging the scrollbar produces a continuous stream of scroll
+  // events with the cursor pinned outside any standard "user gesture"
+  // signal — the only mousedown was at the start of the drag, and
+  // its 200 ms grace window expires long before a slow upward drag
+  // finishes. Without this flag, mid-drag scroll events past the
+  // grace window get classified as spurious and yanked back, which
+  // is exactly the "drag up sticks, drag down works" symptom from
+  // before this fix.
+  const isDraggingRef = useRef(false);
+  // True between any primary-button mousedown ON the scroller and
+  // its corresponding mouseup. Strictly broader than `isDraggingRef`:
+  // includes content drags (text selection), not just scrollbar
+  // drags. The streaming-keep-up effect uses this to suppress its
+  // auto-scroll-to-bottom nudge while the user is actively
+  // interacting with the scroller — without this gate, a drag-to-
+  // select-upward during a streaming response yanks the user back
+  // to the bottom on every text_delta, making it impossible to
+  // extend a selection upward past the viewport edge. The watchdog
+  // uses it to keep the cumulative-drift baseline pinned to the
+  // current scrollTop for the duration of the drag, so the browser's
+  // native auto-scroll-during-selection (small per-frame steps that
+  // accumulate into a multi-hundred-px total) doesn't trip the
+  // drift rule.
+  const mouseDownRef = useRef(false);
+
+  useEffect(() => {
+    const el = scrollerElRef.current;
+    if (!el) return;
+    const markUserScroll = () => {
+      lastUserScrollAtRef.current = Date.now();
+      // Reset the cumulative-drift baseline to the current scrollTop
+      // every time a fresh gesture lands. Without this, baseline
+      // would forever reflect the very first gesture and any
+      // legitimate user-driven scroll over time would look like a
+      // huge "drift" to the watchdog.
+      noGestureBaselineRef.current = el.scrollTop;
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      // Only the primary button — middle-click autoscroll on Windows
+      // and right-click context menu shouldn't open the override.
+      if (e.button !== 0) {
+        markUserScroll();
+        return;
+      }
+      // Track ALL primary mousedowns on the scroller (regardless of
+      // whether they hit the scrollbar or the content) so the
+      // streaming-keep-up effect can suppress its auto-scroll-to-
+      // bottom nudge for the duration of the drag — otherwise a
+      // text-selection drag-upward gets fought back to the bottom.
+      mouseDownRef.current = true;
+      // Distinguish "click on the scrollbar (handle or track)" from
+      // "click on the content (e.g. starting a text selection)".
+      // `offsetX` is measured from the element's padding edge inside
+      // its border. `clientWidth` is the inner width MINUS the
+      // vertical scrollbar gutter. So when the cursor is past
+      // `clientWidth`, it's over the scrollbar — that's the only
+      // case where we want the FULL watchdog override on (bypass
+      // BOTH big-jump and cumulative-drift rules). For content drags
+      // the cumulative-drift rule still gets pinned to current via
+      // mouseDownRef in the scroll handler, but big-jump remains
+      // active so a layout shift mid-selection still fights back.
+      const onScrollbar = e.offsetX > el.clientWidth;
+      if (onScrollbar) isDraggingRef.current = true;
+      markUserScroll();
+    };
+    // mouseup MUST be on window — the user can release outside the
+    // scroller (drags often track off the element), and we MUST hear
+    // about it or the dragging flag stays true forever, leaving the
+    // watchdog disabled until the next mousedown.
+    const onMouseUp = () => {
+      const wasInteracting = mouseDownRef.current || isDraggingRef.current;
+      mouseDownRef.current = false;
+      if (isDraggingRef.current) isDraggingRef.current = false;
+      if (wasInteracting) {
+        // Treat the release itself as a fresh user gesture — gives
+        // the watchdog its normal 200 ms grace window for any final
+        // settling scroll events the browser fires post-release.
+        markUserScroll();
+      }
+    };
+    const onScroll = () => {
+      const cur = el.scrollTop;
+      const prev = lastScrollTopRef.current;
+      // Active scrollbar drag → unconditionally honor. The watchdog
+      // is for fighting Virtuoso re-measurement jumps, not user
+      // gestures. ALSO pull the cumulative-drift baseline along
+      // with the drag so a user dragging from y=2000 to y=200 doesn't
+      // immediately retrigger the cumulative rule on the next
+      // post-release scroll event.
+      if (isDraggingRef.current) {
+        lastScrollTopRef.current = cur;
+        noGestureBaselineRef.current = cur;
+        return;
+      }
+      // Content drag (text selection in progress, mouse held down):
+      // pin the cumulative-drift baseline to the current scrollTop
+      // every event, so the browser's native auto-scroll-during-
+      // selection (small per-frame steps) doesn't accumulate into a
+      // multi-hundred-px "drift" that trips the cumulative rule and
+      // yanks the user mid-selection. The big-jump rule stays
+      // active — a layout shift during selection (>150 px in a
+      // single event) is still spurious and we still fight it.
+      if (mouseDownRef.current) {
+        noGestureBaselineRef.current = cur;
+      }
+      const sinceUserMs = Date.now() - lastUserScrollAtRef.current;
+      // mountAtRef is 0 before the first scrollerRef capture; treat
+      // that as "no mount recorded yet" by passing undefined so the
+      // post-mount rule short-circuits (back-compat semantics).
+      const sincePostMount =
+        mountAtRef.current > 0 ? Date.now() - mountAtRef.current : undefined;
+      // Decision rule lives in `@/lib/scrollWatchdog` so it can be
+      // unit-tested without mounting the whole component.
+      const decision = decideScrollWatchdog({
+        prevScrollTop: prev,
+        newScrollTop: cur,
+        msSinceUserGesture: sinceUserMs,
+        itemsLength: items.length,
+        noGestureBaseline: noGestureBaselineRef.current,
+        msSincePostMount: sincePostMount,
+      });
+      if (decision.spurious && decision.restoreTo !== undefined) {
+        const restoreTo = decision.restoreTo;
+        // Restore. Use scrollTo (not scrollTop = ...) because the
+        // scroller may be inside a container Virtuoso owns; scrollTo
+        // honors smooth-vs-instant scroll mode the same way the user's
+        // earlier gesture did. instant restore is what we want here.
+        el.scrollTo({ top: restoreTo, behavior: 'instant' as ScrollBehavior });
+        if (
+          typeof window !== 'undefined' &&
+          (window as any).localStorage?.scrollDebug === '1'
+        ) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[MessageList] watchdog (${decision.reason}): restored scrollTop ${restoreTo} from ${cur} ` +
+              `(prev=${prev}, baseline=${noGestureBaselineRef.current}, ` +
+              `items=${items.length}, sinceUserMs=${sinceUserMs})`
+          );
+        }
+        // Don't update lastScrollTopRef from the restore itself —
+        // the next scroll event for the restored position will
+        // arrive shortly and update it then.
+        return;
+      }
+      lastScrollTopRef.current = cur;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    el.addEventListener('wheel', markUserScroll, { passive: true });
+    el.addEventListener('touchstart', markUserScroll, { passive: true });
+    el.addEventListener('keydown', markUserScroll);
+    el.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      el.removeEventListener('wheel', markUserScroll);
+      el.removeEventListener('touchstart', markUserScroll);
+      el.removeEventListener('keydown', markUserScroll);
+      el.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mouseup', onMouseUp);
+      // If the user happened to be mid-drag when this effect tore
+      // down (e.g., session switched during a drag), reset state
+      // so the next mount starts clean. We DON'T reset
+      // `mouseDownRef` here: the effect can re-bind mid-drag
+      // (items.length change while user holds mouse down) on the
+      // SAME DOM scroller; clearing the flag in that case would
+      // cause the streaming-keep-up effect to immediately yank
+      // the user back to bottom while they're still selecting.
+      // The window-level mouseup listener still fires on the new
+      // effect instance, so the flag clears correctly when the
+      // user actually releases.
+      isDraggingRef.current = false;
+    };
+    // Re-bind when the scroller element changes (Virtuoso remounts on
+    // visKey bump, which gives us a new HTMLElement) and when items
+    // changes — the items length is captured in the closure so the
+    // SCROLL_TOP_THRESHOLD compare reads a fresh value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollerElRef.current, items.length]);
 
   const itemContent = useCallback(
     (_index: number, item: VirtItem) => {
@@ -338,10 +644,18 @@ export function MessageList({ sessionId, visible }: Props) {
     []
   );
 
-  // Empty state: don't render Virtuoso at all (it would still mount
-  // a viewport / scroller). A simple centered placeholder is cheaper
-  // and matches the previous UX.
-  if (items.length === 0) {
+  // Empty state: render the placeholder ONLY when the chat has never
+  // been loaded yet OR the underlying message list is genuinely empty.
+  // We intentionally do NOT short-circuit just because `items.length
+  // === 0` — `items` is a derived array (filterDisplayMessages +
+  // queued + budget-queued). It can transiently drop to 0 during a
+  // history reload while `messages.length` is mid-replacement, and
+  // unmounting Virtuoso on that flicker forces a remount which
+  // re-applies `initialTopMostItemIndex`. Mounting Virtuoso with an
+  // empty `data` array is well-supported and avoids that whole class
+  // of remount-driven scroll resets.
+  const hasNeverLoaded = chat == null || (!chat.loaded && messages.length === 0);
+  if (hasNeverLoaded && items.length === 0) {
     return (
       <div className="flex-1 overflow-hidden flex items-center justify-center text-text-dim text-[12px]">
         Type a message below to start.
@@ -351,7 +665,35 @@ export function MessageList({ sessionId, visible }: Props) {
 
   return (
     <Virtuoso<VirtItem>
+      // Remount on visibility flip — see visKey comment above.
+      // sessionId in the key as well so a session-switch that lands on
+      // the same SessionPane (theoretically possible during reorder
+      // animations) also gets a fresh Virtuoso.
+      key={`${sessionId}-${visKey}`}
       ref={virtuosoRef}
+      // Capture the underlying scroller HTMLElement for the watchdog
+      // (see useEffect above). Virtuoso's typed callback union allows
+      // Window | HTMLElement | null; we narrow to HTMLElement since
+      // we never enable customScrollParent or useWindowScroll.
+      scrollerRef={(el) => {
+        const next = el instanceof HTMLElement ? el : null;
+        // Stamp mount time only when the element actually changed —
+        // Virtuoso calls scrollerRef on every render in some
+        // versions, and we want the timestamp to reflect actual
+        // remounts (visKey bump → fresh DOM node), not noise.
+        if (next !== scrollerElRef.current) {
+          scrollerElRef.current = next;
+          if (next !== null) {
+            mountAtRef.current = Date.now();
+            // Reset scroll-state refs to whatever the fresh element
+            // reports right now. Without this, the watchdog's
+            // post-mount rule would compare against stale values
+            // from the previous Virtuoso instance.
+            lastScrollTopRef.current = next.scrollTop;
+            noGestureBaselineRef.current = next.scrollTop;
+          }
+        }
+      }}
       data={items}
       computeItemKey={computeItemKey}
       itemContent={itemContent}

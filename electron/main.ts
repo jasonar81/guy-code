@@ -1,12 +1,15 @@
-import { app, BrowserWindow, shell } from 'electron';
+import { app, BrowserWindow, dialog, shell } from 'electron';
 import { join } from 'node:path';
 import log from 'electron-log';
-import { db, initDb, resetStaleRunningSessions } from './db';
+import { db, initDb, resetStaleRunningSessions, getSetting } from './db';
 import { registerIpc } from './ipc';
 import { importClaudeProjects } from './claudeImport';
 import { bootstrapApiKey, hasApiKey } from './secret';
 import { startGovernor, stopGovernor } from './budget';
+import { cleanupArchives } from './toolSummarizer';
 import { initMcp, shutdownMcp } from './mcp';
+import { setAttachApprovalPrompter } from './chromeExtBridge';
+import { initAutoUpdater, shutdownAutoUpdater } from './autoUpdater';
 
 log.initialize();
 log.transports.file.level = 'info';
@@ -167,10 +170,108 @@ app.whenReady().then(async () => {
 
   registerIpc(() => mainWindow);
   createWindow();
+
+  // Wire the BrowserAttach approval prompter. The bridge calls this
+  // every time the agent tries to authorize a pre-existing tab via
+  // BrowserAttach; we show a native modal so the user has to
+  // explicitly OK each one. No prompter wired = fail closed (deny).
+  setAttachApprovalPrompter(async ({ tabId, url, title }) => {
+    const w = mainWindow;
+    // Truncate long titles / URLs so the dialog stays readable.
+    const niceTitle =
+      title.length > 80 ? title.slice(0, 77) + '…' : title || '(untitled)';
+    const niceUrl = url.length > 100 ? url.slice(0, 97) + '…' : url;
+    const opts: Electron.MessageBoxOptions = {
+      type: 'question',
+      title: 'Allow agent to drive Chrome tab?',
+      message: 'The agent wants to operate on one of your existing Chrome tabs.',
+      detail:
+        `Title:  ${niceTitle}\n` +
+        `URL:    ${niceUrl}\n` +
+        `Tab id: ${tabId}\n\n` +
+        'If you allow this, the agent will be able to click, type, ' +
+        'press keys, scroll, screenshot, and run JavaScript in this ' +
+        "tab — until you disconnect the Chrome connector.\n\n" +
+        'Only allow if you specifically asked the agent to use this ' +
+        "tab. Otherwise click Deny — the agent will open its own tab " +
+        'instead.',
+      buttons: ['Deny', 'Allow'],
+      defaultId: 0, // Deny is the safe default (Enter on a no-op)
+      cancelId: 0, // Esc / window close = Deny
+      noLink: true, // Windows: don't render the buttons as hyperlinks
+    };
+    try {
+      const r = w
+        ? await dialog.showMessageBox(w, opts)
+        : await dialog.showMessageBox(opts);
+      return r.response === 1; // 1 = "Allow"
+    } catch (e) {
+      log.warn('[main] BrowserAttach dialog threw, denying by default', e);
+      return false;
+    }
+  });
+
   startGovernor();
+  // Sweep stale archived tool results in the background. Best-effort;
+  // failures are logged but don't block startup.
+  try {
+    cleanupArchives();
+  } catch (e) {
+    log.warn('[main] tool-result archive cleanup failed', e);
+  }
   // Fire MCP init in the background; failures are non-fatal so we don't
   // block the window. Individual servers are isolated by mcp.ts.
   initMcp().catch((e) => log.error('[main] MCP init failed', e));
+  // Initialize the auto-updater. In dev (`!app.isPackaged`) this is a
+  // no-op — the renderer's update banner just never fires. In a
+  // packaged build it kicks off the initial update check after a 30 s
+  // grace and polls every 4 hours thereafter. The renderer subscribes
+  // to state via the `update:event` IPC broadcast.
+  try {
+    initAutoUpdater(() => mainWindow);
+  } catch (e) {
+    log.error('[main] autoUpdater init failed (continuing without auto-update)', e);
+  }
+
+  // Sticky Chrome auto-reconnect. If the user successfully connected
+  // the Chrome connector on a previous run, the IPC handler in
+  // `chrome:connect` saved the port to `chrome.autoConnectPort`. We
+  // restore that connection in the background here so the user
+  // doesn't have to click Settings → Connect on every app start.
+  // Disconnect clears the setting, so this only fires when the user
+  // was deliberately connected when they last quit. Failures are
+  // non-fatal — a stale port, missing extension, or busy port just
+  // leaves the connector disconnected and the user can click
+  // Connect manually with a useful error in Settings.
+  const autoConnectRaw = (() => {
+    try {
+      return getSetting('chrome.autoConnectPort');
+    } catch (e) {
+      log.warn('[main] reading chrome.autoConnectPort setting failed', e);
+      return null;
+    }
+  })();
+  if (autoConnectRaw && autoConnectRaw.trim()) {
+    const portNum = Number(autoConnectRaw.trim());
+    const port = Number.isFinite(portNum) && portNum > 0 ? portNum : undefined;
+    setTimeout(async () => {
+      try {
+        const { connect } = await import('./chromeExtBridge');
+        await connect(port);
+        log.info(
+          `[main] Chrome auto-reconnect succeeded on port ${port ?? '(default)'}`
+        );
+      } catch (e: any) {
+        // Don't surface this as a startup error — the user will see
+        // the disconnected pill in Settings if they go look. Logging
+        // the message helps debugging "why didn't it auto-connect"
+        // questions later.
+        log.warn(
+          `[main] Chrome auto-reconnect failed (will require manual Connect click): ${e?.message ?? e}`
+        );
+      }
+    }, 1500);
+  }
 
   // Kick off import in the background after the window is ready.
   setTimeout(() => {
@@ -203,6 +304,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   stopGovernor();
+  shutdownAutoUpdater();
   shutdownMcp().catch(() => {
     /* best effort */
   });

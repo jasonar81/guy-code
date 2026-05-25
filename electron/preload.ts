@@ -76,6 +76,11 @@ const api = {
     signIn: (name: string) => ipcRenderer.invoke('mcp:signIn', name),
     signOut: (name: string) => ipcRenderer.invoke('mcp:signOut', name),
   },
+  skills: {
+    // Returns { skills: [{ name, description, source }] } for a cwd.
+    // Used by the Composer's slash-command autocomplete menu.
+    list: (cwd: string | null) => ipcRenderer.invoke('skills:list', cwd),
+  },
   imports: {
     run: () => ipcRenderer.invoke('import:run'),
     onProgress: (cb: (p: any) => void) => {
@@ -91,6 +96,18 @@ const api = {
   dialog: {
     pickDirectory: (defaultPath?: string) =>
       ipcRenderer.invoke('dialog:pickDirectory', { defaultPath }),
+  },
+  chrome: {
+    // Returns the connector's current state: {status, port, error,
+    // connectedAt, tabCount}. The Settings UI polls this while open so
+    // the user sees the indicator flip when they launch / kill Chrome.
+    status: () => ipcRenderer.invoke('chrome:status'),
+    // Resolves with {ok, status} on success or {ok:false, error, status}
+    // on failure (e.g. Chrome not listening on the port). The renderer
+    // surfaces `error` verbatim because the main side already wrote a
+    // user-actionable message.
+    connect: (port?: number) => ipcRenderer.invoke('chrome:connect', port),
+    disconnect: () => ipcRenderer.invoke('chrome:disconnect'),
   },
   agent: {
     loadMessages: (sessionId: string, opts?: { fallbackPath?: string }) =>
@@ -113,6 +130,27 @@ const api = {
       const listener = (_: unknown, e: any) => cb(e);
       ipcRenderer.on('agent:event', listener);
       return () => ipcRenderer.removeListener('agent:event', listener);
+    },
+  },
+  update: {
+    // Snapshot of the auto-updater state machine. The Settings
+    // panel reads this on mount; the UpdateBanner relies on the
+    // streaming `onEvent` subscription below for live updates.
+    status: () => ipcRenderer.invoke('update:status'),
+    // Manual "Check for updates" button. Resolves with the
+    // post-check state snapshot. Errors propagate as a thrown
+    // exception (caller's catch sees the message).
+    check: () => ipcRenderer.invoke('update:check'),
+    // Triggers `quitAndInstall` AFTER the quiesce manager confirms
+    // sessions are drained. Returns { ok, error?, drainedAfterMs? }.
+    install: () => ipcRenderer.invoke('update:install'),
+    // Subscribe to every state transition (checking, available,
+    // downloaded, error, etc.). Returns an unsubscribe thunk so
+    // React effects can clean up on unmount.
+    onEvent: (cb: (state: unknown) => void) => {
+      const listener = (_: unknown, state: unknown) => cb(state);
+      ipcRenderer.on('update:event', listener);
+      return () => ipcRenderer.removeListener('update:event', listener);
     },
   },
 };

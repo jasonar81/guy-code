@@ -186,6 +186,9 @@ import {
   precheckCall,
   precheckTurn,
   setBypassNextTurn,
+  getBypassUntil,
+  _resetBypassForTests,
+  FORCE_RESUME_GRACE_MS,
   resetBudgetAdjustment,
 } from '../electron/budget';
 
@@ -245,6 +248,10 @@ function getRow(id: string) {
 
 beforeEach(() => {
   resetFixtures();
+  // The force-resume grace map is module-level singleton state; if a
+  // previous test set a window and the next test ran with `now`
+  // before its expiry, the grace would leak across tests.
+  _resetBypassForTests();
 });
 
 afterEach(() => {
@@ -526,7 +533,12 @@ describe('precheckCall', () => {
     expect(r.capMicros).toBe(0);
   });
 
-  it('Step 2: force-resume bypass → allow + consume one-shot', () => {
+  it('Step 2: force-resume opens a 60-second grace window — multiple back-to-back calls all pass', () => {
+    // The previous semantics were "one-shot bypass": a single click
+    // released exactly ONE API call, which paused again on the
+    // model's NEXT thinking step in the same turn. The user had to
+    // spam the button. New semantics: 60s of bypass per click,
+    // covering the whole multi-call agent turn.
     setKey('k1', {
       dailyUsd: 24,
       adjustmentUsd: 0,
@@ -534,13 +546,70 @@ describe('precheckCall', () => {
     });
     const now = hourTs('2026-05-23T13:30:00');
     addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
-    setBypassNextTurn('s1');
-    const r1 = precheckCall('s1', 'k1', now);
-    expect(r1.allowed).toBe(true);
-    expect(r1.reason).toMatch(/force-resume/);
-    // Bypass consumed → next call (s1 has prior call this hour) blocks.
-    const r2 = precheckCall('s1', 'k1', now);
-    expect(r2.allowed).toBe(false);
+    setBypassNextTurn('s1', FORCE_RESUME_GRACE_MS, now);
+    // Multiple calls within the window all pass.
+    for (let i = 0; i < 5; i++) {
+      const t = now + i * 1000; // 1s apart, all inside the 60s window
+      const r = precheckCall('s1', 'k1', t);
+      expect(r.allowed, `call ${i} at +${i}s`).toBe(true);
+      expect(r.reason).toMatch(/force-resume grace/);
+    }
+  });
+
+  it('Step 2: force-resume window EXPIRES after grace period; budget rules resume', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
+    setBypassNextTurn('s1', FORCE_RESUME_GRACE_MS, now);
+    // Inside the window: allowed.
+    const inWindow = precheckCall('s1', 'k1', now + FORCE_RESUME_GRACE_MS - 1);
+    expect(inWindow.allowed).toBe(true);
+    expect(inWindow.reason).toMatch(/force-resume grace/);
+    // Past the window: budget rules apply again. Bucket is full and
+    // s1 has prior calls this hour → blocked.
+    const past = precheckCall('s1', 'k1', now + FORCE_RESUME_GRACE_MS + 1);
+    expect(past.allowed).toBe(false);
+    // The grace entry is lazy-cleaned on the first expired-window
+    // probe, so getBypassUntil now reports undefined.
+    expect(getBypassUntil('s1')).toBeUndefined();
+  });
+
+  it('Step 2: clicking force-resume twice REPLACES (does not stack) the timer', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const t0 = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: t0, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
+    // First click at t0 → expires at t0 + 60s.
+    setBypassNextTurn('s1', 30_000, t0);
+    expect(getBypassUntil('s1')).toBe(t0 + 30_000);
+    // Second click at t0 + 10s → expires at t0 + 10 + 30 = t0 + 40s.
+    // It does NOT extend to t0 + 60 (which would be cumulative).
+    setBypassNextTurn('s1', 30_000, t0 + 10_000);
+    expect(getBypassUntil('s1')).toBe(t0 + 40_000);
+  });
+
+  it('Step 2: force-resume on session A does NOT bypass session B', () => {
+    // Each session has its own grace window. A user who clicks Force
+    // Resume on the urgent session shouldn't accidentally let an
+    // unrelated background session blow past its budget too.
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 'sA' });
+    addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 'sB' });
+    setBypassNextTurn('sA', FORCE_RESUME_GRACE_MS, now);
+    expect(precheckCall('sA', 'k1', now).allowed).toBe(true);
+    expect(precheckCall('sB', 'k1', now).allowed).toBe(false);
   });
 
   it('Step 3: bucket has room → allow', () => {

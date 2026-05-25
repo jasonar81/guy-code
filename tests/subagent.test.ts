@@ -259,8 +259,53 @@ describe('toolsForRole', () => {
     expect(tools).not.toContain('Task');
   });
 
-  it('general role mirrors execute', () => {
-    expect(toolsForRole('general').sort()).toEqual(toolsForRole('execute').sort());
+  it('general role is execute + research tools (WebSearch + WebFetch)', () => {
+    // `general` and `plan` get research tools; `execute` stays
+    // focused on the local codebase. WebSearch is the local
+    // DuckDuckGo-backed tool (NOT Anthropic's server-side
+    // `web_search_20250305`, which we removed because it requires
+    // per-org enablement). The relationship is now strict superset:
+    // general = execute ∪ {WebSearch, WebFetch, Browser*}.
+    const general = new Set(toolsForRole('general'));
+    const execute = new Set(toolsForRole('execute'));
+    for (const t of execute) {
+      expect(general.has(t), `general should include execute tool: ${t}`).toBe(true);
+    }
+    expect(general.has('WebSearch')).toBe(true);
+    expect(general.has('WebFetch')).toBe(true);
+    expect(execute.has('WebSearch')).toBe(false);
+    expect(execute.has('WebFetch')).toBe(false);
+  });
+
+  it('general role gets Browser* tools; other roles do not', () => {
+    // Browser tools drive the user's connected Chrome over CDP. They
+    // self-error with "not connected" if Chrome isn't attached, so
+    // listing them on `general` is safe even when the connector is
+    // off. Plan/Execute/Review intentionally don't get them — opening
+    // a real-world tab from a planning or review subagent would be
+    // surprising and out of scope for those roles.
+    const browserTools = [
+      'BrowserList',
+      'BrowserOpen',
+      'BrowserExtract',
+      'BrowserScreenshot',
+      'BrowserWaitFor',
+      'BrowserClick',
+      'BrowserType',
+      'BrowserPress',
+      'BrowserScroll',
+      'BrowserEval',
+    ];
+    const general = new Set(toolsForRole('general'));
+    for (const t of browserTools) {
+      expect(general.has(t), `general should include Browser tool ${t}`).toBe(true);
+    }
+    for (const role of ['plan', 'execute', 'review'] as const) {
+      const set = new Set(toolsForRole(role));
+      for (const t of browserTools) {
+        expect(set.has(t), `${role} should NOT include ${t}`).toBe(false);
+      }
+    }
   });
 });
 
