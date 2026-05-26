@@ -917,6 +917,8 @@ function ApiKeysSection({ keys }: { keys: ApiKey[] }) {
                 plain: patch.plain,
                 dailyBudgetUsd: patch.dailyBudgetUsd ?? null,
                 setDefault: keys.length === 0,
+                activeHourStart: patch.activeHourStart,
+                activeHourEnd: patch.activeHourEnd,
               });
               if (id) setAdding(false);
               return !!id;
@@ -966,6 +968,10 @@ function KeyRow({
           {k.daily_budget_usd != null
             ? `daily $${k.daily_budget_usd.toFixed(2)}`
             : 'no daily cap'}
+          {formatActiveHoursSuffix(
+            k.active_hour_start,
+            k.active_hour_end
+          )}
         </div>
       </div>
       <div className="flex items-center gap-1 shrink-0">
@@ -1016,6 +1022,42 @@ interface KeyEditorPatch {
   name?: string;
   plain?: string;
   dailyBudgetUsd?: number | null;
+  /**
+   * Active-hours window. Integers in [0..23]. Both undefined leaves
+   * the row untouched. Both equal (including 0/0) = all-day default.
+   * Sent on every Save — the renderer doesn't try to figure out if
+   * the value changed; the DB UPDATE is a cheap no-op when it didn't.
+   */
+  activeHourStart?: number;
+  activeHourEnd?: number;
+}
+
+/**
+ * Format the active-hours window for display next to the daily budget,
+ * e.g. "  ·  9–17" or "  ·  22–6 (overnight)". Returns empty string
+ * for the all-day default (start == end) so existing keys with the
+ * 0/0 migration default don't grow a noisy badge.
+ */
+function formatActiveHoursSuffix(start: number, end: number): string {
+  if (start === end) return '';
+  const wraps = start > end;
+  return `  ·  ${start}–${end}${wraps ? ' (overnight)' : ''}`;
+}
+
+/**
+ * Parse a hour-of-day input string into an integer in [0..23].
+ * Empty / whitespace returns 0 (= the all-day default sentinel).
+ * Non-numeric / out-of-range returns null so the caller can surface
+ * a validation error instead of silently clamping.
+ */
+function parseHourInput(raw: string): number | null {
+  const t = raw.trim();
+  if (!t) return 0;
+  const n = Number(t);
+  if (!Number.isFinite(n)) return null;
+  const i = Math.trunc(n);
+  if (i < 0 || i > 23) return null;
+  return i;
 }
 
 function KeyEditor({
@@ -1034,6 +1076,20 @@ function KeyEditor({
   const [plain, setPlain] = useState('');
   const [daily, setDaily] = useState<string>(
     initial?.daily_budget_usd != null ? String(initial.daily_budget_usd) : ''
+  );
+  // Active-hours window inputs. Stored as strings so the user can
+  // freely backspace / type; we parse + validate in `onClickSave`.
+  // Default of empty maps to 0 (the "all-day" sentinel) when both
+  // ends are blank — see `parseHourInput`.
+  const [activeStart, setActiveStart] = useState<string>(
+    initial && initial.active_hour_start !== 0
+      ? String(initial.active_hour_start)
+      : ''
+  );
+  const [activeEnd, setActiveEnd] = useState<string>(
+    initial && initial.active_hour_end !== 0
+      ? String(initial.active_hour_end)
+      : ''
   );
   const [err, setErr] = useState<string | null>(null);
 
@@ -1067,6 +1123,29 @@ function KeyEditor({
     } else {
       patch.dailyBudgetUsd = null;
     }
+    // Active-hours validation. Both inputs must be integer hours in
+    // [0..23] (or blank — blank means 0 = the all-day sentinel). If
+    // only one end is filled out, that's almost certainly a user
+    // error (window with a single endpoint is meaningless), so we
+    // surface an error rather than silently substituting 0 for the
+    // other end.
+    const aStart = parseHourInput(activeStart);
+    const aEnd = parseHourInput(activeEnd);
+    if (aStart === null || aEnd === null) {
+      setErr('Active hours must each be an integer 0–23 (or blank).');
+      return;
+    }
+    if (
+      (activeStart.trim() !== '' && activeEnd.trim() === '') ||
+      (activeStart.trim() === '' && activeEnd.trim() !== '')
+    ) {
+      setErr(
+        'Set BOTH active-hours start and end, or leave both blank for all-day.'
+      );
+      return;
+    }
+    patch.activeHourStart = aStart;
+    patch.activeHourEnd = aEnd;
     const ok = await onSave(patch);
     if (!ok) {
       setErr(
@@ -1106,6 +1185,54 @@ function KeyEditor({
           className="flex-1 rounded border border-border bg-bg px-2 py-1 text-[12px] font-mono text-text focus:outline-none focus:border-accent"
           title="Daily budget in USD for this key. When today's spend on this key hits the cap, new turns pause until the next local-day rollover (or until you raise the cap). Blank = no governor (unlimited)."
         />
+      </div>
+      {/* Active-hours window. The daily budget gets redistributed
+          across the configured window instead of being spread evenly
+          over 24 hours — useful when the user only wants the agent
+          to spend during business hours, or only overnight, etc.
+          Leaving both fields blank keeps v0.1.3 behavior (daily / 24
+          per hour, all day). The help text below the inputs
+          enumerates the worked examples so the wrap-around case
+          (start > end) isn't surprising. */}
+      <div>
+        <div className="text-[10px] uppercase tracking-wider text-text-dim font-mono mb-1">
+          Active hours
+        </div>
+        <div className="flex items-center gap-1.5">
+          <input
+            inputMode="numeric"
+            value={activeStart}
+            onChange={(e) => setActiveStart(e.target.value)}
+            placeholder="start"
+            className="w-16 rounded border border-border bg-bg px-2 py-1 text-[12px] font-mono text-text focus:outline-none focus:border-accent"
+            title="Hour-of-day [0..23] when the active window begins (local time)."
+          />
+          <span className="text-[11px] text-text-dim">to</span>
+          <input
+            inputMode="numeric"
+            value={activeEnd}
+            onChange={(e) => setActiveEnd(e.target.value)}
+            placeholder="end"
+            className="w-16 rounded border border-border bg-bg px-2 py-1 text-[12px] font-mono text-text focus:outline-none focus:border-accent"
+            title="Hour-of-day [0..23] when the active window ends (half-open: this hour is the first INACTIVE one)."
+          />
+          <span className="text-[10px] text-text-dim leading-snug">
+            blank = all day (default)
+          </span>
+        </div>
+        <div className="mt-1 text-[10px] text-text-dim leading-snug">
+          Spreads the daily budget over the hours from{' '}
+          <span className="font-mono">start</span> to{' '}
+          <span className="font-mono">end</span> instead of all 24
+          hours. Outside the window the per-hour base is $0 (but any
+          banked underspend is still usable, and Force Resume still
+          works). Half-open: the
+          <span className="font-mono"> end</span> hour itself is the
+          first inactive one. Examples:{' '}
+          <span className="font-mono">9–17</span> = 9am–5pm (8h),{' '}
+          <span className="font-mono">22–6</span> = 10pm–6am wraps
+          midnight (8h).
+        </div>
       </div>
       {err && (
         <div className="text-[10px] text-state-error">{err}</div>

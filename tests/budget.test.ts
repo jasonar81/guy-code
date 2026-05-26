@@ -44,6 +44,12 @@ const _apiKeyRows = new Map<
     is_default: number;
     adjustment_micros: number;
     adjustment_hour_ts: number;
+    /**
+     * Active-hours window. Both `0` = all-day (= v0.1.3 behavior).
+     * Non-equal values reshape the per-hour base (see budget.ts).
+     */
+    active_hour_start: number;
+    active_hour_end: number;
   }
 >();
 let _defaultApiKeyId: string | null = null;
@@ -201,6 +207,12 @@ import {
   FORCE_RESUME_GRACE_MS,
   resetBudgetAdjustment,
   resumeSweep,
+  // v0.1.4 active-hours helpers.
+  isActiveHourOfDay,
+  activeHoursPerDay,
+  countActiveHoursInRange,
+  isCurrentHourActive,
+  getActiveHoursForKey,
 } from '../electron/budget';
 
 // ----- Helpers ----------------------------------------------------------
@@ -238,6 +250,13 @@ function setKey(
     adjustmentUsd?: number;
     /** Pre-seed adjustment_hour_ts. Defaults to 0 (uninitialized). */
     adjustmentHourTs?: number;
+    /**
+     * Active-hours window. Both 0 (the default) means all-day, which
+     * makes every existing v0.1.3-era test behave identically.
+     * Non-equal values trigger the v0.1.4 redistribution logic.
+     */
+    activeStart?: number;
+    activeEnd?: number;
   }
 ) {
   _apiKeyRows.set(id, {
@@ -247,6 +266,8 @@ function setKey(
     is_default: opts.isDefault ? 1 : 0,
     adjustment_micros: Math.round((opts.adjustmentUsd ?? 0) * $1),
     adjustment_hour_ts: opts.adjustmentHourTs ?? 0,
+    active_hour_start: opts.activeStart ?? 0,
+    active_hour_end: opts.activeEnd ?? 0,
   });
   if (opts.isDefault) _defaultApiKeyId = id;
 }
@@ -858,5 +879,485 @@ describe('resumeSweep archived guard', () => {
     ]);
     await resumeSweep();
     expect(_runUserTurnSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ====================================================================
+// v0.1.4 active-hours window
+// ====================================================================
+//
+// New feature: per-key active-hours window. Two integer columns,
+// `active_hour_start` and `active_hour_end` (both 0..23), drive
+// budget redistribution:
+//
+//   • start == end (the 0/0 default) → all 24 hours active.
+//     `base_per_hour = daily / 24`. Equivalent to v0.1.3 behavior;
+//     all existing tests above pass unchanged because `setKey`
+//     defaults both fields to 0.
+//   • start < end → non-wrap window. Active set = [start, end).
+//     `base_per_hour = daily / (end - start)` inside; 0 outside.
+//   • start > end → wraps midnight. Active set = [start, 24) ∪ [0, end).
+//     Count = (24 - start) + end. Same redistribution math.
+//
+// Outside-window behavior: per-hour base contribution is 0, BUT the
+// adjustment carry-over still flows through. So a positive banked
+// underspend from an earlier active hour remains spendable outside
+// the window — exactly the user's spec'd behavior:
+//   "the base budget for those hours is just zero, if there's overage
+//    budget it should be usable though, and obviously the user can
+//    force things to run still"
+//
+// All math is local-clock based (mirrors `startOfHour`'s existing
+// semantics). Tests use ISO timestamps; the test runner's local TZ
+// must match production's, but since the helpers all consume hour
+// numbers extracted via `new Date(...).getHours()` the timezone
+// doesn't actually surface in assertion values.
+
+describe('isActiveHourOfDay (v0.1.4)', () => {
+  it('all-day (start == end) returns true for every hour', () => {
+    for (let h = 0; h < 24; h++) {
+      expect(isActiveHourOfDay(h, 0, 0)).toBe(true);
+      // Any same-value pair behaves identically (defensive).
+      expect(isActiveHourOfDay(h, 12, 12)).toBe(true);
+    }
+  });
+
+  it('non-wrap window 9..17: 9 is active, 17 is FIRST INACTIVE', () => {
+    expect(isActiveHourOfDay(8, 9, 17)).toBe(false);
+    expect(isActiveHourOfDay(9, 9, 17)).toBe(true); // boundary
+    expect(isActiveHourOfDay(12, 9, 17)).toBe(true);
+    expect(isActiveHourOfDay(16, 9, 17)).toBe(true);
+    expect(isActiveHourOfDay(17, 9, 17)).toBe(false); // half-open
+    expect(isActiveHourOfDay(18, 9, 17)).toBe(false);
+  });
+
+  it('wrap window 22..6: includes 22..23 AND 0..5; excludes 6..21', () => {
+    expect(isActiveHourOfDay(21, 22, 6)).toBe(false);
+    expect(isActiveHourOfDay(22, 22, 6)).toBe(true);
+    expect(isActiveHourOfDay(23, 22, 6)).toBe(true);
+    expect(isActiveHourOfDay(0, 22, 6)).toBe(true);
+    expect(isActiveHourOfDay(3, 22, 6)).toBe(true);
+    expect(isActiveHourOfDay(5, 22, 6)).toBe(true);
+    expect(isActiveHourOfDay(6, 22, 6)).toBe(false); // half-open boundary
+    expect(isActiveHourOfDay(12, 22, 6)).toBe(false);
+  });
+
+  it('single-active-hour window 14..15: only hour 14 active', () => {
+    expect(isActiveHourOfDay(13, 14, 15)).toBe(false);
+    expect(isActiveHourOfDay(14, 14, 15)).toBe(true);
+    expect(isActiveHourOfDay(15, 14, 15)).toBe(false);
+  });
+
+  it('all-but-one window 1..0: 23 active hours (everything except hour 0)', () => {
+    // Wrap-around with end=0: active = [1, 24) ∪ [0, 0) = [1, 24).
+    expect(isActiveHourOfDay(0, 1, 0)).toBe(false);
+    expect(isActiveHourOfDay(1, 1, 0)).toBe(true);
+    expect(isActiveHourOfDay(23, 1, 0)).toBe(true);
+  });
+});
+
+describe('activeHoursPerDay (v0.1.4)', () => {
+  it('start == end returns 24 (all-day default)', () => {
+    expect(activeHoursPerDay(0, 0)).toBe(24);
+    expect(activeHoursPerDay(9, 9)).toBe(24);
+    expect(activeHoursPerDay(23, 23)).toBe(24);
+  });
+
+  it('non-wrap 9..17 returns 8', () => {
+    expect(activeHoursPerDay(9, 17)).toBe(8);
+  });
+
+  it('wrap 22..6 returns 8', () => {
+    expect(activeHoursPerDay(22, 6)).toBe(8);
+  });
+
+  it('single-hour 14..15 returns 1', () => {
+    expect(activeHoursPerDay(14, 15)).toBe(1);
+  });
+
+  it('all-but-one 1..0 returns 23', () => {
+    expect(activeHoursPerDay(1, 0)).toBe(23);
+  });
+});
+
+describe('countActiveHoursInRange (v0.1.4)', () => {
+  it('all-day: returns elapsed hours unchanged', () => {
+    const from = hourTs('2026-05-23T08:00:00');
+    const to = hourTs('2026-05-23T20:00:00'); // 12 hours
+    expect(countActiveHoursInRange(from, to, 0, 0)).toBe(12);
+  });
+
+  it('returns 0 for empty / reversed range', () => {
+    const t = hourTs('2026-05-23T10:00:00');
+    expect(countActiveHoursInRange(t, t, 9, 17)).toBe(0);
+    expect(countActiveHoursInRange(t, t - HOUR_MS, 9, 17)).toBe(0);
+  });
+
+  it('9..17 window, range spans 8..18: counts the 8 active hours only', () => {
+    const from = hourTs('2026-05-23T08:00:00'); // hour 8 = inactive
+    const to = hourTs('2026-05-23T18:00:00'); // up to hour 17 (exclusive)
+    expect(countActiveHoursInRange(from, to, 9, 17)).toBe(8);
+  });
+
+  it('9..17 window, range entirely inside (10..15): 5 active hours', () => {
+    const from = hourTs('2026-05-23T10:00:00');
+    const to = hourTs('2026-05-23T15:00:00');
+    expect(countActiveHoursInRange(from, to, 9, 17)).toBe(5);
+  });
+
+  it('9..17 window, range entirely outside active hours (18..22): 0', () => {
+    const from = hourTs('2026-05-23T18:00:00');
+    const to = hourTs('2026-05-23T22:00:00');
+    expect(countActiveHoursInRange(from, to, 9, 17)).toBe(0);
+  });
+
+  it('9..17 window, 7-day span: 7 days × 8 hours = 56', () => {
+    const from = hourTs('2026-05-16T00:00:00');
+    const to = hourTs('2026-05-23T00:00:00');
+    expect(countActiveHoursInRange(from, to, 9, 17)).toBe(56);
+  });
+
+  it('9..17 window, 7d 3h span starting at hour 10: full-day math + remainder iter', () => {
+    // Walks 7 × 24h + 3h additional. firstHour = 10 (active).
+    // remainder hours: 10, 11, 12 = all active → +3.
+    // full_days_active = 7 × 8 = 56. Total = 59.
+    const from = hourTs('2026-05-16T10:00:00');
+    const to = hourTs('2026-05-23T13:00:00');
+    expect(countActiveHoursInRange(from, to, 9, 17)).toBe(59);
+  });
+
+  it('wrap 22..6 window, 24h span: 8 active hours', () => {
+    const from = hourTs('2026-05-23T00:00:00');
+    const to = hourTs('2026-05-24T00:00:00');
+    expect(countActiveHoursInRange(from, to, 22, 6)).toBe(8);
+  });
+
+  it('wrap 22..6, 1-day + 3h remainder starting at hour 21: full day + (21 inactive, 22 active, 23 active)', () => {
+    // 1 × 8 active in the full day + 2 active in the 3-hour remainder.
+    const from = hourTs('2026-05-23T21:00:00');
+    const to = hourTs('2026-05-25T00:00:00'); // 27 hours
+    // Full days = floor(27/24) = 1 → 8 active.
+    // Remainder = 27 - 24 = 3. firstHour = 21. Hours: 21(inactive),
+    // 22(active), 23(active) → 2 active.
+    expect(countActiveHoursInRange(from, to, 22, 6)).toBe(10);
+  });
+});
+
+describe('getActiveHoursForKey (v0.1.4)', () => {
+  it('returns 0/0 (all-day) for a key with no row', () => {
+    expect(getActiveHoursForKey('nope')).toEqual({ start: 0, end: 0 });
+    expect(getActiveHoursForKey(null)).toEqual({ start: 0, end: 0 });
+  });
+
+  it('returns stored window for a configured key', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    expect(getActiveHoursForKey('k1')).toEqual({ start: 9, end: 17 });
+  });
+
+  it('falls back to the default key when no id given', () => {
+    setKey('k1', {
+      dailyUsd: 80,
+      isDefault: true,
+      activeStart: 22,
+      activeEnd: 6,
+    });
+    expect(getActiveHoursForKey()).toEqual({ start: 22, end: 6 });
+  });
+
+  it('clamps out-of-range column values defensively', () => {
+    // Direct mutation simulates DB drift / a buggy migration. Both
+    // bounds should clamp to the [0..23] range without throwing.
+    setKey('k1', { dailyUsd: 80 });
+    const row = _apiKeyRows.get('k1')!;
+    row.active_hour_start = -5 as unknown as number;
+    row.active_hour_end = 99 as unknown as number;
+    expect(getActiveHoursForKey('k1')).toEqual({ start: 0, end: 23 });
+  });
+});
+
+describe('isCurrentHourActive (v0.1.4)', () => {
+  it('all-day (default): always returns true regardless of `now`', () => {
+    setKey('k1', { dailyUsd: 80 });
+    for (let h = 0; h < 24; h++) {
+      const now = new Date('2026-05-23T00:00:00');
+      now.setHours(h);
+      expect(isCurrentHourActive('k1', now.getTime())).toBe(true);
+    }
+  });
+
+  it('9..17 window: true at noon, false at 2am', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    expect(
+      isCurrentHourActive('k1', hourTs('2026-05-23T12:30:00'))
+    ).toBe(true);
+    expect(isCurrentHourActive('k1', hourTs('2026-05-23T02:30:00'))).toBe(
+      false
+    );
+  });
+
+  it('wrap 22..6: true at 3am, false at 3pm', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 22, activeEnd: 6 });
+    expect(isCurrentHourActive('k1', hourTs('2026-05-23T03:30:00'))).toBe(
+      true
+    );
+    expect(isCurrentHourActive('k1', hourTs('2026-05-23T15:30:00'))).toBe(
+      false
+    );
+  });
+});
+
+describe('getBaseHourCapMicros with active-hours redistribution (v0.1.4)', () => {
+  it('all-day default still returns daily / 24', () => {
+    setKey('k1', { dailyUsd: 240 });
+    expect(getBaseHourCapMicros('k1')).toBe(Math.floor((240 * $1) / 24));
+  });
+
+  it('9..17 window (8 hours): returns daily / 8', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    expect(getBaseHourCapMicros('k1')).toBe(Math.floor((80 * $1) / 8));
+  });
+
+  it('wrap 22..6 window (also 8 hours): returns daily / 8', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 22, activeEnd: 6 });
+    expect(getBaseHourCapMicros('k1')).toBe(Math.floor((80 * $1) / 8));
+  });
+
+  it('single-hour window (14..15): returns daily / 1 = full daily', () => {
+    setKey('k1', { dailyUsd: 60, activeStart: 14, activeEnd: 15 });
+    expect(getBaseHourCapMicros('k1')).toBe(60 * $1);
+  });
+});
+
+describe('getEffectiveHourCapMicros with active-hours window (v0.1.4)', () => {
+  it('inside active hour: base ($10) + zero adj on fresh key', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    const now = hourTs('2026-05-23T12:30:00'); // hour 12 = active
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(10 * $1);
+  });
+
+  it('outside active hour: zero base + zero adj = 0', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    const now = hourTs('2026-05-23T02:30:00'); // hour 2 = inactive
+    // Cap is just the adjustment (which is 0 on a fresh key). The
+    // pre-flight will then either fail (call #2+) or grant the
+    // first-call-this-hour exemption.
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(0);
+  });
+
+  it('outside active hour with banked positive adjustment: positive cap (user spec)', () => {
+    // User: "if there's overage budget it should be usable though."
+    // Seed a +$15 adjustment ROLLED OUT TO the inactive hour.
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentUsd: 15,
+      adjustmentHourTs: hourTs('2026-05-23T02:00:00'),
+    });
+    const now = hourTs('2026-05-23T02:30:00'); // still hour 2 = inactive
+    // No fresh settle needed (hour_ts == startOfHour(now)): adjustment
+    // is read as-is. Effective cap = 0 base + $15 adj = +$15.
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(15 * $1);
+  });
+
+  it('outside active hour with negative adjustment: still negative (deficit lingers)', () => {
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentUsd: -5,
+      adjustmentHourTs: hourTs('2026-05-23T02:00:00'),
+    });
+    const now = hourTs('2026-05-23T02:30:00');
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(-5 * $1);
+  });
+
+  it('settle across active+inactive elapsed range: only active hours add to allowed', () => {
+    // Key: $80/day with 9..17 window. Base = $10/active hour.
+    // Adjustment starts at 0, anchored at 08:00 (hour 8, inactive).
+    // Move clock to 14:00 (hour 14, active). Elapsed hours = 6 (8..14).
+    // Active hours in [8, 14): hours 9,10,11,12,13 = 5.
+    // No spend recorded.
+    // total_allowed = 5 × $10 + $0 = $50.
+    // total_spent = 0.
+    // new_adj = $50.
+    // Effective cap at 14:00 = base ($10) + new_adj ($50) = $60.
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentHourTs: hourTs('2026-05-23T08:00:00'),
+    });
+    const now = hourTs('2026-05-23T14:30:00');
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(60 * $1);
+    expect(getRow('k1').adjustment_micros).toBe(50 * $1);
+    expect(getRow('k1').adjustment_hour_ts).toBe(
+      hourTs('2026-05-23T14:00:00')
+    );
+  });
+
+  it('settle across multi-day gap with 9..17 window', () => {
+    // 7 days × 8 active = 56 active hours. Daily $80 → base $10.
+    // total_allowed = 56 × $10 = $560.
+    // No spend. new_adj = $560.
+    // We read inside an active hour, so cap = base + adj = $570.
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentHourTs: hourTs('2026-05-16T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(570 * $1);
+    expect(getRow('k1').adjustment_micros).toBe(560 * $1);
+  });
+
+  it("settle's `spent` counts inactive-hour spend too (force-resume / exemption pulls against bank)", () => {
+    // User spent $4 in an inactive hour via the min-one-call exemption.
+    // That spend MUST be subtracted from the bank — otherwise the user
+    // could indefinitely repeat exemption-driven calls and the bank
+    // wouldn't reflect them.
+    //
+    // Setup: 9..17 window, $80/day → base $10. Anchored at 08:00.
+    // At 09:00 we'd have rolled forward 1 active hour worth = $10 of
+    // banked allowance. Now imagine the user already burned $4 at
+    // hour 8 (inactive). When we settle at 09:30:
+    //   elapsed_hours = 1, active_in_range = 0 (hour 8 alone)
+    //   total_allowed = 0 + 0 = 0  (no active hours yet)
+    //   total_spent = $4
+    //   new_adj = -$4
+    // Effective cap at hour 9 = $10 base + (-$4) adj = $6.
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentHourTs: hourTs('2026-05-23T08:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T08:30:00'),
+      costMicros: 4 * $1,
+      apiKeyId: 'k1',
+    });
+    const now = hourTs('2026-05-23T09:30:00');
+    expect(getEffectiveHourCapMicros('k1', now)).toBe(6 * $1);
+  });
+
+  it('all-day default key still behaves identically to v0.1.3 (regression)', () => {
+    // Re-run the v0.1.3 worked example WITHOUT specifying activeStart/End
+    // — both default to 0 = all-day. Result must match what the
+    // pre-existing test asserts in the "user's H1→H2 example" case.
+    setKey('k1', {
+      dailyUsd: 120,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    addSpend({
+      ts: hourTs('2026-05-23T13:30:00'),
+      costMicros: 7 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const nowH2 = hourTs('2026-05-23T14:30:00');
+    // base = 120/24 = $5. Spent $7 at H1. new_adj = 5 - 7 = -2.
+    // At H2: base + adj = $5 - $2 = $3.
+    expect(getEffectiveHourCapMicros('k1', nowH2)).toBe(3 * $1);
+    expect(getRow('k1').adjustment_micros).toBe(-2 * $1);
+  });
+});
+
+describe('precheckCall with active-hours window (v0.1.4)', () => {
+  it('inside active hour and bucket has room: ALLOWED', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    const now = hourTs('2026-05-23T12:30:00');
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(true);
+  });
+
+  it('outside active hour, zero adjustment, FIRST call this hour: exemption applies (ALLOWED)', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    const now = hourTs('2026-05-23T02:30:00');
+    const r = precheckCall('s1', 'k1', now);
+    // Cap is 0 outside window with zero adjustment. But the session
+    // has no spend in this hour bucket, so the first-call exemption
+    // grants this single call. The exemption is intended to guarantee
+    // progress in pathological cap states and applies regardless of
+    // active-hours; user reaffirmed this with "obviously the user can
+    // force things to run still."
+    expect(r.allowed).toBe(true);
+    expect(r.reason).toContain('first-call-this-hour');
+  });
+
+  it('outside active hour, zero adjustment, AFTER exemption: BLOCKED', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    const now = hourTs('2026-05-23T02:30:00');
+    // Simulate the session having already used its exemption this hour.
+    addSpend({
+      ts: now - 10_000,
+      costMicros: $1, // any non-zero
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/effective cap/);
+  });
+
+  it('outside active hour with banked carry-over: spend up to the bank (ALLOWED)', () => {
+    // $20 banked. Effective cap = $20. Session already used exemption
+    // (or seeded spend by another session). New call still allowed
+    // because spent ($5) < cap ($20).
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentUsd: 20,
+      adjustmentHourTs: hourTs('2026-05-23T02:00:00'),
+    });
+    const now = hourTs('2026-05-23T02:30:00');
+    addSpend({
+      ts: now - 10_000,
+      costMicros: 5 * $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(true);
+    expect(r.capMicros).toBe(20 * $1);
+    expect(r.spentMicros).toBe(5 * $1);
+  });
+
+  it('outside active hour with banked carry-over: BLOCKED once exhausted', () => {
+    setKey('k1', {
+      dailyUsd: 80,
+      activeStart: 9,
+      activeEnd: 17,
+      adjustmentUsd: 5,
+      adjustmentHourTs: hourTs('2026-05-23T02:00:00'),
+    });
+    const now = hourTs('2026-05-23T02:30:00');
+    addSpend({
+      ts: now - 10_000,
+      costMicros: 10 * $1, // exceeds the $5 bank
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(false);
+  });
+
+  it('Force Resume bypass works outside active hours', () => {
+    setKey('k1', { dailyUsd: 80, activeStart: 9, activeEnd: 17 });
+    const now = hourTs('2026-05-23T02:30:00');
+    // Burn the exemption first so the next call would otherwise block.
+    addSpend({
+      ts: now - 10_000,
+      costMicros: $1,
+      apiKeyId: 'k1',
+      sessionId: 's1',
+    });
+    expect(precheckCall('s1', 'k1', now).allowed).toBe(false);
+    setBypassNextTurn('s1', FORCE_RESUME_GRACE_MS, now);
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(true);
+    expect(r.reason).toContain('force-resume');
   });
 });

@@ -324,6 +324,11 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
         dailyBudgetUsd?: number | null;
         perTurnCapUsd?: number | null;
         setDefault?: boolean;
+        // Active-hours window for budget redistribution. Both 0..23;
+        // equal values (including 0/0 default) = all-day. See
+        // `electron/budget.ts` for window semantics + math.
+        activeHourStart?: number;
+        activeHourEnd?: number;
       }
     ) => {
       const id = createApiKey(args);
@@ -340,6 +345,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
         plain?: string;
         dailyBudgetUsd?: number | null;
         perTurnCapUsd?: number | null;
+        activeHourStart?: number;
+        activeHourEnd?: number;
       }
     ) => {
       const ok = updateApiKeyFields(id, patch);

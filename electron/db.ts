@@ -676,6 +676,43 @@ function migrate(d: Database) {
         ALTER TABLE sessions ADD COLUMN draft_text TEXT;
       `,
     },
+    {
+      version: 9,
+      // Per-API-key active-hours window for budget redistribution.
+      //
+      // Default behavior (both columns = 0): the daily budget is spread
+      // evenly across all 24 hours (= `daily / 24` per hour), identical
+      // to v0.1.3 and earlier. Set both columns to non-equal values to
+      // redistribute over a subset of the day:
+      //
+      //   active_hour_start = 9, active_hour_end = 17
+      //     → 8 active hours; base = daily / 8.
+      //   active_hour_start = 22, active_hour_end = 6
+      //     → wraps midnight; 8 active hours; base = daily / 8.
+      //   active_hour_start = active_hour_end = N (any N)
+      //     → all-day (24 active hours). Treated identically to 0/0
+      //       so any user-entered same-value pair "just works."
+      //
+      // Outside the active window: base_for_that_hour = 0. The
+      // adjustment carry-over still flows through inactive hours,
+      // so a positive overage from an earlier active hour remains
+      // usable during inactive hours (the user can spend any
+      // underspend they previously banked, just not the base slice).
+      // The min-one-call-per-session-per-hour exemption and the
+      // Force Resume override continue to work as before.
+      //
+      // Values are 0..23 (hour-of-day, local time). The half-open
+      // interval [start, end) is used for non-wrap ranges; for wrap
+      // (start > end) the active set is [start, 24) ∪ [0, end).
+      //
+      // All existing keys default to 0/0 = all-day, so the migration
+      // is a no-op behavior-wise — only users who explicitly set a
+      // window in Settings get the new behavior.
+      up: `
+        ALTER TABLE api_keys ADD COLUMN active_hour_start INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE api_keys ADD COLUMN active_hour_end INTEGER NOT NULL DEFAULT 0;
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -1498,6 +1535,23 @@ export interface ApiKeyRow {
    * to the current hour with a zero adjustment (clean slate).
    */
   adjustment_hour_ts: number;
+  /**
+   * Start of the daily active-hours window (hour-of-day 0..23, local
+   * clock). The budget's per-active-hour slice is `daily / N` where N
+   * is the count of active hours; outside the window the slice is 0
+   * (but the carry-over adjustment still flows through, so banked
+   * underspend remains usable). `active_hour_start == active_hour_end`
+   * (including the 0/0 default) means "all 24 hours active" —
+   * identical to v0.1.3 and earlier behavior.
+   */
+  active_hour_start: number;
+  /**
+   * End of the daily active-hours window (hour-of-day 0..23, local
+   * clock). Half-open: hour == active_hour_end is the FIRST inactive
+   * hour. When `active_hour_end < active_hour_start` the window wraps
+   * across midnight (e.g., 22..6 = 10pm-6am).
+   */
+  active_hour_end: number;
 }
 
 /**
@@ -1505,7 +1559,7 @@ export interface ApiKeyRow {
  * new column doesn't require touching five copies of the query string.
  */
 const API_KEY_COLS =
-  'id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at, adjustment_micros, adjustment_hour_ts';
+  'id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at, adjustment_micros, adjustment_hour_ts, active_hour_start, active_hour_end';
 
 /** All keys, default first. The full set including cipher_b64. */
 export function listApiKeysFull(): ApiKeyRow[] {
@@ -1758,11 +1812,19 @@ export function insertApiKey(args: {
   perTurnCapUsd: number | null;
   isDefault: boolean;
   createdAt: number;
+  /**
+   * Hour-of-day [0..23]. Default 0. With 0/0 the budget is spread
+   * over all 24 hours; with start != end the budget redistributes
+   * over the half-open window [start, end), wrapping midnight when
+   * end < start.
+   */
+  activeHourStart?: number;
+  activeHourEnd?: number;
 }): void {
   db()
     .prepare(
-      `INSERT INTO api_keys (id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO api_keys (id, name, cipher_b64, daily_budget_usd, per_turn_cap_usd, is_default, created_at, active_hour_start, active_hour_end)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       args.id,
@@ -1771,8 +1833,24 @@ export function insertApiKey(args: {
       args.dailyBudgetUsd,
       args.perTurnCapUsd,
       args.isDefault ? 1 : 0,
-      args.createdAt
+      args.createdAt,
+      clampActiveHour(args.activeHourStart),
+      clampActiveHour(args.activeHourEnd)
     );
+}
+
+/**
+ * Constrain a user-provided active-hour value to a valid integer in
+ * [0..23]. Anything missing / non-finite / out of range falls back to
+ * 0 (= the default, all-day if both ends are 0). Centralized so the
+ * insert and update paths can't drift.
+ */
+function clampActiveHour(v: number | null | undefined): number {
+  if (v == null || !Number.isFinite(v)) return 0;
+  const n = Math.trunc(v);
+  if (n < 0) return 0;
+  if (n > 23) return 23;
+  return n;
 }
 
 /**
@@ -1786,6 +1864,12 @@ export function updateApiKey(
     cipherB64?: string;
     dailyBudgetUsd?: number | null;
     perTurnCapUsd?: number | null;
+    /**
+     * Active-hours window. Undefined leaves the column untouched.
+     * Both 0..23; equal values (including 0/0) = all-day.
+     */
+    activeHourStart?: number;
+    activeHourEnd?: number;
   }
 ): void {
   const sets: string[] = [];
@@ -1805,6 +1889,14 @@ export function updateApiKey(
   if (patch.perTurnCapUsd !== undefined) {
     sets.push('per_turn_cap_usd = ?');
     args.push(patch.perTurnCapUsd);
+  }
+  if (patch.activeHourStart !== undefined) {
+    sets.push('active_hour_start = ?');
+    args.push(clampActiveHour(patch.activeHourStart));
+  }
+  if (patch.activeHourEnd !== undefined) {
+    sets.push('active_hour_end = ?');
+    args.push(clampActiveHour(patch.activeHourEnd));
   }
   if (sets.length === 0) return;
   args.push(id);

@@ -130,15 +130,143 @@ export function getDailyBudgetMicros(apiKeyId?: string | null): number | null {
   return null;
 }
 
+// ---- Active-hours window ----------------------------------------------
+//
+// The user can redistribute the daily budget over a subset of the day
+// instead of spreading it evenly over all 24 hours. Stored per-key as
+// `(active_hour_start, active_hour_end)` in `api_keys` (added in
+// migration v9). Semantics:
+//
+//   • Both values are hour-of-day integers in [0, 23].
+//   • The active set is the half-open interval [start, end) when
+//     `start < end`, OR [start, 24) ∪ [0, end) when `start > end`
+//     (wraps midnight).
+//   • `start == end` (the 0/0 default) means "all 24 hours active" —
+//     identical to v0.1.3 behavior.
+//   • Inside active hours: base per hour = `daily / activeHoursPerDay`.
+//     E.g. daily=$80, window 9..17: base = $80/8 = $10/hr.
+//   • Outside active hours: base per hour = 0. The carry-over adjustment
+//     still flows through, so banked underspend remains usable.
+//
+// All math is single-day-local: the user picks hours in their own clock,
+// and we use the same local-time hour math that startOfHour already
+// uses. No timezone configuration.
+
 /**
- * The base hourly slice = `daily / 24`. Constant given the daily budget
- * setting; does NOT include the carry-over adjustment. For the actual
- * effective cap used by the governor, call `getEffectiveHourCapMicros`.
+ * Pull the configured active-hours window for an API key. Defaults to
+ * (0, 0) — all-day — when the key has no override or doesn't exist.
+ * The default key is consulted when `apiKeyId` is omitted, matching
+ * `getDailyBudgetMicros`.
+ */
+export function getActiveHoursForKey(apiKeyId?: string | null): {
+  start: number;
+  end: number;
+} {
+  const row = apiKeyId ? getApiKeyRow(apiKeyId) : getDefaultApiKeyRow();
+  if (!row) return { start: 0, end: 0 };
+  // The schema guarantees integers in [0, 23]; defensive clamp in case
+  // a legacy migration / direct DB edit ever drifts.
+  const clamp = (v: number) => {
+    const n = Math.trunc(v ?? 0);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    if (n > 23) return 23;
+    return n;
+  };
+  return {
+    start: clamp(row.active_hour_start),
+    end: clamp(row.active_hour_end),
+  };
+}
+
+/**
+ * Count of active hours per day for a given window. Always in [1, 24].
+ * Equal start/end (including 0/0) returns 24 — the all-day default.
+ * Wraps midnight naturally: 22..6 returns 8 just like 9..17 does.
+ */
+export function activeHoursPerDay(start: number, end: number): number {
+  if (start === end) return 24; // all-day (default or explicit same-value)
+  return (end - start + 24) % 24;
+}
+
+/**
+ * Is the given hour-of-day [0, 23] inside the active window?
+ * Half-open: `hour == end` is the FIRST inactive hour.
+ */
+export function isActiveHourOfDay(
+  hour: number,
+  start: number,
+  end: number
+): boolean {
+  if (start === end) return true; // all-day
+  if (start < end) {
+    return hour >= start && hour < end;
+  }
+  // Wrap: active set is [start, 24) ∪ [0, end).
+  return hour >= start || hour < end;
+}
+
+/**
+ * Is the local clock-hour containing `now` an active hour for the key?
+ */
+export function isCurrentHourActive(
+  apiKeyId?: string | null,
+  now: number = Date.now()
+): boolean {
+  const { start, end } = getActiveHoursForKey(apiKeyId);
+  return isActiveHourOfDay(new Date(now).getHours(), start, end);
+}
+
+/**
+ * Count active hours whose start-of-hour timestamps fall in
+ * `[startHourTs, endHourTs)`. Both must be exact hour boundaries
+ * (produced by `startOfHour`). Used by `settle()` to compute
+ * `total_allowed` across an elapsed range when the window is partial.
+ *
+ * For the all-day default the math collapses to `elapsed_hours`
+ * (no per-hour iteration). For partial windows the function counts
+ * full days analytically and walks only the remainder (≤4 weeks of
+ * downtime would walk ≤ a day's worth of hours — cheap and exact).
+ */
+export function countActiveHoursInRange(
+  startHourTs: number,
+  endHourTs: number,
+  start: number,
+  end: number
+): number {
+  if (endHourTs <= startHourTs) return 0;
+  const elapsedHours = Math.round((endHourTs - startHourTs) / HOUR_MS);
+  if (start === end) return elapsedHours; // all-day
+  const perDay = activeHoursPerDay(start, end);
+  const fullDays = Math.floor(elapsedHours / 24);
+  const remainder = elapsedHours - fullDays * 24;
+  // Walk only the remainder. Bounded at < 24 iterations regardless of
+  // how long the app was offline.
+  let active = fullDays * perDay;
+  if (remainder > 0) {
+    const firstHour = new Date(startHourTs).getHours();
+    for (let i = 0; i < remainder; i++) {
+      if (isActiveHourOfDay((firstHour + i) % 24, start, end)) active++;
+    }
+  }
+  return active;
+}
+
+/**
+ * The base hourly slice in micros = `daily / activeHoursPerDay`.
+ *
+ * With the all-day default (start == end), this matches v0.1.3's
+ * `daily / 24`. With a partial window the budget is REDISTRIBUTED:
+ * a key configured 9..17 with $80/day gets $10 base per active hour.
+ *
+ * Constant given the daily budget AND window settings; does NOT
+ * include the carry-over adjustment. For the actual effective cap
+ * used by the governor, call `getEffectiveHourCapMicros`.
  */
 export function getBaseHourCapMicros(apiKeyId?: string | null): number | null {
   const daily = getDailyBudgetMicros(apiKeyId);
   if (daily == null) return null;
-  return Math.floor(daily / 24);
+  const { start, end } = getActiveHoursForKey(apiKeyId);
+  return Math.floor(daily / activeHoursPerDay(start, end));
 }
 
 // ---- Spend queries ------------------------------------------------------
@@ -274,15 +402,33 @@ function settle(
     };
   }
 
-  // Walk forward. Note: `elapsed` is an integer because both timestamps
-  // are exact hour boundaries (we always store `startOfHour(...)`).
-  const elapsed = Math.round((currentHourTs - row.adjustment_hour_ts) / HOUR_MS);
-  const totalAllowed = elapsed * base + row.adjustment_micros;
+  // Walk forward. With active-hours redistribution, only ACTIVE hours
+  // contribute to `total_allowed` (each at `base` micros); inactive
+  // hours contribute 0. Spend in inactive hours is still subtracted —
+  // it can only happen via the min-one-call exemption or Force Resume
+  // pulling against the banked carry-over, but it counts. Net effect:
+  // banked underspend remains usable across inactive periods, and any
+  // overspend during an inactive hour shows up as a negative adjustment
+  // exactly the same way it would inside the window.
+  //
+  // `elapsedActive` is an integer count of active hour boundaries; for
+  // the all-day default it equals `elapsedHours` (no semantics change).
+  const { start, end } = getActiveHoursForKey(row.id);
+  const elapsedHours = Math.round(
+    (currentHourTs - row.adjustment_hour_ts) / HOUR_MS
+  );
+  const elapsedActive = countActiveHoursInRange(
+    row.adjustment_hour_ts,
+    currentHourTs,
+    start,
+    end
+  );
+  const totalAllowed = elapsedActive * base + row.adjustment_micros;
   const totalSpent = spendBetween(row.adjustment_hour_ts, currentHourTs, row.id);
   const newAdjustment = totalAllowed - totalSpent;
   setApiKeyBudgetAdjustment(row.id, newAdjustment, currentHourTs);
   log.info(
-    `[budget] settled key=${row.id} elapsed=${elapsed}h allowed=${(totalAllowed / MICROS_PER_USD).toFixed(2)} spent=${(totalSpent / MICROS_PER_USD).toFixed(2)} new_adj=${(newAdjustment / MICROS_PER_USD).toFixed(2)}`
+    `[budget] settled key=${row.id} elapsed=${elapsedHours}h (${elapsedActive} active) allowed=${(totalAllowed / MICROS_PER_USD).toFixed(2)} spent=${(totalSpent / MICROS_PER_USD).toFixed(2)} new_adj=${(newAdjustment / MICROS_PER_USD).toFixed(2)}`
   );
   return { adjustmentMicros: newAdjustment, hourTs: currentHourTs };
 }
@@ -305,10 +451,17 @@ export function getEffectiveHourCapMicros(
   const row = apiKeyId ? getApiKeyRow(apiKeyId) : getDefaultApiKeyRow();
   if (!row) return base; // shouldn't happen if base is non-null, but defensive
   const { adjustmentMicros } = settle(row, now);
+  // Outside the active window the per-hour base contribution is 0.
+  // The adjustment carry-over still flows through, so a positive
+  // banked underspend remains usable (positive effective cap) and an
+  // overshoot from a prior active hour stays as a deficit (negative
+  // effective cap). All-day windows (start == end, the default) keep
+  // the v0.1.3 behavior unchanged.
+  const hourContribution = isCurrentHourActive(apiKeyId, now) ? base : 0;
   // Negative effective caps are valid (means "this hour starts with
   // less than zero room" — every call will fail the cap check unless
   // the exemption applies). Floor at the stored value, not at zero.
-  return base + adjustmentMicros;
+  return hourContribution + adjustmentMicros;
 }
 
 /**

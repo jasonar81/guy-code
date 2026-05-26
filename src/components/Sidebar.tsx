@@ -306,7 +306,9 @@ function BudgetPill({
           'Headline number is spend in the current clock-hour bucket — that is what the governor enforces. ' +
           'A session whose key has hit the cap pauses until the top of the next clock hour. ' +
           'New sessions get one free turn per hour even when the bucket is exhausted (the min-one-turn-per-session-per-hour exemption).' +
-          (dailyCap ? ` Daily budget is ${formatUsdMicros(dailyCap)} (= 24 × hourly cap).` : '')
+          (dailyCap
+            ? ` Daily budget is ${formatUsdMicros(dailyCap)} spread across the key's active-hours window (= daily / N active hours; default N=24).`
+            : '')
         }
       >
         <div className={clsx('flex justify-between', hourCls)}>

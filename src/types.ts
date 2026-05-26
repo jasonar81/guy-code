@@ -62,6 +62,17 @@ export interface ApiKey {
   is_default: boolean;
   created_at: number;
   preview: string | null;
+  /**
+   * Active-hours window for budget redistribution. Both integers in
+   * [0..23]. When `active_hour_start == active_hour_end` (including
+   * the 0/0 default) the budget spreads over all 24 hours —
+   * identical to v0.1.3 and earlier behavior. Otherwise the window
+   * is the half-open interval [start, end) per local clock, wrapping
+   * midnight when end < start. Outside the window the per-hour base
+   * is zero but the carry-over adjustment still flows through.
+   */
+  active_hour_start: number;
+  active_hour_end: number;
 }
 
 export interface ProjectRow {
@@ -342,6 +353,8 @@ declare global {
           dailyBudgetUsd?: number | null;
           perTurnCapUsd?: number | null;
           setDefault?: boolean;
+          activeHourStart?: number;
+          activeHourEnd?: number;
         }) => Promise<{ ok: boolean; id: string | null; keys: ApiKey[] }>;
         update: (
           id: string,
@@ -350,6 +363,8 @@ declare global {
             plain?: string;
             dailyBudgetUsd?: number | null;
             perTurnCapUsd?: number | null;
+            activeHourStart?: number;
+            activeHourEnd?: number;
           }
         ) => Promise<{ ok: boolean; keys: ApiKey[] }>;
         setDefault: (id: string) => Promise<ApiKey[]>;

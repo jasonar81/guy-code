@@ -82,6 +82,15 @@ export interface ApiKeyPublic {
   created_at: number;
   /** First/last bits of the decrypted key for visual identification. Never sends the full key over IPC. */
   preview: string | null;
+  /**
+   * Active-hours window for budget redistribution. Both 0..23.
+   * When `active_hour_start == active_hour_end` (including the 0/0
+   * default) the budget spreads over all 24 hours. Otherwise the
+   * window is the half-open interval [start, end), wrapping midnight
+   * when end < start. See `electron/budget.ts` for the math.
+   */
+  active_hour_start: number;
+  active_hour_end: number;
 }
 
 function toPublic(r: ApiKeyRow): ApiKeyPublic {
@@ -103,6 +112,8 @@ function toPublic(r: ApiKeyRow): ApiKeyPublic {
     is_default: r.is_default === 1,
     created_at: r.created_at,
     preview,
+    active_hour_start: r.active_hour_start,
+    active_hour_end: r.active_hour_end,
   };
 }
 
@@ -142,6 +153,13 @@ export function createApiKey(args: {
   dailyBudgetUsd?: number | null;
   perTurnCapUsd?: number | null;
   setDefault?: boolean;
+  /**
+   * Active-hours window. Both integers [0..23]; omit / leave 0
+   * for the all-day default. See `db.ts` insertApiKey doc for
+   * wrap semantics.
+   */
+  activeHourStart?: number;
+  activeHourEnd?: number;
 }): string | null {
   const trimmed = args.plain.trim();
   if (!trimmed.startsWith('sk-')) {
@@ -167,6 +185,8 @@ export function createApiKey(args: {
     // First key is always default; otherwise honor the caller's flag.
     isDefault: isFirst || !!args.setDefault,
     createdAt: Date.now(),
+    activeHourStart: args.activeHourStart,
+    activeHourEnd: args.activeHourEnd,
   });
   if (args.setDefault && !isFirst) {
     setDefaultApiKey(id);
@@ -182,6 +202,10 @@ export function updateApiKeyFields(
     plain?: string; // re-encrypt and store if provided
     dailyBudgetUsd?: number | null;
     perTurnCapUsd?: number | null;
+    /** Hour-of-day [0..23] for the active-hours start. Undefined leaves it alone. */
+    activeHourStart?: number;
+    /** Hour-of-day [0..23] for the active-hours end. Undefined leaves it alone. */
+    activeHourEnd?: number;
   }
 ): boolean {
   const dbPatch: {
@@ -189,6 +213,8 @@ export function updateApiKeyFields(
     cipherB64?: string;
     dailyBudgetUsd?: number | null;
     perTurnCapUsd?: number | null;
+    activeHourStart?: number;
+    activeHourEnd?: number;
   } = {};
   if (patch.name !== undefined) dbPatch.name = patch.name.trim();
   if (patch.plain !== undefined && patch.plain.trim()) {
@@ -212,6 +238,12 @@ export function updateApiKeyFields(
       patch.perTurnCapUsd != null && Number.isFinite(patch.perTurnCapUsd)
         ? patch.perTurnCapUsd
         : null;
+  }
+  if (patch.activeHourStart !== undefined) {
+    dbPatch.activeHourStart = patch.activeHourStart;
+  }
+  if (patch.activeHourEnd !== undefined) {
+    dbPatch.activeHourEnd = patch.activeHourEnd;
   }
   updateApiKey(id, dbPatch);
   return true;

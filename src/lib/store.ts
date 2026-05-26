@@ -333,6 +333,8 @@ interface AppState {
     dailyBudgetUsd?: number | null;
     perTurnCapUsd?: number | null;
     setDefault?: boolean;
+    activeHourStart?: number;
+    activeHourEnd?: number;
   }) => Promise<string | null>;
   updateApiKey: (
     id: string,
@@ -341,6 +343,8 @@ interface AppState {
       plain?: string;
       dailyBudgetUsd?: number | null;
       perTurnCapUsd?: number | null;
+      activeHourStart?: number;
+      activeHourEnd?: number;
     }
   ) => Promise<boolean>;
   setDefaultApiKey: (id: string) => Promise<void>;

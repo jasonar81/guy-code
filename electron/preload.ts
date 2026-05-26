@@ -56,6 +56,14 @@ const api = {
       dailyBudgetUsd?: number | null;
       perTurnCapUsd?: number | null;
       setDefault?: boolean;
+      // Per-key active-hours window for budget redistribution. Both
+      // integers in [0..23]; equal values (including the 0/0 default)
+      // mean "all 24 hours active" — identical to v0.1.3 behavior.
+      // When start > end the window wraps midnight (e.g. 22..6).
+      // Outside the window the per-hour base is 0; carry-over flows
+      // through. See `electron/budget.ts` for the math.
+      activeHourStart?: number;
+      activeHourEnd?: number;
     }) => ipcRenderer.invoke('apiKeys:create', args),
     update: (
       id: string,
@@ -64,6 +72,8 @@ const api = {
         plain?: string;
         dailyBudgetUsd?: number | null;
         perTurnCapUsd?: number | null;
+        activeHourStart?: number;
+        activeHourEnd?: number;
       }
     ) => ipcRenderer.invoke('apiKeys:update', id, patch),
     setDefault: (id: string) => ipcRenderer.invoke('apiKeys:setDefault', id),
