@@ -83,6 +83,35 @@ jobs:
         # build fails loudly here rather than silently drifting.
         run: npm ci
 
+      - name: Pin version from tag
+        # The pushed git tag (e.g. `v0.1.5`) is the single source of
+        # truth for the released version. Overwrite package.json's
+        # `version` field from `$GITHUB_REF_NAME` (minus the leading
+        # `v`) so `app.getVersion()` and the embedded NSIS / DMG /
+        # AppImage version metadata always match the tag — even if
+        # the maintainer forgot to bump `package.json` before
+        # pushing the tag. This is the "can't forget to update it"
+        # guarantee shipped in v0.1.5.
+        #
+        # Notes:
+        #   • `--no-git-tag-version` keeps npm from trying to create
+        #     a new commit/tag (we're already on the tag).
+        #   • `--allow-same-version` makes the step a no-op when
+        #     package.json was bumped correctly — no failure when
+        #     the maintainer DID do the bump locally.
+        #   • `npm version` updates both `package.json` AND
+        #     `package-lock.json`. We run AFTER `npm ci` so the
+        #     install used the as-committed lockfile; the
+        #     subsequent updates don't re-trigger installs.
+        #   • `shell: bash` works on all three runners (Windows
+        #     uses Git Bash). The `${VAR#prefix}` parameter
+        #     expansion strips the leading `v` portably.
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "Pinning package.json version to $TAG_VERSION (tag: $GITHUB_REF_NAME)"
+          npm version "$TAG_VERSION" --no-git-tag-version --allow-same-version
+
       - name: Run tests
         # Belt-and-suspenders: even though tests run on every PR via
         # a separate workflow (when added), gate the release on a

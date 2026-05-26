@@ -293,6 +293,15 @@ export interface ImportProgress {
 declare global {
   interface Window {
     api: {
+      app: {
+        /**
+         * The version string `app.getVersion()` returns. For released
+         * builds this matches the GitHub release tag exactly because
+         * the CI workflow pins package.json's version field from the
+         * tag before electron-builder runs.
+         */
+        version: () => Promise<string>;
+      };
       sessions: {
         listAll: () => Promise<SessionRow[]>;
         create: (

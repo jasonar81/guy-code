@@ -65,6 +65,18 @@ import {
 } from './agent';
 
 export function registerIpc(getMainWindow: () => BrowserWindow | null) {
+  // ---- App metadata ----
+  //
+  // `app.getVersion()` returns the version embedded at build time. For
+  // production builds the release CI workflow rewrites `package.json`'s
+  // version field from the pushed git tag BEFORE running
+  // electron-builder, so the embedded version is always identical to
+  // the GitHub release tag (no drift possible). In dev (`npm run dev`)
+  // this returns whatever package.json currently says, which is fine —
+  // dev builds aren't released. Surfaced in the renderer via the
+  // Settings footer and as a tooltip on the title bar.
+  ipcMain.handle('app:version', () => app.getVersion());
+
   // ---- Sessions (primary entity in the UI) ----
   ipcMain.handle('sessions:listAll', () => listSessionsAll());
 

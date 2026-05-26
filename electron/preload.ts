@@ -1,6 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 const api = {
+  app: {
+    // App version embedded at build time. For released builds the CI
+    // workflow rewrites package.json's version from the pushed git
+    // tag before electron-builder runs, so this always matches the
+    // GitHub release tag.
+    version: () => ipcRenderer.invoke('app:version') as Promise<string>,
+  },
   sessions: {
     listAll: () => ipcRenderer.invoke('sessions:listAll'),
     create: (cwd: string, title?: string | null, apiKeyId?: string | null) =>

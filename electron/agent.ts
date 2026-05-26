@@ -45,6 +45,10 @@ import { getDefaultApiKeyId } from './secret';
 import { computeCostMicros } from './pricing';
 import { loadMemory } from './memory';
 import { precheckCall } from './budget';
+import {
+  looksLikeContextBail,
+  buildContextBailNudge,
+} from './contextBailGuard';
 import { maybeSummarize } from './toolSummarizer';
 import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
 import { renderActivePlanBlock } from './planManager';
@@ -817,6 +821,38 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // get pummeled forever.
     const MAX_MONITORING_NUDGES = 4;
 
+    // ---- Context-bail WaitForUser runtime guardrail -------------------
+    //
+    // Symptom (the v0.1.5 user complaint, verbatim example):
+    //   > "Push through to completion now in this same turn (will be
+    //   > tight against context budget), OR stop here and let a fresh
+    //   > session pick up from the saved memory?"
+    //
+    // This is the model calling WaitForUser to ask the user for
+    // PERMISSION to keep working on the grounds that context might
+    // be tight. It's never the right call:
+    //   • Anthropic's server-side micro-compaction
+    //     (`context_management.clear_tool_uses_20250919`) clears older
+    //     tool results in place once we cross the input-token trigger
+    //     (600K for 1M context, 150K for 200K).
+    //   • Our client-side `preflightCompactIfNeeded` summarizes the
+    //     head as a backstop before any request that would otherwise
+    //     exceed the cap.
+    //   • Saved memory + JSONL + the active-plan slot anchor goal +
+    //     progress across compactions; the model doesn't lose its
+    //     place. There's no "fresh session needed" scenario.
+    //
+    // Guardrail: when a WaitForUser fires with a question matching
+    // the context-bail pattern, refuse it. Synthesize a tool_result
+    // telling the model "context is automatic; keep working", DON'T
+    // transition the session to waiting-on-user, DON'T emit the UI
+    // wait_for_user event, and continue the loop. Bounded by
+    // `MAX_CONTEXT_BAIL_NUDGES` so a genuinely confused model
+    // eventually falls through to a real WaitForUser (surfacing the
+    // bug to the human instead of looping forever).
+    let contextBailNudgesUsed = 0;
+    const MAX_CONTEXT_BAIL_NUDGES = 4;
+
     // ----- Context shaping is now SERVER-SIDE -----------------------------
     //
     // Anthropic's `context_management` beta does what `maybeCompact` and
@@ -1392,6 +1428,63 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         }
         if (isWaitForUser(tu.name)) {
           const question = String((tu.input as any)?.question ?? '');
+          // ---- Context-bail interception -----------------------------
+          //
+          // If the WaitForUser question matches the "should I stop or
+          // keep going due to context budget / fresh session pickup"
+          // anti-pattern, refuse it. Context management is automatic
+          // (server-side micro-compaction + client-side preflight); the
+          // user has explicitly said they never want to be asked these
+          // questions. Synthesize a tool_result that nudges the model
+          // to keep working and continue the loop instead of breaking.
+          //
+          // Bounded by `MAX_CONTEXT_BAIL_NUDGES` so a genuinely confused
+          // model eventually falls through to a real WaitForUser (better
+          // UX to surface the bug than to silently hang the session in
+          // a refusal loop forever).
+          if (
+            contextBailNudgesUsed < MAX_CONTEXT_BAIL_NUDGES &&
+            looksLikeContextBail(question)
+          ) {
+            contextBailNudgesUsed++;
+            const nudgeMsg = buildContextBailNudge(
+              contextBailNudgesUsed,
+              MAX_CONTEXT_BAIL_NUDGES
+            );
+            log.warn(
+              `[agent] context-bail WaitForUser intercepted for ${sessionId} ` +
+                `(nudge ${contextBailNudgesUsed}/${MAX_CONTEXT_BAIL_NUDGES}): ` +
+                `${question.slice(0, 160)}`
+            );
+            // Push a tool_result so the conversation history is well-
+            // formed for the NEXT streamMessage call. The model sees
+            // the refusal as a tool_result response to its own
+            // WaitForUser call — same shape as a normal tool, with
+            // is_error=true to make the refusal visually distinct.
+            toolResultBlocks.push({
+              type: 'tool_result',
+              tool_use_id: tu.id,
+              content: nudgeMsg,
+              is_error: true,
+            } as any);
+            // Surface in the UI's tool-card row as an error result so
+            // the user can see the guardrail fired (no silent magic).
+            // We DO NOT emit `wait_for_user` — the session stays in
+            // its current `running` state and the loop continues.
+            onEv({
+              type: 'tool_result',
+              sessionId,
+              id: tu.id,
+              content: 'Context-bail WaitForUser refused — guardrail nudged model to keep working.',
+              isError: true,
+              ms: 0,
+            });
+            // Don't break — keep executing any remaining tools in this
+            // batch and then re-stream so the model gets the nudge.
+            continue;
+          }
+          // ---- Normal WaitForUser path -------------------------------
+          //
           // Synthesize a tool_result so the conversation history is well-formed
           // when the user's reply comes back.
           toolResultBlocks.push({

@@ -41,6 +41,13 @@ export function SettingsModal({ open, onClose }: Props) {
   const [mcpMsg, setMcpMsg] = useState<string | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServerStatus[]>([]);
   const [signingIn, setSigningIn] = useState<string | null>(null);
+  // App version, fetched from main once when the modal opens. Sourced
+  // from `app.getVersion()`, which in release builds is rewritten from
+  // the GitHub release tag by the CI workflow — so there's no risk
+  // package.json's checked-in version drifts from what the user sees.
+  // null while loading / on IPC failure (kept silent — the footer
+  // just shows nothing in that case rather than a broken "v???").
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   // Multi-key support lives in the global store so the Sidebar's budget pill
   // and the SessionContextMenu can share the same source of truth without an
@@ -66,6 +73,16 @@ export function SettingsModal({ open, onClose }: Props) {
       // Make sure the keys list is fresh whenever the user opens
       // Settings (a key may have been added/removed via another path).
       refreshApiKeys();
+      // Fetch the running app version. Cheap one-shot (no polling —
+      // the version doesn't change while the app is open) and best-
+      // effort — a missing IPC handler in an older preload build
+      // just leaves the footer chip hidden.
+      try {
+        const v = await window.api.app.version();
+        if (!cancelled && typeof v === 'string' && v) setAppVersion(v);
+      } catch {
+        /* ignore: footer chip stays hidden when IPC is unavailable */
+      }
     })();
     return () => {
       cancelled = true;
@@ -215,9 +232,28 @@ export function SettingsModal({ open, onClose }: Props) {
         </div>
 
         <footer className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border shrink-0">
+          {/* Version chip on the LEFT. We want it always visible (so the
+              user can read off the version when filing a bug) but
+              visually subordinate to the Save / Cancel actions, hence
+              the muted color + monospace + small font. Hidden silently
+              while the IPC fetch is in flight or fails. */}
+          {appVersion && (
+            <span
+              className="text-[10px] font-mono text-text-dim select-text"
+              title={`Guy Code v${appVersion} — embedded at build time from the GitHub release tag. Reference this when filing issues.`}
+            >
+              v{appVersion}
+            </span>
+          )}
           {savedAt && (
             <span className="text-[11px] text-text-dim mr-auto">Saved.</span>
           )}
+          {/* When no "Saved." badge is showing, push the buttons to the
+              right so the version chip alone doesn't leave them
+              hugging the version. The empty spacer keeps layout
+              consistent regardless of whether the user has just
+              saved. */}
+          {!savedAt && <span className="mr-auto" aria-hidden="true" />}
           <button
             onClick={onClose}
             className="px-3 py-1.5 text-[12px] rounded-md text-text-dim hover:text-text hover:bg-bg-hover"

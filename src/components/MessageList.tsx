@@ -7,6 +7,7 @@ import { RichText } from './RichText';
 import { LinkifyText } from './LinkifyText';
 import { absoluteTime } from '@/lib/format';
 import { decideScrollWatchdog } from '@/lib/scrollWatchdog';
+import { classifyAssistantText } from '@/lib/narration';
 import type { ChatMessage, ContentBlock } from '@/types';
 
 interface Props {
@@ -858,15 +859,79 @@ function MessageBlockImpl({
           // emits paragraph / list / table elements that handle their own
           // spacing, and pre-wrap would cause raw newlines inside paragraph
           // text nodes to render as literal line breaks.
+          //
+          // v0.1.5: classify each paragraph as "internal narration" or
+          // "substantive content". Narration paragraphs (memory /
+          // compaction / self-reassurance noise) render in a smaller,
+          // dimmer font so the eye doesn't have to wade through them.
+          // The chunker respects fenced code blocks; never mutes code.
+          // See `src/lib/narration.ts` for the rules + rationale.
+          const chunks = classifyAssistantText(b.text);
+          const isLast = i === message.content.length - 1;
+          // If the chunker returned nothing (empty / whitespace block)
+          // we still render the original to keep the streaming cursor
+          // attached to the right element while the model is typing.
+          if (chunks.length === 0) {
+            return (
+              <div
+                key={i}
+                className={clsx(
+                  'text-[13px] text-text break-words',
+                  isStreamingTail &&
+                    isLast &&
+                    'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
+                )}
+              >
+                <RichText text={b.text} />
+              </div>
+            );
+          }
           return (
-            <div
-              key={i}
-              className={clsx(
-                'text-[13px] text-text break-words',
-                isStreamingTail && i === message.content.length - 1 && 'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
-              )}
-            >
-              <RichText text={b.text} />
+            <div key={i} className="space-y-1.5">
+              {chunks.map((c, ci) => {
+                const isLastChunk = ci === chunks.length - 1;
+                // The streaming cursor must sit on the FINAL chunk of
+                // the FINAL block so it tracks the model's typing.
+                const showCursor =
+                  isStreamingTail && isLast && isLastChunk;
+                if (c.muted) {
+                  // Muted classes:
+                  //   - text-[11px]: noticeably smaller than the 13px
+                  //     baseline, signals "secondary" without being
+                  //     hard to read.
+                  //   - text-text-dim opacity-80: lower contrast.
+                  //   - italic: extra visual differentiation; helps the
+                  //     eye skip these blocks on scan.
+                  //   - title attribute explains the why for any user
+                  //     who hovers, so we don't look like we're hiding
+                  //     anything.
+                  return (
+                    <div
+                      key={ci}
+                      title="Filtered as internal-state narration (memory / compaction / status pings). The text is still here — just visually de-emphasized."
+                      className={clsx(
+                        'text-[11px] text-text-dim italic opacity-80 break-words',
+                        showCursor &&
+                          'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
+                      )}
+                    >
+                      <RichText text={c.text} />
+                    </div>
+                  );
+                }
+                return (
+                  <div
+                    key={ci}
+                    className={clsx(
+                      'text-[13px] text-text break-words',
+                      showCursor &&
+                        'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
+                    )}
+                  >
+                    <RichText text={c.text} />
+                  </div>
+                );
+              })}
             </div>
           );
         }
