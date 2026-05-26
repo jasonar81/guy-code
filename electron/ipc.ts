@@ -687,45 +687,83 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
       };
     }
   });
-  ipcMain.handle('update:install', async () => {
-    const { installDownloadedUpdate, getUpdateState } = await import(
-      './autoUpdater'
-    );
-    const { drainBeforeQuit } = await import('./quiesceManager');
-    const startedAt = Date.now();
-    try {
-      // Wait for in-flight agent turns to reach a quiescent state
-      // (idle / waiting-on-user / sleeping-budget / error). Bounded
-      // by the manager's own timeout (default 30 s) so a stuck tool
-      // call can't permanently block the install.
-      await drainBeforeQuit();
-    } catch (e: any) {
-      // Drain timed out — the user might prefer "force install"
-      // over "stuck waiting forever." We surface the error and let
-      // the renderer ask "Install anyway?" If they confirm, the
-      // renderer can call `update:install` again with the override
-      // (TODO: wire force flag once we ship the UI).
-      return {
-        ok: false,
-        error: `quiesce timed out: ${e?.message ?? e}`,
-        state: getUpdateState(),
-      };
+  ipcMain.handle(
+    'update:install',
+    async (_evt, opts: { force?: boolean } = {}) => {
+      const { installDownloadedUpdate, getUpdateState } = await import(
+        './autoUpdater'
+      );
+      const { drainBeforeQuit, listActiveSessionIds } = await import(
+        './quiesceManager'
+      );
+      const force = opts?.force === true;
+      const startedAt = Date.now();
+      if (force) {
+        // Force-install path. The user has already seen a quiesce
+        // timeout error and confirmed they want to drop in-flight
+        // work. Abort each active session's run, then wait a short
+        // grace period for the aborts to propagate and the row
+        // states to settle. Whatever doesn't settle in 5 s gets
+        // killed by the imminent `quitAndInstall` anyway, so there's
+        // no point in waiting longer.
+        const { cancelRun } = await import('./agent');
+        const active = listActiveSessionIds();
+        log.info(
+          `[ipc:update:install] force-install requested with ${active.length} active session(s); aborting each`
+        );
+        for (const id of active) {
+          try {
+            cancelRun(id);
+          } catch (e) {
+            log.warn(`[ipc:update:install] cancelRun(${id}) threw`, e);
+          }
+        }
+        // Short drain so the just-aborted sessions can transition to
+        // idle/error and we can log how many actually cleaned up. If
+        // some are still pinned (e.g. a tool ignoring the abort
+        // signal — defense-in-depth: cancelRun has its own 5 s
+        // watchdog that force-cleans `activeRuns`), we still install.
+        try {
+          await drainBeforeQuit({ timeoutMs: 5_000 });
+        } catch (e: any) {
+          log.warn(
+            `[ipc:update:install] force-drain still found stuck sessions; installing anyway: ${e?.message ?? e}`
+          );
+        }
+      } else {
+        try {
+          // Wait for in-flight agent turns to reach a quiescent state
+          // (idle / waiting-on-user / sleeping-budget / error). Bounded
+          // by the manager's own timeout (default 30 s) so a stuck tool
+          // call can't permanently block the install.
+          await drainBeforeQuit();
+        } catch (e: any) {
+          // Drain timed out — the renderer's UpdateBanner shows a
+          // secondary "Force install anyway" button that re-calls
+          // this handler with `{ force: true }`.
+          return {
+            ok: false,
+            error: `quiesce timed out: ${e?.message ?? e}`,
+            state: getUpdateState(),
+          };
+        }
+      }
+      const drainedAfterMs = Date.now() - startedAt;
+      const ok = installDownloadedUpdate();
+      if (!ok) {
+        return {
+          ok: false,
+          error:
+            'no update is downloaded yet — refresh status and try again',
+          state: getUpdateState(),
+          drainedAfterMs,
+        };
+      }
+      // We never get here in practice — quitAndInstall terminates the
+      // process — but the promise needs to resolve in case of a race.
+      return { ok: true, drainedAfterMs };
     }
-    const drainedAfterMs = Date.now() - startedAt;
-    const ok = installDownloadedUpdate();
-    if (!ok) {
-      return {
-        ok: false,
-        error:
-          'no update is downloaded yet — refresh status and try again',
-        state: getUpdateState(),
-        drainedAfterMs,
-      };
-    }
-    // We never get here in practice — quitAndInstall terminates the
-    // process — but the promise needs to resolve in case of a race.
-    return { ok: true, drainedAfterMs };
-  });
+  );
 }
 
 /** Encode a Windows/Unix cwd path the same way Claude Code does. */

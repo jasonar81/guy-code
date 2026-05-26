@@ -145,7 +145,14 @@ const api = {
     check: () => ipcRenderer.invoke('update:check'),
     // Triggers `quitAndInstall` AFTER the quiesce manager confirms
     // sessions are drained. Returns { ok, error?, drainedAfterMs? }.
-    install: () => ipcRenderer.invoke('update:install'),
+    //
+    // Pass `{ force: true }` to bypass the drain wait: the IPC
+    // handler aborts every active session, gives them a 5 s grace
+    // window to settle, then installs regardless. The renderer only
+    // surfaces the Force button after the non-force install path
+    // already returned a quiesce-timeout error.
+    install: (opts: { force?: boolean } = {}) =>
+      ipcRenderer.invoke('update:install', opts),
     // Subscribe to every state transition (checking, available,
     // downloaded, error, etc.). Returns an unsubscribe thunk so
     // React effects can clean up on unmount.

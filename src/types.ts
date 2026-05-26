@@ -450,7 +450,7 @@ declare global {
       update: {
         status: () => Promise<UpdateState>;
         check: () => Promise<UpdateState | { error: string }>;
-        install: () => Promise<{
+        install: (opts?: { force?: boolean }) => Promise<{
           ok: boolean;
           error?: string;
           state?: UpdateState;

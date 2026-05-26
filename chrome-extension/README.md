@@ -1,29 +1,37 @@
-# Guy Code Bridge — Chrome extension
+# Guy Code Bridge — browser extension (Chrome / Edge)
 
-This is the Chrome-side half of Guy Code's browser connector. It lets
-the desktop app drive your Chrome tabs (read Gmail, click Send in
+This is the browser-side half of Guy Code's browser connector. It lets
+the desktop app drive your tabs (read Gmail, click Send in
 Slack, etc.) **without** requiring `--remote-debugging-port` on your
-main Chrome profile. The desktop app runs a tiny WebSocket server on
+main browser profile. The desktop app runs a tiny WebSocket server on
 `127.0.0.1:9223`; this extension is the client.
+
+**Supported browsers:** Google Chrome and Microsoft Edge. Both use the
+same Manifest V3 / WebExtension APIs (`chrome.tabs`,
+`chrome.scripting`, `chrome.debugger`) so the extension works
+unmodified in either. For Edge, substitute `edge://extensions/` for
+`chrome://extensions/` everywhere below.
 
 ## Why an extension instead of CDP-over-TCP?
 
 Chrome 136+ silently refuses `--remote-debugging-port` when
 `--user-data-dir` resolves to your default profile (anti-cookie-theft
-measure — see https://issues.chromium.org/issues/41486862). The
-extension bypasses this restriction because it uses the
-`chrome.tabs` and `chrome.scripting` extension APIs from inside the
-browser process, not an externally-launched debugger.
+measure — see https://issues.chromium.org/issues/41486862). Edge
+follows Chrome's anti-debug-port behavior. The extension bypasses
+this restriction because it uses the `chrome.tabs` and
+`chrome.scripting` extension APIs from inside the browser process,
+not an externally-launched debugger.
 
 ## One-time install
 
-1. Open Chrome and go to `chrome://extensions/`.
-2. Toggle **Developer mode** on (top-right).
+1. Open Chrome (`chrome://extensions/`) or Edge (`edge://extensions/`).
+2. Toggle **Developer mode** on (top-right in Chrome; bottom-left in
+   Edge).
 3. Click **Load unpacked**.
 4. Pick the `chrome-extension/` directory from this repo (the one
    containing `manifest.json`).
 5. The extension's icon (a small puzzle-piece by default since we
-   ship no PNG icons) appears in the Chrome toolbar. Pin it if you
+   ship no PNG icons) appears in the browser toolbar. Pin it if you
    like — clicking it shows the connection status.
 
 That's it. The extension's service worker tries to connect to the

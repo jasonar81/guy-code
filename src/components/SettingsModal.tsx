@@ -315,22 +315,22 @@ function McpServersSection({
 }
 
 /**
- * Chrome connector controls — extension transport version.
+ * Browser connector controls (Chrome and Edge) — extension transport.
  *
  * Previously this section walked the user through launching Chrome
  * with `--remote-debugging-port`. Chrome 136+ silently disables that
  * flag on default signed-in profiles (anti-cookie-theft measure) so
  * the CDP approach no longer works for the primary use case (driving
- * the user's already-logged-in Chrome).
+ * the user's already-logged-in browser).
  *
- * The replacement: a small unpacked Chrome extension at
+ * The replacement: a small unpacked WebExtension at
  * `chrome-extension/` in the repo, which connects out to a WebSocket
  * server we run in the Electron main process on port 9223. Once the
- * extension is loaded into Chrome (one-time setup), the user clicks
- * Connect here and our server waits for the extension to attach.
- * Everything else — listTabs / openTab / extract / screenshot /
- * waitFor / click / type / press / scroll / eval — runs through the
- * extension's `chrome.tabs.*` and `chrome.scripting.*` APIs.
+ * extension is loaded into Chrome OR Edge (one-time setup), the user
+ * clicks Connect here and our server waits for the extension to
+ * attach. The extension uses standard MV3 APIs (`chrome.tabs.*`,
+ * `chrome.scripting.*`, `chrome.debugger`) which are identical in
+ * Chrome and Edge — same package, same code, two browsers.
  *
  * Polling: when the modal is open, we re-fetch status every 3s so the
  * UI catches out-of-band changes (the user disables the extension →
@@ -355,19 +355,27 @@ function ChromeConnectorSection({ open }: { open: boolean }) {
   // listen port; the extension's service worker has the same default
   // baked in, so 99% of users never touch this input.
   const [portInput, setPortInput] = useState<string>('9223');
-  // Brief "Copied!" affordance on the chrome://extensions/ copy
-  // button — same UX pattern as the old launch-command Copy.
-  const [copied, setCopied] = useState(false);
+  // Brief "Copied!" affordance on the per-browser extensions URL Copy
+  // buttons. Tracked per-key so each row has its own state — clicking
+  // Chrome's Copy doesn't briefly flash "Copied" on the Edge row.
+  const [copiedKey, setCopiedKey] = useState<'chrome' | 'edge' | null>(
+    null
+  );
 
-  const onCopyExtensionsUrl = async () => {
-    // chrome:// URLs can't be opened from a non-privileged origin
-    // (Chromium security policy), so the best the app can do is put
-    // the URL on the clipboard and tell the user to paste it.
-    const url = 'chrome://extensions/';
+  const onCopyExtensionsUrl = async (
+    key: 'chrome' | 'edge',
+    url: string
+  ) => {
+    // chrome:// / edge:// URLs can't be opened from a non-privileged
+    // origin (Chromium security policy), so the best the app can do
+    // is put the URL on the clipboard and tell the user to paste it.
     try {
       await navigator.clipboard.writeText(url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      setCopiedKey(key);
+      setTimeout(
+        () => setCopiedKey((k) => (k === key ? null : k)),
+        1500
+      );
     } catch {
       // Clipboard API can fail when the window isn't focused — rare
       // in an Electron modal but the fallback is cheap. Same approach
@@ -380,8 +388,11 @@ function ChromeConnectorSection({ open }: { open: boolean }) {
       ta.select();
       try {
         document.execCommand('copy');
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
+        setCopiedKey(key);
+        setTimeout(
+          () => setCopiedKey((k) => (k === key ? null : k)),
+          1500
+        );
       } catch {
         /* nothing else to try; the user can paste from the visible code box */
       } finally {
@@ -464,53 +475,73 @@ function ChromeConnectorSection({ open }: { open: boolean }) {
     <div className="pt-2 border-t border-border">
       <div className="flex items-center gap-1.5 text-[12px] font-medium text-text mb-1.5">
         <Globe size={14} className="text-text-dim" />
-        Chrome connector
+        Browser connector (Chrome / Edge)
       </div>
       <p className="text-[11px] text-text-dim leading-snug mb-2">
-        Drive your existing logged-in Chrome (Gmail, Slack, Outlook, etc.)
-        from the agent via a small browser extension. One-time setup; the
-        extension reconnects automatically afterwards.
+        Drive your existing logged-in Chrome or Edge (Gmail, Slack,
+        Outlook, etc.) from the agent via a small browser extension.
+        One-time setup; the extension reconnects automatically
+        afterwards. The same extension works in either browser — load
+        it into whichever one you actually use.
       </p>
       <ol className="text-[11px] text-text-dim leading-snug mb-2 list-decimal pl-4 space-y-0.5">
         <li>
-          Open <code className="font-mono">chrome://extensions/</code> in
-          Chrome (chrome:// URLs can't be opened from here — click Copy
-          and paste into Chrome's address bar).
+          Open <code className="font-mono">chrome://extensions/</code>{' '}
+          in Chrome <em>or</em>{' '}
+          <code className="font-mono">edge://extensions/</code> in
+          Edge (these URLs can't be opened from here — use Copy and
+          paste into your browser's address bar).
         </li>
         <li>
-          Turn on <strong>Developer mode</strong> (toggle, top-right).
+          Turn on <strong>Developer mode</strong> (toggle; top-right
+          in Chrome, bottom-left in Edge).
         </li>
         <li>
           Click <strong>Load unpacked</strong> and pick the{' '}
-          <code className="font-mono">chrome-extension</code> folder inside
-          your Guy Code checkout.
+          <code className="font-mono">chrome-extension</code> folder
+          inside your Guy Code checkout.
         </li>
         <li>Come back here and click Connect.</li>
       </ol>
-      {/* chrome://extensions/ URL display + Copy button. Selectable so
-          the user can manual-copy as a fallback; Copy is the primary
-          path. Same `select-text` + `stopPropagation` story as the old
-          launch-command box. */}
-      <div className="flex items-stretch gap-1.5 mb-2">
-        <code
-          className="flex-1 select-text text-[10px] font-mono bg-bg border border-border rounded p-1.5 overflow-x-auto whitespace-nowrap"
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          chrome://extensions/
-        </code>
-        <button
-          onClick={onCopyExtensionsUrl}
-          className={clsx(
-            'shrink-0 inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded border transition-colors',
-            copied
-              ? 'border-state-success/50 text-state-success bg-state-success/10'
-              : 'border-border text-text-muted hover:text-text hover:border-border-strong'
-          )}
-          title="Copy chrome://extensions/ to the clipboard"
-        >
-          {copied ? <Check size={11} /> : <Copy size={11} />}
-          {copied ? 'Copied' : 'Copy'}
-        </button>
+      {/* Per-browser extensions-URL display + Copy. Two rows because
+          there's no way for us to know which browser the user wants
+          to use, and asking would add a click. Each Copy has its own
+          flash state so feedback is local to the button you pressed. */}
+      <div className="space-y-1 mb-2">
+        {(
+          [
+            { key: 'chrome', label: 'Chrome', url: 'chrome://extensions/' },
+            { key: 'edge', label: 'Edge', url: 'edge://extensions/' },
+          ] as const
+        ).map(({ key, label, url }) => {
+          const isCopied = copiedKey === key;
+          return (
+            <div key={key} className="flex items-stretch gap-1.5">
+              <span className="w-12 self-center text-[10px] font-medium text-text-dim shrink-0">
+                {label}
+              </span>
+              <code
+                className="flex-1 select-text text-[10px] font-mono bg-bg border border-border rounded p-1.5 overflow-x-auto whitespace-nowrap"
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                {url}
+              </code>
+              <button
+                onClick={() => onCopyExtensionsUrl(key, url)}
+                className={clsx(
+                  'shrink-0 inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded border transition-colors',
+                  isCopied
+                    ? 'border-state-success/50 text-state-success bg-state-success/10'
+                    : 'border-border text-text-muted hover:text-text hover:border-border-strong'
+                )}
+                title={`Copy ${url} to the clipboard`}
+              >
+                {isCopied ? <Check size={11} /> : <Copy size={11} />}
+                {isCopied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+          );
+        })}
       </div>
       <div className="flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-bg/40">
         <div className="shrink-0">{pillIcon}</div>

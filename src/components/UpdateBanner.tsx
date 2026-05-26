@@ -1,6 +1,34 @@
 import { useEffect, useState } from 'react';
-import { Download, RefreshCw, AlertTriangle, X } from 'lucide-react';
+import {
+  Download,
+  RefreshCw,
+  AlertTriangle,
+  X,
+  Zap,
+} from 'lucide-react';
 import type { UpdateState } from '@/types';
+
+/**
+ * Heuristic: did the failed install fail because the quiesce manager
+ * timed out (i.e., one or more sessions are stuck in `running` or
+ * `waiting-on-system` and refused to drain in 30 s)?
+ *
+ * If yes, the user can recover by force-installing — the IPC handler
+ * aborts active runs and installs anyway. If no (e.g. the error was
+ * "no update is downloaded yet"), force-install would just hit the
+ * same wall, so we hide the button.
+ *
+ * The string match is intentional and brittle on purpose: we only
+ * want to expose the destructive Force button for THIS exact failure
+ * mode. Any future quiesce error wording change should be coordinated
+ * with this match.
+ */
+function isQuiesceTimeoutError(msg: string | null | undefined): boolean {
+  if (!msg) return false;
+  return /quiesce timed out|still active after \d+ms|drain timed out/i.test(
+    msg
+  );
+}
 
 /**
  * Top-of-window banner that surfaces auto-updater state to the user.
@@ -70,11 +98,21 @@ export function UpdateBanner() {
   if (state.state === 'idle' || state.state === 'disabled') return null;
   if (state.state === 'checking' || state.state === 'available') return null;
 
-  const onInstall = async () => {
+  const onInstall = async (force = false) => {
+    if (force) {
+      // Force install is destructive — abort any in-flight tool calls
+      // and lose their work. Confirm before proceeding so a stray
+      // click after the timeout doesn't silently kill a long Bash.
+      const ok = window.confirm(
+        'Force install drops in-flight work in any active session(s) ' +
+          'and restarts immediately. Continue?'
+      );
+      if (!ok) return;
+    }
     setInstalling(true);
     setInstallError(null);
     try {
-      const r = await window.api.update.install();
+      const r = await window.api.update.install({ force });
       if (!r.ok) {
         setInstallError(r.error ?? 'install failed');
       }
@@ -88,6 +126,12 @@ export function UpdateBanner() {
   };
 
   if (state.state === 'downloaded') {
+    // Only expose Force after a real quiesce-timeout failure. Hidden
+    // on first paint (installError === null) and on unrelated errors
+    // (e.g. "no update downloaded yet") so users don't reach for the
+    // destructive button by default.
+    const showForce =
+      !installing && isQuiesceTimeoutError(installError);
     return (
       <div className="px-3 py-1.5 bg-state-attention/10 border-b border-state-attention/40 flex items-center gap-3 text-[13px]">
         <Download size={14} className="text-state-attention" />
@@ -98,8 +142,19 @@ export function UpdateBanner() {
             <span className="ml-2 text-state-error">{installError}</span>
           )}
         </span>
+        {showForce && (
+          <button
+            onClick={() => onInstall(true)}
+            disabled={installing}
+            className="px-2.5 py-1 rounded-md bg-state-error/15 hover:bg-state-error/25 border border-state-error/40 text-state-error disabled:opacity-50 disabled:cursor-wait text-[12px] font-medium inline-flex items-center gap-1.5"
+            title="Aborts active sessions and installs anyway. Any tool work in flight will be lost."
+          >
+            <Zap size={12} />
+            Force install anyway
+          </button>
+        )}
         <button
-          onClick={onInstall}
+          onClick={() => onInstall(false)}
           disabled={installing}
           className="px-3 py-1 rounded-md bg-state-attention/20 hover:bg-state-attention/30 border border-state-attention/40 text-state-attention disabled:opacity-50 disabled:cursor-wait text-[12px] font-medium inline-flex items-center gap-1.5"
           title="Drains in-flight conversations, then restarts into the new version. May take up to 30 s if a tool call is running."
@@ -112,7 +167,7 @@ export function UpdateBanner() {
           ) : (
             <>
               <RefreshCw size={12} />
-              Restart to install
+              {installError ? 'Try again' : 'Restart to install'}
             </>
           )}
         </button>
