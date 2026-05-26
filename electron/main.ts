@@ -1,7 +1,13 @@
 import { app, BrowserWindow, dialog, shell } from 'electron';
 import { join } from 'node:path';
 import log from 'electron-log';
-import { db, initDb, resetStaleRunningSessions, getSetting } from './db';
+import {
+  db,
+  initDb,
+  resetStaleRunningSessions,
+  resetArchivedRunningSessions,
+  getSetting,
+} from './db';
 import { registerIpc } from './ipc';
 import { importClaudeProjects } from './claudeImport';
 import { bootstrapApiKey, hasApiKey } from './secret';
@@ -103,6 +109,27 @@ app.whenReady().then(async () => {
     }
   } catch (e) {
     log.warn('[main] resetStaleRunningSessions failed', e);
+  }
+
+  // One-time backfill for the "archive doesn't stop runtime" bug fix:
+  // any archived session left in a runnable state by a pre-fix install
+  // gets idled here. This is BELT-AND-SUSPENDERS with the new
+  // sessions:archive IPC handler (which idles on the way in) — the
+  // handler covers all NEW archives, this covers existing archived
+  // rows that were stuck before the handler was changed. Specifically
+  // this catches archived rows whose state is running,
+  // waiting-on-system, waiting-on-user, or sleeping-budget, plus
+  // clears their pending_user_text so the resume sweep can never
+  // re-wake them.
+  try {
+    const n = resetArchivedRunningSessions();
+    if (n > 0) {
+      log.info(
+        `[main] backfill: idled ${n} archived session(s) that were stuck in a runnable state`
+      );
+    }
+  } catch (e) {
+    log.warn('[main] resetArchivedRunningSessions failed', e);
   }
 
   // Diagnostic: count archived vs non-archived sessions at startup. Helps

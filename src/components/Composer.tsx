@@ -116,34 +116,132 @@ export function Composer({ sessionId, visible }: Props) {
   const markIdle = useApp((s) => s.markIdle);
   const hasApiKey = useApp((s) => s.hasApiKey);
 
-  const [text, setText] = useState('');
+  // Per-session draft hydration. The initial textarea value comes
+  // from the session row's `draft_text` column (DB-persisted via
+  // `setSessionDraft`). This restores in-progress messages across:
+  //   • app restart (the durable case — the row carries the draft
+  //     between processes),
+  //   • first-time pane mount (e.g., session not previously opened
+  //     in this run).
+  //
+  // Non-restart switches (active session A → B → back to A) don't
+  // need DB hydration because PanesContainer pre-mounts every opened
+  // session, so each Composer instance keeps its own React `text`
+  // state alive while hidden via `visibility:hidden`. The state IS
+  // the draft for the duration of the run; the DB is a backup.
+  //
+  // We read via `useApp.getState()` (one-shot, non-reactive) inside
+  // a lazy useState initializer so we don't subscribe — no re-render
+  // when other things on the row change. Without `getState()` we'd
+  // have to do useEffect+setText, which would briefly flash the
+  // textarea empty before hydrating.
+  const [text, setText] = useState<string>(() => {
+    const row = useApp.getState().sessions.find((r) => r.id === sessionId);
+    return row?.draft_text ?? '';
+  });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Debounced draft persistence. Tracks the last value successfully
+  // written to the DB so the debounce can skip no-op writes (e.g.,
+  // re-renders that don't change `text`). Seeded with the hydrated
+  // initial draft to suppress an immediate redundant write on first
+  // mount. Updated by both the debounce timer (success path) AND the
+  // submit handler (immediate-clear path).
+  const lastSavedDraftRef = useRef<string | null>(
+    (() => {
+      const row = useApp.getState().sessions.find((r) => r.id === sessionId);
+      return row?.draft_text ?? null;
+    })()
+  );
+  useEffect(() => {
+    // Normalize empty/whitespace to null — matches the IPC handler's
+    // own normalization, so the skip-check below correctly identifies
+    // "user cleared the textarea" (text='') as already-saved when the
+    // last-saved value is null.
+    const normalized = text.trim().length > 0 ? text : null;
+    if (normalized === lastSavedDraftRef.current) return;
+    // 500 ms idle is the sweet spot: fast enough that a power loss or
+    // app crash within a typing burst loses ≤1 sentence; slow enough
+    // that a typical "type a paragraph" session results in ~3-5 DB
+    // writes total instead of 50+ keystroke-rate writes. The final
+    // settle write is also covered — when the user pauses to think,
+    // the timer fires before they resume.
+    const id = setTimeout(() => {
+      window.api.sessions.setDraft(sessionId, normalized).catch((e) => {
+        // eslint-disable-next-line no-console
+        console.warn('[Composer] draft persist failed', e);
+      });
+      lastSavedDraftRef.current = normalized;
+    }, 500);
+    return () => clearTimeout(id);
+  }, [text, sessionId]);
+
   const streaming = chat?.streaming ?? false;
   const pending = chat?.pendingQuestion ?? null;
-  const error = chat?.errorMessage ?? null;
+  const liveError = chat?.errorMessage ?? null;
   const liveCost = chat?.liveTurnCostMicros ?? 0;
   const interruptTurn = useApp((s) => s.interruptTurn);
   const queuedCount = chat?.pendingInterrupts.length ?? 0;
   const awaiting = chat?.awaitingResponse ?? null;
-  // Tick once per second while we're waiting on the API so the elapsed
-  // counter in the status bar updates live. Cheap re-render — only one
-  // small text node depends on this state.
-  const [now, setNow] = useState<number>(() => Date.now());
-  useEffect(() => {
-    if (!awaiting) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [awaiting]);
   // Pull the matching session row so we can detect sleeping-budget state and
   // show the force-resume affordance only when it's actionable.
   const sessionRow = useApp((s) => s.sessions.find((r) => r.id === sessionId));
   const sleeping = sessionRow?.state === 'sleeping-budget';
   const sleepingSince = sessionRow?.sleeping_since ?? null;
+  // Sleeping-budget banner: when the live `errorMessage` is set (the
+  // session entered sleeping-budget IN THIS PROCESS via the
+  // `budget_blocked` event), use it as-is — it carries the full
+  // spend/cap dollar figures that the user's renderer constructed
+  // when the event fired. After an APP RESTART the row is still
+  // marked `sleeping-budget` in the DB (state survives restart) but
+  // the chat reducer's transient `errorMessage` is gone — it lives in
+  // memory only. Without a fallback, the user clicks the row, sees
+  // the paused glyph in the sidebar, but no banner inside the pane.
+  // That makes the session look incorrectly idle. Synthesize a
+  // shorter banner here ("Paused — auto-resumes at HH:MM, Force
+  // resume to bypass") so the UX matches whether the pause happened
+  // pre- or post-restart. The simpler text drops the exact dollar
+  // figures (we don't have them in the row), but the user is still
+  // told what's happening and given the same Force-resume button.
+  const sleepingBanner = sleeping
+    ? (() => {
+        const nextHour = new Date();
+        nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+        const wakeStr = nextHour.toLocaleTimeString([], {
+          hour: 'numeric',
+          minute: '2-digit',
+        });
+        return `Paused — hourly budget cap reached. Auto-resumes at ${wakeStr}, or hit Force resume to bypass for one turn.`;
+      })()
+    : null;
+  const error = liveError ?? sleepingBanner;
+  // Persistent-sleep state (today: WaitForTime). When the agent loop
+  // exits into sleeping-tool the session row carries `wake_at_ts` —
+  // we surface that as a countdown in the status bar so the user can
+  // see exactly when the session will resume, and a Stop button on
+  // the composer cancels the wait via the same cancelRun path.
+  const sleepingTool = sessionRow?.state === 'sleeping-tool';
+  const wakeAtTs = sessionRow?.wake_at_ts ?? null;
+  // Tick once per second whenever there's a moving time display:
+  // the awaiting-API counter (during a turn), or the sleeping-tool
+  // wake countdown (while paused). Cheap re-render — only one small
+  // text node depends on this state.
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    if (!awaiting && !(sleepingTool && wakeAtTs)) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [awaiting, sleepingTool, wakeAtTs]);
+  // Archived sessions are inert: the backend will refuse any agent:run
+  // for them anyway (see `runUserTurn`'s archive guard), but disabling
+  // the composer prevents the user from confusedly typing into a field
+  // whose contents won't go anywhere. Unarchive (via sidebar / row
+  // button / context menu) re-enables.
+  const archived = sessionRow?.archived === 1;
 
   // ---- Slash-command autocomplete --------------------------------------
   //
@@ -318,6 +416,12 @@ export function Composer({ sessionId, visible }: Props) {
   };
 
   const submit = async () => {
+    // Archived sessions: ignore submit entirely. The composer is also
+    // visually disabled (textarea + send button), so reaching this
+    // branch generally means a keyboard shortcut fired (Enter while
+    // somehow still focused). Just no-op — clearer UX than silently
+    // dropping the text into a backend that would also refuse it.
+    if (archived) return;
     const t = text.trim();
     // During streaming we queue the text as an interrupt — the agent picks
     // it up between tool rounds and inlines it into the conversation.
@@ -334,11 +438,23 @@ export function Composer({ sessionId, visible }: Props) {
         return;
       }
       setText('');
+      // Submit-clear is synchronous + redundant-with-debounce.
+      // The 500-ms debounce above would eventually write null when
+      // it next fires, but a fast app close before that timer
+      // expires would leave the just-sent message back in
+      // draft_text and re-hydrate it on next launch — exactly the
+      // wrong UX. Fire-and-forget the IPC clear immediately, and
+      // pin the lastSaved ref so the still-pending debounce write
+      // sees no-op and skips.
+      lastSavedDraftRef.current = null;
+      window.api.sessions.setDraft(sessionId, null).catch(() => {});
       await interruptTurn(sessionId, t);
       return;
     }
     if (!t && attachments.length === 0) return;
     setText('');
+    lastSavedDraftRef.current = null;
+    window.api.sessions.setDraft(sessionId, null).catch(() => {});
     const sending = attachments;
     setAttachments([]);
     setAttachError(null);
@@ -489,6 +605,37 @@ export function Composer({ sessionId, visible }: Props) {
           </span>
         ) : streaming ? (
           <span className="text-state-running">● streaming</span>
+        ) : sleepingTool && wakeAtTs ? (
+          // Persistent WaitForTime: show countdown to wake. The
+          // `now` state ticks every second (see useEffect above)
+          // so this reads as a live countdown. When wake_at_ts is
+          // in the past, the resume sweep / timer will have fired
+          // already — we still show "waking…" until the state-
+          // change broadcast updates the row out of sleeping-tool.
+          (() => {
+            const remainingMs = Math.max(0, wakeAtTs - now);
+            const totalSec = Math.round(remainingMs / 1000);
+            const hours = Math.floor(totalSec / 3600);
+            const mins = Math.floor((totalSec % 3600) / 60);
+            const secs = totalSec % 60;
+            const parts: string[] = [];
+            if (hours > 0) parts.push(`${hours}h`);
+            if (hours > 0 || mins > 0) parts.push(`${mins}m`);
+            parts.push(`${secs}s`);
+            const remStr = parts.join(' ');
+            const wakeTimeStr = new Date(wakeAtTs).toLocaleTimeString();
+            const label =
+              remainingMs <= 0 ? 'waking…' : `sleeping · wakes in ${remStr}`;
+            return (
+              <span
+                className="text-state-sleeping inline-flex items-center gap-1"
+                title={`WaitForTime: session resumes at ${wakeTimeStr}. Survives app restart — the wake will fire even if you quit and reopen. Click Stop to cancel the wait.`}
+              >
+                ⏳ {label}
+                <span className="ml-1 text-text-dim">· at {wakeTimeStr}</span>
+              </span>
+            );
+          })()
         ) : (
           <span>idle</span>
         )}
@@ -573,31 +720,37 @@ export function Composer({ sessionId, visible }: Props) {
           onSelect={syncCaret}
           onPaste={onPaste}
           rows={1}
+          disabled={archived}
           placeholder={
-            pending
-              ? 'Reply…'
-              : streaming
-                ? 'Type to queue for the agent (picked up between tool rounds)…'
-                : attachments.length > 0
-                  ? 'Add a message (optional)…'
-                  : 'Message Guy Code…'
+            archived
+              ? 'Session archived — unarchive to continue'
+              : pending
+                ? 'Reply…'
+                : streaming
+                  ? 'Type to queue for the agent (picked up between tool rounds)…'
+                  : attachments.length > 0
+                    ? 'Add a message (optional)…'
+                    : 'Message Guy Code…'
           }
           className={clsx(
             'flex-1 resize-none rounded-md bg-bg border border-border focus:border-accent',
             'px-3 py-2 text-[13px] text-text placeholder:text-text-dim',
             'outline-none transition-colors',
-            'min-h-[36px] max-h-[220px]'
+            'min-h-[36px] max-h-[220px]',
+            archived && 'opacity-60 cursor-not-allowed'
           )}
         />
-        {/* Stop button is always available during streaming, alongside the
-            queue/send button — so the user can either feed the agent more
-            context or hard-stop it without hunting through menus. */}
-        {streaming && (
+        {/* Stop button is available during streaming OR sleeping-tool —
+            in the former it aborts the in-flight stream/tools, in the
+            latter it tears down the wake timer and idles the session
+            (the user can then send a fresh message to restart). Both
+            paths go through cancelRun/cancelTurn on the backend. */}
+        {(streaming || sleepingTool) && (
           <button
             onClick={() => cancelTurn(sessionId)}
             className="shrink-0 inline-flex items-center gap-1 rounded-md bg-bg-elevated hover:bg-bg-hover border border-border px-3 py-2 text-[12px] text-text"
-            title="Cancel turn"
-            aria-label="Cancel turn"
+            title={sleepingTool ? 'Cancel scheduled wake' : 'Cancel turn'}
+            aria-label={sleepingTool ? 'Cancel scheduled wake' : 'Cancel turn'}
           >
             <Square size={14} />
             Stop
@@ -605,19 +758,23 @@ export function Composer({ sessionId, visible }: Props) {
         )}
         <button
           onClick={submit}
-          disabled={!text.trim() && (streaming || attachments.length === 0)}
+          disabled={archived || (!text.trim() && (streaming || attachments.length === 0))}
           className={clsx(
             'shrink-0 inline-flex items-center gap-1 rounded-md px-3 py-2 text-[12px]',
-            (text.trim() || (!streaming && attachments.length > 0))
-              ? streaming
-                ? 'bg-state-attention/80 text-white hover:bg-state-attention'
-                : 'bg-accent text-white hover:bg-accent-dim'
-              : 'bg-bg-elevated text-text-dim cursor-not-allowed'
+            archived
+              ? 'bg-bg-elevated text-text-dim cursor-not-allowed'
+              : (text.trim() || (!streaming && attachments.length > 0))
+                ? streaming
+                  ? 'bg-state-attention/80 text-white hover:bg-state-attention'
+                  : 'bg-accent text-white hover:bg-accent-dim'
+                : 'bg-bg-elevated text-text-dim cursor-not-allowed'
           )}
           title={
-            streaming
-              ? 'Queue this text — the agent will pick it up between tool rounds'
-              : 'Send'
+            archived
+              ? 'Session archived — unarchive to send messages'
+              : streaming
+                ? 'Queue this text — the agent will pick it up between tool rounds'
+                : 'Send'
           }
         >
           <Send size={14} />

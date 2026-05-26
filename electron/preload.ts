@@ -15,6 +15,8 @@ const api = {
       ipcRenderer.invoke('sessions:deleteFromDisk', id),
     setState: (id: string, state: string) =>
       ipcRenderer.invoke('sessions:setState', id, state),
+    setDraft: (id: string, draft: string | null) =>
+      ipcRenderer.invoke('sessions:setDraft', id, draft),
     cancelPending: (id: string) =>
       ipcRenderer.invoke('sessions:cancelPending', id),
     setApiKey: (id: string, apiKeyId: string | null) =>

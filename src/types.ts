@@ -4,7 +4,8 @@ export type ProjectState =
   | 'waiting-on-system'
   | 'waiting-on-user'
   | 'error'
-  | 'sleeping-budget';
+  | 'sleeping-budget'
+  | 'sleeping-tool';
 
 /** Each row in the sidebar. One JSONL = one session = one row. */
 export interface SessionRow {
@@ -30,6 +31,20 @@ export interface SessionRow {
   pending_user_text: string | null;
   /** When the session entered sleeping-budget; null otherwise. */
   sleeping_since: number | null;
+  /**
+   * Wall-clock ms-epoch at which a `sleeping-tool` session resumes
+   * (today: `WaitForTime`). Null when not sleeping. The sidebar uses
+   * this to render "Sleeps until 2:14 PM" without round-tripping.
+   */
+  wake_at_ts: number | null;
+  /**
+   * Per-session draft text (the unsubmitted message in the composer).
+   * Survives app restart so the user's in-progress typing isn't lost.
+   * The Composer hydrates its initial textarea state from this on
+   * first mount and writes back via `setSessionDraft` (debounced).
+   * Cleared on successful send. NULL = no draft.
+   */
+  draft_text: string | null;
   /** API key id this session is bound to. Null = inherits the current default. */
   api_key_id: string | null;
 }
@@ -288,6 +303,7 @@ declare global {
         archive: (id: string, archived: boolean) => Promise<SessionRow[]>;
         deleteFromDisk: (id: string) => Promise<SessionRow[]>;
         setState: (id: string, state: string) => Promise<SessionRow[]>;
+        setDraft: (id: string, draft: string | null) => Promise<void>;
         cancelPending: (id: string) => Promise<SessionRow[]>;
         setApiKey: (id: string, apiKeyId: string | null) => Promise<SessionRow[]>;
       };

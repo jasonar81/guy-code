@@ -503,21 +503,48 @@ export function MessageList({ sessionId, visible }: Props) {
         // honors smooth-vs-instant scroll mode the same way the user's
         // earlier gesture did. instant restore is what we want here.
         el.scrollTo({ top: restoreTo, behavior: 'instant' as ScrollBehavior });
-        if (
-          typeof window !== 'undefined' &&
-          (window as any).localStorage?.scrollDebug === '1'
-        ) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[MessageList] watchdog (${decision.reason}): restored scrollTop ${restoreTo} from ${cur} ` +
-              `(prev=${prev}, baseline=${noGestureBaselineRef.current}, ` +
-              `items=${items.length}, sinceUserMs=${sinceUserMs})`
-          );
-        }
+        // Diagnostic is now ALWAYS on (was gated on
+        // localStorage.scrollDebug === '1'). The watchdog only fires
+        // a handful of times per session — and only on actually-
+        // spurious jumps that we already considered worth fighting
+        // — so the log volume is negligible. Always-on means when
+        // the user reports "still seeing scroll-to-top", we have the
+        // evidence in DevTools without asking them to flip a flag
+        // beforehand.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[MessageList] watchdog (${decision.reason}): restored scrollTop ${restoreTo} from ${cur} ` +
+            `(prev=${prev}, baseline=${noGestureBaselineRef.current}, ` +
+            `items=${items.length}, sinceUserMs=${sinceUserMs}, sincePostMountMs=${sincePostMount})`
+        );
         // Don't update lastScrollTopRef from the restore itself —
         // the next scroll event for the restored position will
         // arrive shortly and update it then.
         return;
+      }
+      // Forensic trace for near-zero scrolls that the watchdog
+      // DECLINED to fight. The user has repeatedly reported residual
+      // scroll-to-top cases that the current rules don't catch; this
+      // log captures the inputs to the rule when a candidate (large
+      // upward jump landing near zero, no gesture) gets through, so
+      // we can see exactly which condition rejected the fire and
+      // tighten the rule. Cheap: only fires when both conditions are
+      // suspicious, which itself is rare.
+      const isSuspiciousButNotFlagged =
+        cur < 100 &&
+        prev - cur > 100 &&
+        sinceUserMs > 200 &&
+        !isDraggingRef.current &&
+        !mouseDownRef.current;
+      if (isSuspiciousButNotFlagged) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[MessageList] watchdog NO-FIRE on suspicious near-zero scroll: ` +
+            `prev=${prev} → cur=${cur} (jump=${prev - cur}), ` +
+            `items=${items.length}, sinceUserMs=${sinceUserMs}, ` +
+            `sincePostMountMs=${sincePostMount ?? 'undef'}, ` +
+            `baseline=${noGestureBaselineRef.current}, drift=${noGestureBaselineRef.current - cur}`
+        );
       }
       lastScrollTopRef.current = cur;
     };

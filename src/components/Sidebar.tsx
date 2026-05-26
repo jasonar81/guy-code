@@ -21,7 +21,16 @@ const FILTERS: { v: SidebarFilter; label: string; title: string }[] = [
 ];
 
 const NEEDS_YOU = new Set<ProjectState>(['waiting-on-user', 'error']);
-const RUNNING = new Set<ProjectState>(['running', 'waiting-on-system', 'sleeping-budget']);
+const RUNNING = new Set<ProjectState>([
+  'running',
+  'waiting-on-system',
+  'sleeping-budget',
+  // sleeping-tool sessions are persistently paused waiting for their
+  // wake_at_ts. They count as "active work" the user is monitoring,
+  // not as idle — so they belong in the Running group alongside
+  // sleeping-budget (the other "paused but resuming" state).
+  'sleeping-tool',
+]);
 const IDLE = new Set<ProjectState>(['idle']);
 
 /**

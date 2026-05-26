@@ -617,6 +617,65 @@ function migrate(d: Database) {
           ON plans(session_id) WHERE state = 'active';
       `,
     },
+    {
+      version: 7,
+      // Persistent sleeping-tool state for cross-restart-survival of the
+      // `WaitForTime` tool (and any future tool that needs a wall-clock
+      // delay without holding an in-process timer).
+      //
+      // When a tool decides to put the session to sleep, the agent loop
+      // writes:
+      //   • state = 'sleeping-tool'
+      //   • wake_at_ts = <ms epoch at which the session should resume>
+      // …and exits cleanly. The conversation history in JSONL already
+      // contains a synthesized tool_result for the sleeping tool (so
+      // the assistant/user pair is well-formed for a future API call).
+      //
+      // Wake-up happens via two independent paths that converge on the
+      // same `wakeSleepingTool(sessionId)` function:
+      //   • An in-process `setTimeout` armed when the tool persisted,
+      //     for low-latency wake while the app is still running.
+      //   • The budget governor's resumeSweep (every 60 s), which also
+      //     fires once at startup, so a wake_at_ts whose moment passed
+      //     while the app was closed gets picked up on next boot.
+      //
+      // wake_at_ts is nullable so non-sleeping sessions don't need a
+      // value. We don't add an index — typical user has at most a
+      // handful of sleeping-tool sessions, and the sweep scans a tiny
+      // set already filtered by state.
+      up: `
+        ALTER TABLE sessions ADD COLUMN wake_at_ts INTEGER;
+      `,
+    },
+    {
+      version: 8,
+      // Per-session draft text — the message the user has typed into
+      // the composer for this session but hasn't submitted yet.
+      //
+      // The Composer holds the live draft in React `useState` while
+      // the pane is mounted, which already gives us per-session
+      // retention during a single app run (PanesContainer pre-mounts
+      // every opened session, so each Composer's state survives
+      // session switches via `visibility: hidden`). What that
+      // doesn't cover: app restart. The user closes the app
+      // mid-typing, reopens, and their in-progress message is gone.
+      //
+      // This column is the durable backing store. The Composer
+      // debounces writes to this column (~500 ms idle) so we don't
+      // hammer SQLite on every keystroke, and clears it on send.
+      // On startup, `listSessionsAll` loads the column and the
+      // Composer hydrates its initial `text` state from it.
+      //
+      // Distinct from `pending_user_text`, which holds a message the
+      // user EXPLICITLY SUBMITTED that's queued for the next budget
+      // rollover. Drafts are unsubmitted-in-progress; pending_user_text
+      // is submitted-but-budget-blocked. A session can have both
+      // (rare, but legal — e.g., the user submitted a queued reply
+      // while paused, then started typing a follow-up draft).
+      up: `
+        ALTER TABLE sessions ADD COLUMN draft_text TEXT;
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -742,6 +801,22 @@ export interface SessionRow {
   archived: number;
   pending_user_text: string | null;
   sleeping_since: number | null;
+  /**
+   * Wall-clock epoch (ms) at which a `sleeping-tool` session should
+   * resume. Set by `WaitForTime` (and any future persistent-wait tool)
+   * via `setSessionWakeAt`; cleared on resume / archive / cancel. NULL
+   * for sessions that aren't currently sleeping.
+   */
+  wake_at_ts: number | null;
+  /**
+   * Per-session unsent-draft text. The message the user has typed
+   * into the composer but hasn't submitted yet. Persisted via
+   * `setSessionDraft` (debounced ~500 ms). Cleared on successful
+   * send. NULL = no draft. Distinct from `pending_user_text`, which
+   * is a message the user already submitted that's queued for budget
+   * rollover. See migration v8 for the full design rationale.
+   */
+  draft_text: string | null;
   /** API key this session uses; null = inherits the current default key. */
   api_key_id: string | null;
 }
@@ -812,6 +887,78 @@ export function setSessionArchived(id: string, archived: boolean) {
 }
 
 /**
+ * Cheap "is this session archived" lookup. Used by the agent loop's
+ * pre-flight guard (refuse to start a turn on an archived session) and
+ * by the budget governor's resume sweep (refuse to wake an archived
+ * sleeping-budget session). Both paths need this to be sync + fast so
+ * the guard adds negligible latency to every turn start. Returns false
+ * if the session row doesn't exist — letting the caller fall through to
+ * its existing "no such session" handling rather than reporting a fake
+ * archived=true.
+ */
+export function isSessionArchived(id: string): boolean {
+  const r = db()
+    .prepare('SELECT archived FROM sessions WHERE id = ?')
+    .get<{ archived: number | null }>(id);
+  return !!r && r.archived === 1;
+}
+
+/**
+ * One-time cleanup that runs at app startup AFTER `resetStaleRunningSessions`.
+ *
+ * Background: until this commit, archiving a session was a pure
+ * "hide from sidebar" flag — it did NOT stop a running turn, did NOT
+ * prevent the resume sweep from waking a sleeping-budget archived
+ * session, and did NOT prevent new turns from starting. As a result
+ * an existing install can have archived rows that are still in
+ * `running`, `waiting-on-system`, `waiting-on-user`, or
+ * `sleeping-budget` state — the agent that owned that state is dead
+ * (we just restarted), but the row says "still active".
+ *
+ * Going forward, the `sessions:archive` IPC handler cancels and idles
+ * on the way in, so new archives are clean. This sweep handles the
+ * legacy population.
+ *
+ * Behavior:
+ *   • Any archived session in a non-terminal state is reset to `idle`.
+ *   • Their `pending_user_text` is cleared so the resume sweep can't
+ *     pick them back up (defense-in-depth — `resumeSweep` also now
+ *     filters out archived rows, but clearing the pending text means
+ *     even if a future code path forgets that filter the message can
+ *     never auto-fire).
+ *   • Terminal states (`idle`, `error`) are left untouched — those
+ *     are already not running and the user might want to see the
+ *     `error` rationale for an archived session post-mortem.
+ *
+ * Returns the count of rows touched so the caller can log it.
+ */
+export function resetArchivedRunningSessions(): number {
+  const row = db()
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM sessions
+        WHERE archived = 1
+          AND state IN ('running', 'waiting-on-system', 'waiting-on-user', 'sleeping-budget', 'sleeping-tool')`
+    )
+    .get<{ n: number }>();
+  const n = row?.n ?? 0;
+  if (n > 0) {
+    db()
+      .prepare(
+        `UPDATE sessions
+            SET state = 'idle',
+                pending_user_text = NULL,
+                sleeping_since = NULL,
+                wake_at_ts = NULL
+          WHERE archived = 1
+            AND state IN ('running', 'waiting-on-system', 'waiting-on-user', 'sleeping-budget', 'sleeping-tool')`
+      )
+      .run();
+  }
+  return n;
+}
+
+/**
  * Permanently remove a session row from the database. Used by the
  * sidebar's "Delete from disk" action together with an `unlink` of
  * the JSONL on the filesystem.
@@ -866,6 +1013,9 @@ export function setSessionState(id: string, state: string) {
  * Deliberately NOT reset:
  *   - `waiting-on-user`  — model genuinely asked a question; user can answer.
  *   - `sleeping-budget`  — budget governor owns this state; resume sweep handles it.
+ *   - `sleeping-tool`    — wake_at_ts is durable; the wakeSleepingTool sweep
+ *                          (or the in-process timer if it survived) will
+ *                          resume the session when its moment is reached.
  *   - `error`            — preserve so the user sees what happened.
  *   - `idle`             — already correct.
  */
@@ -920,6 +1070,91 @@ export function getSessionPending(
     .get<{ pending_user_text: string | null; sleeping_since: number | null }>(id);
 }
 
+/**
+ * Write (or clear) the wall-clock wake time for a `sleeping-tool` session.
+ * Pass null to clear when the session is resumed, archived, or cancelled.
+ *
+ * Doesn't write `state` — the caller is responsible for transitioning
+ * the session into / out of `sleeping-tool`. Splitting these
+ * responsibilities lets us update the state and wake_at_ts in the
+ * appropriate order from the agent loop (state first so the renderer's
+ * state-changed broadcast fires, then wake_at_ts so it's already
+ * present by the time the sweep first scans).
+ */
+export function setSessionWakeAt(id: string, wakeAtTs: number | null): void {
+  db()
+    .prepare('UPDATE sessions SET wake_at_ts = ? WHERE id = ?')
+    .run(wakeAtTs, id);
+}
+
+/**
+ * Persist (or clear) a session's draft text. Called from the
+ * `sessions:setDraft` IPC handler, which is in turn invoked by the
+ * Composer's debounced-write effect. Pass `null` (or empty string,
+ * normalized to NULL by the caller) to clear the draft — happens on
+ * successful send so the next session-load doesn't rehydrate stale text.
+ *
+ * Cheap UPDATE keyed by the primary key. We do NOT broadcast a
+ * state-change event for draft writes — drafts are renderer-owned
+ * UI state that just happens to be durable, not state any other
+ * subsystem cares about. The next `refreshSessions()` call will
+ * see the new value naturally.
+ */
+export function setSessionDraft(id: string, draft: string | null): void {
+  db()
+    .prepare('UPDATE sessions SET draft_text = ? WHERE id = ?')
+    .run(draft, id);
+}
+
+/**
+ * Look up a sleeping-tool session's wake_at_ts. Returns null both when
+ * the row doesn't exist and when wake_at_ts is unset — callers should
+ * already know the session id is valid in their context, so we don't
+ * distinguish (yet).
+ */
+export function getSessionWakeAt(id: string): number | null {
+  const r = db()
+    .prepare('SELECT wake_at_ts FROM sessions WHERE id = ?')
+    .get<{ wake_at_ts: number | null }>(id);
+  return r?.wake_at_ts ?? null;
+}
+
+/**
+ * All sessions currently in `sleeping-tool` state, returning enough
+ * info for the resume sweep / startup catch-up to call `runUserTurn`
+ * for each. We deliberately INCLUDE archived rows here so the sweep
+ * can log/skip them explicitly (the archived guard in the sweep
+ * filters them out); the alternative of filtering at the SQL layer
+ * would hide the existence of archived sleepers from the log entirely.
+ */
+export function listSleepingToolSessions(): Array<{
+  id: string;
+  project_id: string;
+  cwd: string | null;
+  jsonl_path: string;
+  api_key_id: string | null;
+  archived: number;
+  wake_at_ts: number | null;
+}> {
+  return db()
+    .prepare(
+      `SELECT s.id, s.project_id, p.cwd AS cwd, s.jsonl_path,
+              s.api_key_id, s.archived, s.wake_at_ts
+         FROM sessions s
+         LEFT JOIN projects p ON p.id = s.project_id
+        WHERE s.state = 'sleeping-tool'`
+    )
+    .all<{
+      id: string;
+      project_id: string;
+      cwd: string | null;
+      jsonl_path: string;
+      api_key_id: string | null;
+      archived: number;
+      wake_at_ts: number | null;
+    }>();
+}
+
 /** All sessions currently in a given state. Used by the budget resume sweep. */
 export function listSessionsByState(state: string): {
   id: string;
@@ -929,11 +1164,12 @@ export function listSessionsByState(state: string): {
   cwd: string | null;
   jsonl_path: string;
   api_key_id: string | null;
+  archived: number;
 }[] {
   return db()
     .prepare(
       `SELECT s.id, s.project_id, s.pending_user_text, s.sleeping_since,
-              p.cwd AS cwd, s.jsonl_path, s.api_key_id
+              p.cwd AS cwd, s.jsonl_path, s.api_key_id, s.archived
          FROM sessions s
          LEFT JOIN projects p ON p.id = s.project_id
         WHERE s.state = ?`
@@ -946,6 +1182,7 @@ export function listSessionsByState(state: string): {
       cwd: string | null;
       jsonl_path: string;
       api_key_id: string | null;
+      archived: number;
     }>(state);
 }
 
@@ -981,6 +1218,8 @@ export function listSessionsAll(): SessionFullRow[] {
         s.archived,
         s.pending_user_text,
         s.sleeping_since,
+        s.wake_at_ts,
+        s.draft_text,
         s.api_key_id,
         p.cwd AS cwd,
         COALESCE(c.total, 0) AS cost_all_time_micros,

@@ -524,8 +524,11 @@ export function resetBudgetAdjustment(apiKeyId: string, now: number = Date.now()
  *
  * Also acts as crash recovery: if the app was killed while paused, the
  * startup sweep finds the row and resumes it.
+ *
+ * Exported so tests can invoke a single tick directly instead of
+ * fighting the `_resumeTimer` interval set up by `startGovernor`.
  */
-async function resumeSweep() {
+export async function resumeSweep() {
   const sleepers = listSessionsByState('sleeping-budget');
   if (sleepers.length === 0) return;
 
@@ -533,6 +536,19 @@ async function resumeSweep() {
 
   const now = Date.now();
   for (const s of sleepers) {
+    // Defense-in-depth: archived sessions are inert. The archive IPC
+    // handler clears pending_user_text and idles them on the way in,
+    // so a normal flow would never produce an archived sleeping-budget
+    // row. But legacy DBs (archived before this fix) can; the startup
+    // resetArchivedRunningSessions sweep cleans them up too. This
+    // belt-and-suspenders check guarantees that even if both prior
+    // safety nets fail, the sweep refuses to wake an archived row.
+    if (s.archived === 1) {
+      log.info(
+        `[budget] skipping wake of archived session ${s.id}; would have qualified`
+      );
+      continue;
+    }
     const cap = getEffectiveHourCapMicros(s.api_key_id, now);
     let canWake = false;
     if (cap == null) {
@@ -627,10 +643,36 @@ export function startGovernor() {
   if (_resumeTimer) return;
   _resumeTimer = setInterval(() => {
     resumeSweep().catch((e) => log.error('[budget] sweep error', e));
+    // Sleeping-tool sweep piggybacks on the same cadence. It walks any
+    // session in `sleeping-tool` state and either fires the wake (if
+    // wake_at_ts is now past) or re-arms the in-process timer (if
+    // future). On an idle install this is a no-op SELECT against a
+    // tiny set, so adding it to every tick is essentially free.
+    void runSleepingToolSweep();
   }, 60_000);
   // Kick once immediately so an app restart doesn't leave paused sessions
-  // sitting for up to 60s before the first sweep.
+  // sitting for up to 60s before the first sweep. The sleeping-tool
+  // version is especially important here — a session whose wake_at_ts
+  // already passed during the downtime should resume right after
+  // boot, not 60 s later.
   resumeSweep().catch((e) => log.error('[budget] startup sweep error', e));
+  void runSleepingToolSweep();
+}
+
+/**
+ * Lazy wrapper around `wakeSleepingToolSweep` to avoid a static import
+ * cycle: `budget.ts` ↔ `agent.ts`. The agent module owns
+ * `wakeSleepingTool` / `armWakeTimer`, both of which themselves
+ * already pull from `budget.ts` indirectly through `runUserTurn`.
+ * Dynamic import lets the modules load in either order.
+ */
+async function runSleepingToolSweep(): Promise<void> {
+  try {
+    const { wakeSleepingToolSweep } = await import('./agent');
+    await wakeSleepingToolSweep();
+  } catch (e) {
+    log.error('[budget] sleeping-tool sweep error', e);
+  }
 }
 
 export function stopGovernor() {

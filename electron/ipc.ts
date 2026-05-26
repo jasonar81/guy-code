@@ -14,6 +14,8 @@ import {
   setSessionArchived,
   setSessionState,
   setSessionPending,
+  setSessionWakeAt,
+  setSessionDraft,
   getSessionPending,
   setSessionApiKey,
   deleteSession,
@@ -80,6 +82,67 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
   );
 
   ipcMain.handle('sessions:archive', (_e, id: string, archived: boolean) => {
+    // When archiving: forcibly stop any in-flight or scheduled activity on
+    // this session so it can't continue spending tokens / hitting tools /
+    // waking from sleeping-budget. The archived flag is treated as
+    // "deactivated" — the session is hidden AND inert until unarchived.
+    //
+    // Order matters:
+    //   1. Cancel any active turn FIRST so the AbortController fires
+    //      while the JSONL/state writes from the in-flight loop are
+    //      still considered "live". cancelRun is a no-op if nothing
+    //      is running, so this is safe for the common case where the
+    //      user archives an idle session.
+    //   2. Clear pending_user_text and sleeping_since BEFORE flipping
+    //      the archived flag — protects against a race where the
+    //      resume sweep fires between the archive write and our
+    //      idle-state write below.
+    //   3. Force state → idle if the session was in any active state.
+    //      `error` is preserved (post-mortem visibility), `idle` is
+    //      already correct.
+    //   4. Finally flip the archived flag.
+    // When unarchiving: just flip the flag. The session is now visible
+    // and runnable again, but stays in `idle` — the user must explicitly
+    // send a message to continue. We do NOT auto-resume any prior
+    // pending text, both because that text was cleared at archive time
+    // and because surprising users with a delayed auto-fire would be
+    // worse UX than making them re-send.
+    if (archived) {
+      try {
+        // cancelRun also tears down any sleeping-tool wake timer +
+        // idles the row if it was in sleeping-tool — so the archived
+        // session can't auto-wake from a still-armed timer.
+        cancelRun(id);
+      } catch (e) {
+        log.warn(`[ipc] cancelRun while archiving ${id} failed`, e);
+      }
+      try {
+        setSessionPending(id, null, null);
+      } catch (e) {
+        log.warn(`[ipc] clear-pending while archiving ${id} failed`, e);
+      }
+      try {
+        // Clear any persistent wake marker — the timer was already
+        // cleared above by cancelRun, but the DB column is the
+        // durable source of truth for the post-restart sweep.
+        setSessionWakeAt(id, null);
+      } catch (e) {
+        log.warn(`[ipc] clear-wake while archiving ${id} failed`, e);
+      }
+      // Find the current state and idle it unless it's terminal.
+      // cancelRun already idled sleeping-tool sessions; we still do
+      // this defensively for any other non-terminal state
+      // (running, waiting-on-system, waiting-on-user, sleeping-budget).
+      const row = listSessionsAll().find((s) => s.id === id);
+      const st = row?.state ?? 'idle';
+      if (st !== 'idle' && st !== 'error') {
+        try {
+          setSessionState(id, 'idle');
+        } catch (e) {
+          log.warn(`[ipc] state→idle while archiving ${id} failed`, e);
+        }
+      }
+    }
     setSessionArchived(id, archived);
     return listSessionsAll();
   });
@@ -128,6 +191,36 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     setSessionState(id, state);
     return listSessionsAll();
   });
+
+  // Persist (or clear) per-session draft text.
+  //
+  // Called by the Composer's debounced-write effect on the renderer
+  // side: every keystroke updates local React state for instant UI
+  // response, and a 500-ms-idle debounce calls this handler to
+  // commit the latest draft to SQLite. Submit-success calls it with
+  // null/'' to clear the row.
+  //
+  // Performance note: even at heavy typing speeds (~10 chars/sec),
+  // the debounce coalesces to ~2 calls/sec MAX (one settle per
+  // typing burst). Each call is a single keyed UPDATE — well below
+  // the rate where SQLite contention or IPC marshaling would matter.
+  // We deliberately do NOT return the refreshed sessions array
+  // here: a draft write is hot-path and the renderer doesn't need
+  // a sidebar refresh — the draft never appears outside its own
+  // composer. Saves a full scan-and-marshal on every settle.
+  //
+  // Empty/whitespace-only drafts normalize to NULL so the row goes
+  // back to "no draft" (matters for the post-restart hydration —
+  // we don't want to restore a textarea to a single accidental
+  // space).
+  ipcMain.handle(
+    'sessions:setDraft',
+    (_e, id: string, draft: string | null) => {
+      const normalized =
+        draft && draft.trim().length > 0 ? draft : null;
+      setSessionDraft(id, normalized);
+    }
+  );
 
   // Bind a session to a specific API key (or pass null to clear the
   // binding so it inherits the current default at agent-run time).

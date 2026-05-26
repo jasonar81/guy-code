@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import type Anthropic from '@anthropic-ai/sdk';
 import log from 'electron-log';
-import { setSessionState } from './db';
+import { setSessionState, setSessionWakeAt } from './db';
 import {
   listClaudeSkills,
   recallFromBundle,
@@ -83,6 +83,14 @@ export type ToolResultTextBlock = { type: 'text'; text: string };
 export interface StructuredToolResult {
   modelContent: Array<ToolResultTextBlock | ToolResultImageBlock>;
   uiSummary: string;
+  /**
+   * Persistent-sleep signal. Forwarded to `ExecutedToolResult.sleepUntil`
+   * by `executeTool` and consumed by the agent loop. See the
+   * `sleepUntil` doc on `ExecutedToolResult` for the full lifecycle.
+   * Optional so the existing structured-result callers (today only
+   * `BrowserScreenshot`) don't have to set it.
+   */
+  sleepUntil?: number;
 }
 
 export interface ToolDef {
@@ -925,7 +933,7 @@ const WAIT_FOR_TIME: ToolDef = {
   schema: {
     name: 'WaitForTime',
     description:
-      'Pause the turn for a fixed duration in milliseconds (max 1 hour). Use sparingly — prefer WaitForFile/Process/Http when possible. Session shows waiting-on-system.',
+      'Pause the turn for a fixed duration in milliseconds (max 1 hour). Use sparingly — prefer WaitForFile/Process/Http when possible. Session shows sleeping-tool and survives app restart: the agent loop exits cleanly while sleeping and is resumed automatically when the wake time arrives (in-process timer if the app stayed alive, governor sweep if it was restarted).',
     input_schema: {
       type: 'object',
       properties: { duration_ms: { type: 'integer' } },
@@ -933,15 +941,62 @@ const WAIT_FOR_TIME: ToolDef = {
     },
   },
   async execute(input, ctx) {
+    // Persistent-sleep path. Instead of holding a setTimeout in this
+    // process for `ms`, we:
+    //   1. Write `sleeping-tool` state + `wake_at_ts = now + ms` to the
+    //      DB so the row knows when to wake even if the app dies.
+    //   2. Return a tool_result IMMEDIATELY (the call returns now, in
+    //      microseconds) carrying a `sleepUntil` signal on the
+    //      structured result.
+    //   3. The agent loop detects `sleepUntil` and exits cleanly —
+    //      it writes the tool_result to JSONL like normal, sets
+    //      state=sleeping-tool, and stops sending API calls.
+    //   4. Wake fires via either the in-process `wakeSleepingToolSweep`
+    //      timer (snappy in-app wake) or the governor's sweep
+    //      (handles restart-while-sleeping).
+    //
+    // The model-facing tool_result string still says "slept ${ms}ms"
+    // so the conversation history reads naturally after the wake;
+    // the model doesn't need to know the wait was implemented
+    // persistently. The wall-clock IS honored — wake won't fire
+    // before `wake_at_ts`.
     const ms = clampWait(input.duration_ms, 1000);
-    return await withWaitingState(ctx, async () => {
-      try {
-        await sleep(ms, ctx.signal);
-        return `WaitForTime: slept ${ms}ms`;
-      } catch {
-        return `WaitForTime: aborted`;
-      }
-    });
+    const wakeAtTs = Date.now() + ms;
+    try {
+      setSessionWakeAt(ctx.sessionId, wakeAtTs);
+      setSessionState(ctx.sessionId, 'sleeping-tool');
+      broadcastStateChanged(ctx.sessionId, 'sleeping-tool');
+    } catch (e) {
+      log.warn(
+        `[tool:WaitForTime] persistent-sleep setup failed for session ${ctx.sessionId}, falling back to in-process sleep`,
+        e
+      );
+      // Fallback to historical in-process behavior. The wait still
+      // happens; it just doesn't survive restart. Better than
+      // failing the tool call outright.
+      return await withWaitingState(ctx, async () => {
+        try {
+          await sleep(ms, ctx.signal);
+          return `WaitForTime: slept ${ms}ms (non-persistent fallback after DB error)`;
+        } catch {
+          return `WaitForTime: aborted`;
+        }
+      });
+    }
+    const wakeIso = new Date(wakeAtTs).toISOString();
+    log.info(
+      `[tool:WaitForTime] sleeping ${ctx.sessionId} for ${ms}ms (wake at ${wakeIso})`
+    );
+    return {
+      modelContent: [
+        {
+          type: 'text',
+          text: `WaitForTime: slept ${ms}ms (wake at ${wakeIso})`,
+        },
+      ],
+      uiSummary: `WaitForTime: ${ms}ms — sleeping until ${wakeIso}`,
+      sleepUntil: wakeAtTs,
+    };
   },
 };
 
@@ -2223,6 +2278,21 @@ export interface ExecutedToolResult {
   content: string | Array<ToolResultTextBlock | ToolResultImageBlock>;
   uiSummary: string;
   isError: boolean;
+  /**
+   * If present, this tool put the session to sleep until `sleepUntil`
+   * (ms-epoch). The agent loop, upon seeing this on a tool result,
+   * writes the `tool_result` to JSONL like normal so the conversation
+   * history is well-formed, then persists `state=sleeping-tool` +
+   * `wake_at_ts=sleepUntil` and exits the loop cleanly without
+   * sending another API call. The session resumes via either an
+   * in-process timer (snappy when the app stays alive) or the
+   * `wakeSleepingToolSweep` (handles app restart while sleeping).
+   *
+   * Only set by `WaitForTime` today; future tools that need a
+   * wall-clock delay without holding a live process can opt in by
+   * setting this same field.
+   */
+  sleepUntil?: number;
 }
 
 export async function executeTool(
@@ -2264,6 +2334,10 @@ export async function executeTool(
         content: raw.modelContent,
         uiSummary: raw.uiSummary,
         isError: false,
+        // Forward the persistent-sleep signal if the tool set it. The
+        // agent loop inspects this on the ExecutedToolResult side to
+        // decide whether to exit cleanly into `sleeping-tool` state.
+        ...(typeof raw.sleepUntil === 'number' ? { sleepUntil: raw.sleepUntil } : {}),
       };
     }
     // Plain string — keep historical behavior (content === uiSummary).

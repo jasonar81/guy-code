@@ -58,6 +58,7 @@ const _sessionsByState = new Map<
     cwd: string | null;
     jsonl_path: string;
     api_key_id: string | null;
+    archived: number;
   }>
 >();
 const _setSessionStateCalls: Array<{ id: string; state: string }> = [];
@@ -173,6 +174,15 @@ vi.mock('../electron/agentEvents', () => ({
   broadcastStateChanged: vi.fn(),
 }));
 
+// Mock the agent module so resumeSweep tests can detect which sessions
+// the sweep tried to wake without actually invoking the agent loop.
+// `resumeSweep` dynamically imports `./agent` for runUserTurn, so this
+// mock has to land BEFORE the budget module is imported below.
+const _runUserTurnSpy = vi.fn(async () => {});
+vi.mock('../electron/agent', () => ({
+  runUserTurn: _runUserTurnSpy,
+}));
+
 // Imports must come AFTER vi.mock — vitest hoists them at runtime.
 import {
   getDailyBudgetMicros,
@@ -190,6 +200,7 @@ import {
   _resetBypassForTests,
   FORCE_RESUME_GRACE_MS,
   resetBudgetAdjustment,
+  resumeSweep,
 } from '../electron/budget';
 
 // ----- Helpers ----------------------------------------------------------
@@ -252,6 +263,7 @@ beforeEach(() => {
   // previous test set a window and the next test ran with `now`
   // before its expiry, the grace would leak across tests.
   _resetBypassForTests();
+  _runUserTurnSpy.mockClear();
 });
 
 afterEach(() => {
@@ -779,5 +791,72 @@ describe('resetBudgetAdjustment', () => {
     resetBudgetAdjustment('k1', hourTs('2026-05-23T13:30:00'));
     // Spend history is untouched.
     expect(_spendRows).toHaveLength(1);
+  });
+});
+
+// ----- Resume sweep: archived sessions stay paused ----------------------
+
+describe('resumeSweep archived guard', () => {
+  // Regression for the bug where archiving a sleeping-budget session did
+  // not prevent the governor from waking it on the next hour rollover —
+  // archived sessions would resume API spend in the background even
+  // though the user had explicitly removed them from the active set.
+  //
+  // After the fix:
+  //   • New archives are caught at the IPC handler (cleared pending
+  //     text + idle state); they never reach `sleeping-budget` again.
+  //   • Legacy archived rows that are still `sleeping-budget` get
+  //     skipped here by resumeSweep, with no runUserTurn invocation
+  //     and no JSONL append.
+  it('skips archived sleeping-budget sessions; wakes only the non-archived one', async () => {
+    setKey('k1', { dailyUsd: 240, adjustmentUsd: 0 }); // base $10/hr, no carry
+    // Two sleepers on the same key; budget is wide open.
+    _sessionsByState.set('sleeping-budget', [
+      {
+        id: 'sA',
+        project_id: 'p1',
+        pending_user_text: 'wake me',
+        sleeping_since: Date.now() - 60_000,
+        cwd: '/tmp',
+        jsonl_path: '/tmp/sA.jsonl',
+        api_key_id: 'k1',
+        archived: 0,
+      },
+      {
+        id: 'sB',
+        project_id: 'p1',
+        pending_user_text: 'do NOT wake me — I am archived',
+        sleeping_since: Date.now() - 60_000,
+        cwd: '/tmp',
+        jsonl_path: '/tmp/sB.jsonl',
+        api_key_id: 'k1',
+        archived: 1,
+      },
+    ]);
+    await resumeSweep();
+    // The non-archived session woke; the archived one didn't.
+    expect(_runUserTurnSpy).toHaveBeenCalledTimes(1);
+    const calls = _runUserTurnSpy.mock.calls as unknown as Array<
+      [{ sessionId: string }]
+    >;
+    expect(calls[0][0].sessionId).toBe('sA');
+  });
+
+  it('skips an archived session even when only archived sleepers exist', async () => {
+    setKey('k1', { dailyUsd: 240, adjustmentUsd: 0 });
+    _sessionsByState.set('sleeping-budget', [
+      {
+        id: 'sArch',
+        project_id: 'p1',
+        pending_user_text: 'still queued',
+        sleeping_since: Date.now() - 60_000,
+        cwd: '/tmp',
+        jsonl_path: '/tmp/sArch.jsonl',
+        api_key_id: 'k1',
+        archived: 1,
+      },
+    ]);
+    await resumeSweep();
+    expect(_runUserTurnSpy).not.toHaveBeenCalled();
   });
 });

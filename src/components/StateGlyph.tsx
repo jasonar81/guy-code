@@ -8,6 +8,7 @@ const MAP: Record<ProjectState, { glyph: string; color: string; pulse?: boolean;
   error: { glyph: '✗', color: 'text-state-error', title: 'Error' },
   idle: { glyph: '○', color: 'text-state-idle', title: 'Idle' },
   'sleeping-budget': { glyph: '💤', color: 'text-state-sleeping', title: 'Sleeping (budget)' },
+  'sleeping-tool': { glyph: '⏳', color: 'text-state-sleeping', title: 'Sleeping (timer)' },
 };
 
 export function StateGlyph({ state }: { state: ProjectState }) {

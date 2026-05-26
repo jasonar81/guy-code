@@ -40,6 +40,8 @@
  */
 
 import { app, BrowserWindow } from 'electron';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import log from 'electron-log';
 import { autoUpdater } from 'electron-updater';
 import { getSetting } from './db';
@@ -205,6 +207,27 @@ export function initAutoUpdater(getMainWindow: () => BrowserWindow | null) {
     // renderer's banner code can still mount without surfacing
     // confusing errors.
     log.info('[updater] disabled in dev mode (app.isPackaged === false)');
+    setState({ state: 'disabled' });
+    return;
+  }
+
+  // Second guard: `electron-builder --dir` (used for local QA via
+  // `npm run pack`) produces a packaged-looking app — `app.isPackaged`
+  // is `true` and `process.resourcesPath` points at `resources/` —
+  // but it does NOT generate `app-update.yml`. That file is only
+  // emitted by the installer targets (NSIS, dmg, AppImage, deb).
+  // Without it, electron-updater's first check throws ENOENT and
+  // the renderer surfaces a red banner. From the user's perspective
+  // it looks like a real update failure, but it's just an artifact
+  // of testing the unpacked output. The check below detects this
+  // case explicitly and short-circuits the same way dev mode does.
+  // Production NSIS/dmg installs always include the file, so this
+  // branch never fires there.
+  const updateYmlPath = join(process.resourcesPath, 'app-update.yml');
+  if (!existsSync(updateYmlPath)) {
+    log.info(
+      `[updater] disabled: app-update.yml not present at ${updateYmlPath} (likely an electron-builder --dir test build)`
+    );
     setState({ state: 'disabled' });
     return;
   }

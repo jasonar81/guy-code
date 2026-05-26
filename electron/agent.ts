@@ -30,10 +30,14 @@ import {
 import {
   insertAuditEvent,
   insertUsageEvent,
+  isSessionArchived,
   setSessionState,
   setSessionPending,
+  setSessionWakeAt,
   getSessionPending,
   getSessionApiKey,
+  listSessionsAll,
+  listSleepingToolSessions,
   upsertSession,
   getSetting,
 } from './db';
@@ -129,6 +133,19 @@ export type AgentEvent =
 
 const activeRuns = new Map<string, AbortController>();
 
+/**
+ * Per-session wake timers for `sleeping-tool` sessions. Set by
+ * `armWakeTimer` when a tool with `sleepUntil` puts the session to
+ * sleep; cleared on wake / cancel / archive. Map cardinality matches
+ * the live count of sleeping-tool sessions (rare in practice — there's
+ * usually 0 or 1, never hundreds), so we don't optimize storage.
+ *
+ * The timers are `.unref()`'d so they DON'T keep the Electron main
+ * process alive on quit. The DB row's `wake_at_ts` IS durable, so a
+ * shutdown-while-sleeping is handled by the post-restart sweep instead.
+ */
+const wakeTimers = new Map<string, NodeJS.Timeout>();
+
 function safeStringify(v: unknown): string {
   try {
     const s = JSON.stringify(v);
@@ -143,14 +160,44 @@ export function isRunning(sessionId: string): boolean {
 }
 
 /**
- * Cancel an in-flight turn. Aborts the AbortController so the Anthropic
- * stream and any signal-aware tools (SHELL, GREP, WaitFor*) tear down. A
- * watchdog forcibly cleans up `activeRuns` if the run is still mapped
- * after a grace period — defense in depth against any future tool that
- * forgets to honor the signal. Without this, a hung tool wedges the
- * session in "running" forever and no further messages can be sent.
+ * Cancel an in-flight turn OR a sleeping-tool wait. Aborts the
+ * AbortController so the Anthropic stream and any signal-aware tools
+ * (SHELL, GREP, WaitFor*) tear down. A watchdog forcibly cleans up
+ * `activeRuns` if the run is still mapped after a grace period —
+ * defense in depth against any future tool that forgets to honor the
+ * signal. Without this, a hung tool wedges the session in "running"
+ * forever and no further messages can be sent.
+ *
+ * Also cancels the wake timer for sleeping-tool sessions and idles
+ * them — without this branch, a user clicking Stop on a sleeping
+ * session would see nothing happen (the in-flight wait doesn't have
+ * an AbortController to fire).
  */
 export function cancelRun(sessionId: string) {
+  // Tear down any sleep wake timer + idle the row if we're in
+  // sleeping-tool. We do this first so the renderer sees the state
+  // transition immediately even if there was no live stream.
+  const sleepTimer = wakeTimers.get(sessionId);
+  if (sleepTimer) {
+    clearTimeout(sleepTimer);
+    wakeTimers.delete(sessionId);
+    log.info(`[agent] cancelled wake timer for sleeping-tool session ${sessionId}`);
+  }
+  try {
+    const row = listSessionsAll().find((s) => s.id === sessionId);
+    if (row?.state === 'sleeping-tool') {
+      setSessionWakeAt(sessionId, null);
+      setSessionState(sessionId, 'idle');
+      broadcastStateChanged(sessionId, 'idle');
+      broadcastAgentEvent({
+        type: 'turn_done',
+        sessionId,
+        stopReason: 'cancelled-sleep',
+      });
+    }
+  } catch (e) {
+    log.warn('[agent] cancel-sleep cleanup failed', e);
+  }
   const ctrl = activeRuns.get(sessionId);
   if (!ctrl) return;
   ctrl.abort();
@@ -174,6 +221,162 @@ export function cancelRun(sessionId: string) {
       broadcastAgentEvent({ type: 'turn_done', sessionId, stopReason: 'force-aborted' });
     }
   }, 5000).unref();
+}
+
+// ---- Sleeping-tool wake machinery --------------------------------------
+
+/**
+ * Arm an in-process wake timer for a session that just entered
+ * `sleeping-tool` state. Two-pronged wake-up strategy:
+ *
+ *   • This timer is fast and precise — fires the moment `wakeAtTs` is
+ *     reached, while the app is still running.
+ *   • The governor's `wakeSleepingToolSweep` (every 60 s + once at
+ *     startup) is the durable backup — handles the case where the app
+ *     was killed/restarted between sleep and wake, so the timer is
+ *     long gone.
+ *
+ * Both paths converge on `wakeSleepingTool(sessionId)`, which is
+ * idempotent (state check + activeRuns check) so a race between them
+ * is safe.
+ *
+ * Clamped: never fires immediately — even a wake_at_ts already in the
+ * past gets at least a 0 ms scheduling slot, so we don't recurse into
+ * runUserTurn synchronously from inside the agent loop's `finally`.
+ * `.unref()` so the timer doesn't keep the Electron main process from
+ * exiting cleanly on quit.
+ */
+function armWakeTimer(sessionId: string, wakeAtTs: number) {
+  const prev = wakeTimers.get(sessionId);
+  if (prev) {
+    clearTimeout(prev);
+    log.info(`[agent] re-arming wake timer for ${sessionId} (previous was active)`);
+  }
+  const delay = Math.max(0, wakeAtTs - Date.now());
+  const t = setTimeout(() => {
+    wakeTimers.delete(sessionId);
+    wakeSleepingTool(sessionId).catch((e) =>
+      log.error(`[agent] wake timer fired for ${sessionId} but resume failed`, e)
+    );
+  }, delay);
+  t.unref();
+  wakeTimers.set(sessionId, t);
+  log.info(
+    `[agent] armed wake timer for ${sessionId} in ${delay}ms (wake at ${new Date(wakeAtTs).toISOString()})`
+  );
+}
+
+/**
+ * Resume a `sleeping-tool` session. Idempotent: if the session has
+ * been cancelled, archived, woken by a parallel path, or is currently
+ * already running, this returns without doing anything.
+ *
+ * On a successful resume:
+ *   1. Clear `wake_at_ts` so a second wake fires don't re-resume.
+ *   2. Re-enter the agent loop via `runUserTurn` with
+ *      `continueExisting: true` — the JSONL already contains a
+ *      well-formed tool_result for the WaitForTime, so streamMessage
+ *      can be called immediately on the existing history.
+ *
+ * Exported so the budget governor's sweep can call it on app
+ * startup for sleepers whose moment passed while the app was down.
+ */
+export async function wakeSleepingTool(sessionId: string) {
+  const row = listSessionsAll().find((s) => s.id === sessionId);
+  if (!row) {
+    log.info(`[agent] wake skipped: session ${sessionId} not found`);
+    return;
+  }
+  if (row.archived === 1) {
+    log.info(`[agent] wake skipped: session ${sessionId} is archived`);
+    // Also clear the wake marker so a later unarchive doesn't
+    // immediately re-trigger.
+    try {
+      setSessionWakeAt(sessionId, null);
+    } catch {
+      /* non-fatal */
+    }
+    return;
+  }
+  if (row.state !== 'sleeping-tool') {
+    log.info(
+      `[agent] wake skipped: session ${sessionId} state is ${row.state} (not sleeping-tool)`
+    );
+    return;
+  }
+  if (activeRuns.has(sessionId)) {
+    log.info(`[agent] wake skipped: session ${sessionId} already has an active run`);
+    return;
+  }
+  // Clear wake marker BEFORE the resume call so a tight-race
+  // re-trigger doesn't double-resume.
+  setSessionWakeAt(sessionId, null);
+  log.info(`[agent] waking sleeping-tool session ${sessionId}`);
+  await runUserTurn({
+    sessionId,
+    projectId: row.project_id,
+    cwd: row.cwd ?? '',
+    userText: '',
+    continueExisting: true,
+    seedFromJsonl: row.jsonl_path,
+  });
+}
+
+/**
+ * Catch-up sweep for the persistent-sleep state. Called once at app
+ * startup (before the governor's interval timer kicks in) and on every
+ * resumeSweep tick thereafter. Walks all `sleeping-tool` sessions and:
+ *
+ *   • If `wake_at_ts <= now`: wake immediately via `wakeSleepingTool`.
+ *   • Otherwise: re-arm the in-process wake timer (so a session that
+ *     was sleeping when the app died gets back its low-latency wake
+ *     after restart). Idempotent — armWakeTimer clears any previous
+ *     timer for the same session.
+ *
+ * Archived sessions are skipped — the archive IPC handler already
+ * clears their wake marker, but a legacy archived sleeping-tool row
+ * could still exist (cleaned up by `resetArchivedRunningSessions`
+ * during the same startup sequence).
+ */
+export async function wakeSleepingToolSweep() {
+  const sleepers = listSleepingToolSessions();
+  if (sleepers.length === 0) return;
+  const now = Date.now();
+  for (const s of sleepers) {
+    if (s.archived === 1) {
+      log.info(
+        `[agent] sweep: skipping archived sleeping-tool session ${s.id}`
+      );
+      continue;
+    }
+    if (s.wake_at_ts == null) {
+      // Defensive: a session in sleeping-tool with no wake_at_ts is
+      // malformed. Idle it so the user can resume manually.
+      log.warn(
+        `[agent] sweep: session ${s.id} is sleeping-tool but wake_at_ts is null; idling`
+      );
+      try {
+        setSessionState(s.id, 'idle');
+        broadcastStateChanged(s.id, 'idle');
+      } catch {
+        /* non-fatal */
+      }
+      continue;
+    }
+    if (s.wake_at_ts <= now) {
+      // Past wake — fire immediately. Don't await in the loop so a
+      // single slow resume doesn't block other sleepers.
+      wakeSleepingTool(s.id).catch((e) =>
+        log.error(`[agent] sweep wake of ${s.id} failed`, e)
+      );
+    } else {
+      // Future wake — make sure the in-process timer is armed. After
+      // app restart this is the only path that re-creates the
+      // timer; without it, low-latency wake would be lost until the
+      // next 60s sweep tick.
+      armWakeTimer(s.id, s.wake_at_ts);
+    }
+  }
 }
 
 /**
@@ -394,6 +597,18 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     }
   }
   const attachments = normalizeAttachments(args.attachments);
+  // Archived sessions are inert. The `sessions:archive` IPC handler
+  // cancels any in-flight turn and clears pending text on the way in,
+  // but a fire-and-forget runUserTurn that was already scheduled
+  // (e.g., the resume sweep made a decision microseconds before the
+  // archive write landed) could still arrive here. Refuse cleanly —
+  // no state mutation, no JSONL append. The user must unarchive to
+  // continue. We also catch any caller that bypassed the IPC layer
+  // (sub-agent Task delegation, future internal triggers, etc.).
+  if (isSessionArchived(sessionId)) {
+    log.info(`[agent] refusing to run archived session ${sessionId}`);
+    return;
+  }
   if (activeRuns.has(sessionId)) {
     log.warn(`[agent] turn already running for ${sessionId}; ignoring`);
     return;
@@ -1139,6 +1354,11 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // and risks spending tokens on a direction they're trying to redirect.
       const toolResultBlocks: any[] = [];
       let waitedForUser = false;
+      // Set when a tool returns `sleepUntil`. The agent loop exits
+      // cleanly after the current tool's result is recorded, persists
+      // the session as `sleeping-tool` (the tool already did the state
+      // write — this is just an exit signal), and arms the wake timer.
+      let sleepingUntil: number | null = null;
       for (let toolIdx = 0; toolIdx < toolUses.length; toolIdx++) {
         const tu = toolUses[toolIdx];
         // Before each tool run (except the first), check the interrupt queue.
@@ -1265,8 +1485,21 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         }
         // Tool may have flipped state to waiting-on-system mid-execution
         // (e.g. WaitFor*); reset to running for the next iteration.
-        setSessionState(sessionId, 'running');
-        broadcastStateChanged(sessionId, 'running');
+        //
+        // EXCEPTION: a tool with `sleepUntil` is a persistent-sleep tool
+        // (today only WaitForTime). It already set state=sleeping-tool
+        // and wake_at_ts; flipping back to `running` would (a) clobber
+        // the sleeping-tool state the sidebar needs to surface and (b)
+        // un-pause a session the user explicitly told to wait. Leave
+        // the tool's state write in place.
+        if (raw.sleepUntil) {
+          log.info(
+            `[agent] session ${sessionId} entering sleeping-tool (wake at ${new Date(raw.sleepUntil).toISOString()})`
+          );
+        } else {
+          setSessionState(sessionId, 'running');
+          broadcastStateChanged(sessionId, 'running');
+        }
         onEv({
           type: 'tool_result',
           sessionId,
@@ -1282,6 +1515,41 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         };
         if (isError) block.is_error = true;
         toolResultBlocks.push(block);
+
+        // Persistent-sleep handoff. The tool already wrote state +
+        // wake_at_ts; we just need to synthesize skip results for any
+        // tools later in the same batch (the model shouldn't expect
+        // them to have executed) and break out of the for-loop. The
+        // outer while-loop detects `sleepingUntil` after writing the
+        // user message to JSONL and exits the turn cleanly.
+        if (raw.sleepUntil) {
+          sleepingUntil = raw.sleepUntil;
+          for (let j = toolIdx + 1; j < toolUses.length; j++) {
+            const skip = toolUses[j];
+            // WaitForUser after a sleeping tool is nonsensical, but
+            // if the model emitted one we still need a well-formed
+            // tool_result so the next API call doesn't 400.
+            toolResultBlocks.push({
+              type: 'tool_result',
+              tool_use_id: skip.id,
+              content: '(skipped — session is sleeping; will resume at wake time)',
+            });
+            onEv({
+              type: 'tool_result',
+              sessionId,
+              id: skip.id,
+              content: '(skipped — session sleeping)',
+              isError: false,
+              ms: 0,
+            });
+          }
+          if (toolUses.length - (toolIdx + 1) > 0) {
+            log.info(
+              `[agent] sleeping-tool: skipped ${toolUses.length - (toolIdx + 1)} subsequent tool(s) in the batch for ${sessionId}`
+            );
+          }
+          break;
+        }
       }
 
       // ---- Mid-turn interruption pickup ----------------------------------
@@ -1329,6 +1597,20 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
 
       if (waitedForUser) {
         onEv({ type: 'turn_done', sessionId, stopReason: 'wait_for_user' });
+        break;
+      }
+      if (sleepingUntil != null) {
+        // The persistent-sleep tool (WaitForTime) ran in this batch.
+        // The user message carrying its tool_result (and any skip
+        // results for subsequent tools) has just been written to
+        // JSONL above, so the conversation history is well-formed
+        // for the future wake. Arm an in-process wake timer (so the
+        // resume is snappy if the app stays alive) and exit the
+        // turn cleanly — DON'T loop back to streamMessage. The
+        // governor's sweep is the durable backup if the timer is
+        // lost to a restart before wake.
+        armWakeTimer(sessionId, sleepingUntil);
+        onEv({ type: 'turn_done', sessionId, stopReason: 'sleeping-tool' });
         break;
       }
       // Continue loop — next iteration sends the assistant follow-up
