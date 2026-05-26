@@ -63,6 +63,7 @@ import {
   queueInterrupt,
   removeInterrupt,
 } from './agent';
+import { deleteSessionAttachments } from './attachments';
 
 export function registerIpc(getMainWindow: () => BrowserWindow | null) {
   // ---- App metadata ----
@@ -192,6 +193,18 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
           `[ipc] deleteFromDisk failed to unlink ${p}: ${(e as Error).message}`
         );
       }
+    }
+    // Best-effort: also wipe any disk-backed attachments saved under
+    // ~/.guycode/attachments/<sessionId>/. The session can't reference
+    // them anymore once the JSONL is gone, and they'd otherwise leak
+    // disk space indefinitely. Failures are logged but don't block
+    // the deletion (the row removal is what the user will check for).
+    try {
+      deleteSessionAttachments(id);
+    } catch (e) {
+      log.warn(
+        `[ipc] deleteFromDisk: attachments cleanup failed: ${(e as Error).message}`
+      );
     }
     // Finally drop the DB row (and dependent rows). This is what makes
     // it disappear from the sidebar.

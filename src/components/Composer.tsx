@@ -21,11 +21,44 @@ interface Props {
 
 // Per-attachment caps. Anthropic accepts images up to 5 MB base64 (~3.7 MB
 // raw) and PDFs up to 32 MB; we're a touch stricter on images so the JSONL
-// doesn't balloon. Plain-text files inline directly into the prompt.
+// doesn't balloon.
 const MAX_IMAGE_BYTES = 4_500_000;
 const MAX_PDF_BYTES = 24_000_000;
-const MAX_TEXT_BYTES = 200_000;
-const MAX_TOTAL_BYTES = 30_000_000;
+
+// ---- Text-file routing thresholds (v0.1.6+) -----------------------
+//
+// We have TWO modes for plain-text attachments:
+//
+//   1. Inline (≤ INLINE_TEXT_THRESHOLD):
+//      The full text gets embedded directly into the user message
+//      content as a labeled text block ("--- Attached: foo.md ---
+//      <text> --- end foo.md ---"). Cheap and instant — model sees
+//      everything immediately. Costs prompt tokens proportional to
+//      file size, so we cap at ~200 KB so a typical drag-drop doesn't
+//      blow up the turn cost.
+//
+//   2. Disk-backed (between threshold and MAX_TEXT_FILE_BYTES):
+//      Renderer ships the bytes to main, which writes them under
+//      `~/.guycode/attachments/<sessionId>/<sanitized-name>` and
+//      emits a SHORT reference block in the user message — file
+//      name, exact byte count, absolute path, instructions to use
+//      `Read`, plus a 500-char preview. The model accesses the
+//      content on demand via the existing `Read` tool. Token cost
+//      per turn is bounded by the reference block (~600 chars)
+//      regardless of file size.
+//
+// Hard ceiling at 50 MB so a stray 10 GB log file doesn't kill IPC
+// or fill the disk. Beyond that the user should grep / slice first.
+//
+// Why these specific numbers:
+//   - 200 KB inline matches the previous `MAX_TEXT_BYTES`; existing
+//     attachments below that get the same behavior they always did.
+//   - 50 MB is enough headroom for any reasonable log / dataset
+//     someone would attach to a chat without bringing IPC + JSONL
+//     bookkeeping to its knees.
+const INLINE_TEXT_THRESHOLD = 200_000;
+const MAX_TEXT_FILE_BYTES = 50_000_000;
+const MAX_TOTAL_BYTES = 60_000_000;
 
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'log', 'xml',
@@ -94,11 +127,37 @@ async function fileToAttachment(file: File): Promise<Attachment | { error: strin
 
   // Plain-text branch (md, code, csv, json, …)
   if (TEXT_EXTENSIONS.has(ext) || mime.startsWith('text/')) {
-    if (sizeBytes > MAX_TEXT_BYTES) {
-      return { error: `${file.name} is ${(sizeBytes / 1024).toFixed(0)} KB; text files inlined into the prompt must be ≤ ${(MAX_TEXT_BYTES / 1024).toFixed(0)} KB.` };
+    // Hard ceiling first. Anything bigger than this is rejected with
+    // a message that points the user toward the workaround (slice /
+    // grep before attaching). Disk-backed mode could in principle go
+    // higher, but at 50+ MB the file is almost certainly something
+    // the user wants to extract from rather than chat about; we keep
+    // the cap firm so an accidental drag of a giant log doesn't
+    // silently consume disk + IPC budget.
+    if (sizeBytes > MAX_TEXT_FILE_BYTES) {
+      const mb = (sizeBytes / 1_048_576).toFixed(1);
+      const capMb = (MAX_TEXT_FILE_BYTES / 1_048_576).toFixed(0);
+      return {
+        error:
+          `${file.name} is ${mb} MB; max attachment size is ${capMb} MB. ` +
+          `Consider grepping or slicing the file before attaching, ` +
+          `or split it into smaller chunks.`,
+      };
     }
+    // Read the bytes once. We use this for either the inline path
+    // (text goes into the prompt directly) or the disk-backed path
+    // (main process writes it to ~/.guycode/attachments/<sessionId>/
+    // and emits a reference block). Same wire shape either way; the
+    // `kind` discriminator tells the agent loop how to handle it.
     const text = await file.text();
-    return { kind: 'text', name: file.name, text, sizeBytes };
+    if (sizeBytes <= INLINE_TEXT_THRESHOLD) {
+      return { kind: 'text', name: file.name, text, sizeBytes };
+    }
+    // Disk-backed (>200KB and ≤50MB). The chip in the UI continues
+    // to render the same so the user sees no difference; the only
+    // change is what the model sees in the prompt (path reference
+    // + preview instead of the full text).
+    return { kind: 'text-file', name: file.name, text, sizeBytes };
   }
 
   return {
@@ -821,13 +880,25 @@ function AttachmentPill({
       </div>
     );
   }
+  // Sub-label for the chip:
+  //   - 'PDF'  → kind: 'pdf'
+  //   - 'file' → kind: 'text-file' (disk-backed; model will Read on demand)
+  //   - 'text' → kind: 'text' (inlined directly into the prompt)
+  // The user-visible distinction is intentionally subtle — both work
+  // identically from the user's perspective. The 'file' label is a
+  // small affordance for power users who want to know what's
+  // happening behind the scenes (inline vs disk-backed).
+  const subLabel =
+    a.kind === 'pdf' ? 'PDF' : a.kind === 'text-file' ? 'file' : 'text';
   return (
     <div className="relative inline-flex items-center gap-1.5 rounded-md border border-border bg-bg-elevated px-2 py-1.5 pr-7 text-[11px] text-text-muted">
       <FileText size={14} className={a.kind === 'pdf' ? 'text-state-attention' : 'text-text-dim'} />
       <div className="flex flex-col gap-0 min-w-0 max-w-[180px]">
-        <span className="truncate text-text">{a.name}</span>
+        <span className="truncate text-text" title={a.kind === 'text-file'
+          ? `${a.name} (${sizeLabel}) — saved to disk; the model will Read it on demand`
+          : a.name}>{a.name}</span>
         <span className="text-text-dim font-mono text-[10px]">
-          {a.kind === 'pdf' ? 'PDF' : 'text'} · {sizeLabel}
+          {subLabel} · {sizeLabel}
         </span>
       </div>
       <button

@@ -49,6 +49,10 @@ import {
   looksLikeContextBail,
   buildContextBailNudge,
 } from './contextBailGuard';
+import {
+  saveTextAttachment,
+  buildAttachmentPreview,
+} from './attachments';
 import { maybeSummarize } from './toolSummarizer';
 import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
 import { renderActivePlanBlock } from './planManager';
@@ -450,7 +454,16 @@ type IncomingAttachment =
       dataBase64: string;
     }
   | { kind: 'pdf'; name?: string; dataBase64: string }
-  | { kind: 'text'; name?: string; text: string };
+  | { kind: 'text'; name?: string; text: string }
+  /**
+   * Disk-backed text attachment. Renderer ships the full content
+   * here; main writes it under `~/.guycode/attachments/<sessionId>/`
+   * (via `saveTextAttachment`) and emits a reference content block
+   * pointing the model at the absolute path. See `electron/attachments.ts`
+   * for the storage layout and `buildUserContent` below for the
+   * reference-block format.
+   */
+  | { kind: 'text-file'; name?: string; text: string };
 
 interface RunArgs {
   sessionId: string;
@@ -515,6 +528,16 @@ function normalizeAttachments(raw: unknown[] | undefined): IncomingAttachment[] 
         name: typeof r.name === 'string' ? r.name : undefined,
         text: r.text,
       });
+    } else if (r.kind === 'text-file' && typeof r.text === 'string') {
+      // Disk-backed text. Same wire shape as `text` (full content
+      // crosses IPC) but flagged so `buildUserContent` writes it to
+      // a per-session attachment dir and emits a path-reference
+      // block instead of inlining the full content.
+      out.push({
+        kind: 'text-file',
+        name: typeof r.name === 'string' ? r.name : undefined,
+        text: r.text,
+      });
     }
   }
   return out;
@@ -530,7 +553,11 @@ function normalizeAttachments(raw: unknown[] | undefined): IncomingAttachment[] 
  * doesn't yet include the `document` (PDF) variant, even though the runtime
  * API accepts it. We cast at the streamMessage boundary.
  */
-function buildUserContent(text: string, attachments: IncomingAttachment[]): unknown {
+function buildUserContent(
+  text: string,
+  attachments: IncomingAttachment[],
+  sessionId: string
+): unknown {
   // No attachments → keep the simple string form for back-compat (matches
   // what the JSONL has historically stored for plain user turns).
   if (attachments.length === 0) return text;
@@ -554,6 +581,45 @@ function buildUserContent(text: string, attachments: IncomingAttachment[]): unkn
       blocks.push({
         type: 'text',
         text: `\n\n--- Attached: ${a.name ?? 'file'} ---\n${a.text}\n--- end ${a.name ?? 'file'} ---`,
+      });
+    } else if (a.kind === 'text-file') {
+      // ---- Disk-backed text attachment (v0.1.6+) -----------------
+      //
+      // The renderer routed this here because the file exceeded the
+      // inline threshold (~200KB). We:
+      //   1. Write the full content to `<userData>/.guycode/attachments/
+      //      <sessionId>/<sanitized-name>` via `saveTextAttachment`.
+      //   2. Emit a small reference text block in place of the
+      //      content. The model sees: file name, exact byte count,
+      //      absolute path, an instruction to use `Read`, and a
+      //      ~500-char preview.
+      //
+      // This keeps the prompt token cost bounded by the reference
+      // block size (~600 chars) regardless of how big the file is,
+      // while leaving the model fully able to access any portion
+      // via `Read(path, offset, limit)`. The file persists for the
+      // life of the session and is deleted alongside the JSONL when
+      // the user removes the session.
+      //
+      // Failure handling: writeFileSync throws synchronously on
+      // disk errors (out-of-space, permission). We let it propagate
+      // so the agent loop's outer try/catch surfaces it as a turn
+      // error rather than silently sending a path that can't be
+      // Read.
+      const rawName = a.name ?? 'attachment.txt';
+      const saved = saveTextAttachment(sessionId, rawName, a.text);
+      const sizeKb = Math.max(1, Math.round(saved.sizeBytes / 1024));
+      const preview = buildAttachmentPreview(a.text, 500);
+      blocks.push({
+        type: 'text',
+        text:
+          `\n\n--- Attached file (too large to inline): ${rawName} ---\n` +
+          `Saved at: ${saved.absPath}\n` +
+          `Size: ${sizeKb} KB\n` +
+          `Use the Read tool with the absolute path above to access the contents. ` +
+          `For very large files, pass offset/limit to read in chunks.\n` +
+          `\nPreview (first ~500 chars):\n${preview}\n` +
+          `--- end ${rawName} ---`,
       });
     }
   }
@@ -740,7 +806,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // top of the existing history — same semantics as a fresh send while
     // the session was running.
     if (!args.continueExisting || effectiveText.trim() || attachments.length > 0) {
-      const userContent = buildUserContent(effectiveText, attachments);
+      const userContent = buildUserContent(effectiveText, attachments, sessionId);
       const userMsg = {
         role: 'user' as const,
         content: userContent,

@@ -156,6 +156,28 @@ export type Attachment =
       name: string;
       text: string;
       sizeBytes: number;
+    }
+  /**
+   * Disk-backed text attachment for files too large to inline directly
+   * into the prompt (>200KB by default; see `INLINE_TEXT_THRESHOLD` in
+   * `Composer.tsx`). The renderer hands the full text to the main
+   * process, which writes it under
+   * `~/.guycode/attachments/<sessionId>/<name>` and emits a reference
+   * content block that points the model at the absolute path. The
+   * model accesses the contents via the existing `Read` tool, so any
+   * file size up to `MAX_TEXT_FILE_BYTES` (50MB) works without
+   * burning prompt tokens proportional to size.
+   *
+   * `text` carries the full content over IPC — main writes it; the
+   * renderer keeps it in state so the chip preview / future re-sends
+   * still work. We never persist this kind into the JSONL with the
+   * full text inline (the JSONL stores the reference block only).
+   */
+  | {
+      kind: 'text-file';
+      name: string;
+      text: string;
+      sizeBytes: number;
     };
 
 export interface ChatMessage {
