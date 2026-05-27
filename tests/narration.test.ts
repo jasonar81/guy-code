@@ -17,8 +17,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   classifyAssistantText,
+  groupChunks,
   isInternalNarration,
   splitIntoChunks,
+  type ClassifiedChunk,
 } from '../src/lib/narration';
 
 // ----- splitIntoChunks --------------------------------------------------
@@ -256,5 +258,122 @@ describe('classifyAssistantText', () => {
     const text = 'State is fully captured in memory at session_X (8.4KB).';
     const chunks = classifyAssistantText(text);
     expect(chunks).toEqual([{ text, muted: true }]);
+  });
+});
+
+// ----- groupChunks (v0.1.7 twisty grouping) -----------------------------
+
+describe('groupChunks', () => {
+  // Small helper to make the test fixtures readable.
+  const m = (text: string): ClassifiedChunk => ({ text, muted: true });
+  const n = (text: string): ClassifiedChunk => ({ text, muted: false });
+
+  it('empty input returns empty array', () => {
+    expect(groupChunks([])).toEqual([]);
+  });
+
+  it('single muted chunk returns one muted group of size 1', () => {
+    const r = groupChunks([m('memory saved')]);
+    expect(r).toHaveLength(1);
+    expect(r[0]).toEqual({
+      kind: 'muted',
+      chunks: [m('memory saved')],
+      firstIndex: 0,
+      lastIndex: 0,
+    });
+  });
+
+  it('single normal chunk returns one normal group of size 1', () => {
+    const r = groupChunks([n('here is the answer')]);
+    expect(r).toHaveLength(1);
+    expect(r[0].kind).toBe('normal');
+    expect(r[0].chunks).toEqual([n('here is the answer')]);
+  });
+
+  it('all-muted run collapses into ONE group', () => {
+    // This is the common case: model emits 3 narration paragraphs
+    // back-to-back; UI shows them under a single twisty.
+    const r = groupChunks([m('a'), m('b'), m('c')]);
+    expect(r).toHaveLength(1);
+    expect(r[0].kind).toBe('muted');
+    expect(r[0].chunks.map((c) => c.text)).toEqual(['a', 'b', 'c']);
+    expect(r[0].firstIndex).toBe(0);
+    expect(r[0].lastIndex).toBe(2);
+  });
+
+  it('all-normal run collapses into ONE group', () => {
+    const r = groupChunks([n('para1'), n('para2'), n('para3')]);
+    expect(r).toHaveLength(1);
+    expect(r[0].kind).toBe('normal');
+    expect(r[0].chunks).toHaveLength(3);
+  });
+
+  it('alternating muted/normal/muted produces three groups in order', () => {
+    const r = groupChunks([m('mem'), n('answer'), m('also memory')]);
+    expect(r).toHaveLength(3);
+    expect(r[0].kind).toBe('muted');
+    expect(r[1].kind).toBe('normal');
+    expect(r[2].kind).toBe('muted');
+    expect(r.map((g) => g.firstIndex)).toEqual([0, 1, 2]);
+    expect(r.map((g) => g.lastIndex)).toEqual([0, 1, 2]);
+  });
+
+  it('the canonical [muted, muted, normal, muted] example', () => {
+    // The example from the JSDoc — make sure docs match behavior.
+    const r = groupChunks([m('a'), m('b'), n('c'), m('d')]);
+    expect(r).toHaveLength(3);
+    expect(r[0]).toMatchObject({ kind: 'muted', firstIndex: 0, lastIndex: 1 });
+    expect(r[0].chunks).toHaveLength(2);
+    expect(r[1]).toMatchObject({ kind: 'normal', firstIndex: 2, lastIndex: 2 });
+    expect(r[1].chunks).toHaveLength(1);
+    expect(r[2]).toMatchObject({ kind: 'muted', firstIndex: 3, lastIndex: 3 });
+    expect(r[2].chunks).toHaveLength(1);
+  });
+
+  it('preserves chunk content byte-for-byte', () => {
+    const a = m('paragraph A with **markdown**');
+    const b = n('paragraph B with `code`');
+    const r = groupChunks([a, b]);
+    expect(r[0].chunks[0]).toBe(a);
+    expect(r[1].chunks[0]).toBe(b);
+  });
+
+  it('firstIndex + lastIndex span the original positions correctly', () => {
+    // 5 chunks: 2 muted, 1 normal, 2 muted. lastIndex of the last
+    // group must be 4 — used by the renderer to detect "this group
+    // owns the streaming-tail chunk".
+    const r = groupChunks([m('a'), m('b'), n('c'), m('d'), m('e')]);
+    expect(r).toHaveLength(3);
+    expect(r[0].firstIndex).toBe(0);
+    expect(r[0].lastIndex).toBe(1);
+    expect(r[1].firstIndex).toBe(2);
+    expect(r[1].lastIndex).toBe(2);
+    expect(r[2].firstIndex).toBe(3);
+    expect(r[2].lastIndex).toBe(4);
+  });
+
+  it('end-to-end: classify + group on a realistic transcript', () => {
+    // The combined pipeline. This is what MessageList.tsx actually
+    // calls, so the integration must hold.
+    const text = [
+      'Memory is comprehensively saved to memory at session-X (8.2KB).',
+      '',
+      'Here is the actual answer to your question: the function returns 42.',
+      '',
+      'I just verified all the bookkeeping is in order.',
+      '',
+      '```js',
+      'console.log(42);',
+      '```',
+    ].join('\n');
+    const chunks = classifyAssistantText(text);
+    const groups = groupChunks(chunks);
+    // Expect at least 3 groups (muted, normal, muted, normal-code).
+    // The code block is treated as substantive (never muted).
+    expect(groups.length).toBeGreaterThanOrEqual(3);
+    // First group is muted ("Memory is comprehensively saved...").
+    expect(groups[0].kind).toBe('muted');
+    // Last group should be normal (the code block).
+    expect(groups[groups.length - 1].kind).toBe('normal');
   });
 });

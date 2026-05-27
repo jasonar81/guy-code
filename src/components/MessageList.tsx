@@ -7,7 +7,8 @@ import { RichText } from './RichText';
 import { LinkifyText } from './LinkifyText';
 import { absoluteTime } from '@/lib/format';
 import { decideScrollWatchdog } from '@/lib/scrollWatchdog';
-import { classifyAssistantText } from '@/lib/narration';
+import { classifyAssistantText, groupChunks, type ChunkGroup } from '@/lib/narration';
+import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ChatMessage, ContentBlock } from '@/types';
 
 interface Props {
@@ -86,6 +87,108 @@ type VirtItem =
   | { kind: 'message'; key: string; message: ChatMessage; isStreamingTail: boolean }
   | { kind: 'queued'; key: string; localId: string; text: string }
   | { kind: 'budget-queued'; key: string; text: string; sleepingSince: number | null };
+
+/**
+ * Collapsible disclosure for a run of internal-narration paragraphs.
+ *
+ * v0.1.7 update: the user wanted the muted/dimmer/italic narration
+ * paragraphs (memory bookkeeping, "I'll keep going" reassurance,
+ * compaction worries, etc.) HIDDEN behind a twisty instead of just
+ * de-emphasized. The classifier work in `lib/narration.ts` is
+ * unchanged; this component is the new visual presentation.
+ *
+ * State model:
+ *   • Each group renders collapsed by default.
+ *   • `forceExpanded=true` (set by the parent when the streaming
+ *     cursor lives inside this group) overrides the default so the
+ *     user can watch text arrive live instead of just "▶ 1 internal
+ *     note".
+ *   • Once the user manually clicks the toggle, their explicit
+ *     choice sticks for the lifetime of this component instance
+ *     (key-stable across re-renders of the same group).
+ *
+ * Implemented with React state rather than a native `<details>`
+ * because we need the auto-expand-on-streaming behavior, which the
+ * `<details>` element doesn't give us out of the box.
+ */
+function NarrationGroup({
+  group,
+  isStreamingTail,
+  isLastBlock,
+  totalChunksInBlock,
+}: {
+  group: ChunkGroup;
+  /** True when the parent message is the streaming tail. */
+  isStreamingTail: boolean;
+  /** True when this group's parent text block is the LAST block of the message. */
+  isLastBlock: boolean;
+  /** Total number of chunks in the parent block (used to detect "this group owns the last chunk"). */
+  totalChunksInBlock: number;
+}) {
+  // Auto-expand when the streaming cursor sits on the LAST chunk of
+  // the LAST block AND that chunk falls inside this group. Without
+  // this, a muted final paragraph would stream into a collapsed
+  // twisty showing only "▶ 1 internal note" — the user would lose
+  // the streaming-progress signal entirely.
+  const containsStreamingTail =
+    isStreamingTail && isLastBlock && group.lastIndex === totalChunksInBlock - 1;
+
+  // Three-valued: null = user has not touched the twisty, defer to
+  // `forceExpanded`. Once they click, their value sticks.
+  const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const expanded = userToggled !== null ? userToggled : containsStreamingTail;
+
+  const count = group.chunks.length;
+  const summaryLabel = `${count} internal note${count === 1 ? '' : 's'}`;
+
+  return (
+    <div className="space-y-1">
+      <button
+        type="button"
+        onClick={() => setUserToggled(!expanded)}
+        className={clsx(
+          'inline-flex items-center gap-1 rounded px-1 -mx-1 py-0.5',
+          'text-[10px] text-text-dim italic opacity-80 hover:opacity-100 hover:bg-bg-hover',
+          'transition-opacity select-none'
+        )}
+        title={
+          expanded
+            ? 'Hide internal notes (memory / status / compaction self-talk)'
+            : 'Show internal notes (memory / status / compaction self-talk)'
+        }
+        aria-expanded={expanded}
+      >
+        {expanded ? (
+          <ChevronDown size={10} className="shrink-0" />
+        ) : (
+          <ChevronRight size={10} className="shrink-0" />
+        )}
+        <span>{summaryLabel}</span>
+      </button>
+      {expanded && (
+        <div className="space-y-1.5 border-l border-border/60 pl-2 ml-1">
+          {group.chunks.map((c, ci) => {
+            const isLastChunkInGroup = ci === group.chunks.length - 1;
+            const showCursor = containsStreamingTail && isLastChunkInGroup;
+            return (
+              <div
+                key={ci}
+                title="Filtered as internal-state narration (memory / compaction / status pings). The text is still here — just visually de-emphasized."
+                className={clsx(
+                  'text-[11px] text-text-dim italic opacity-80 break-words',
+                  showCursor &&
+                    'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
+                )}
+              >
+                <RichText text={c.text} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function MessageList({ sessionId, visible }: Props) {
   const chat = useApp((s) => s.chats[sessionId]);
@@ -886,49 +989,52 @@ function MessageBlockImpl({
               </div>
             );
           }
+          // v0.1.7: group consecutive muted chunks into runs so they
+          // can collapse behind a single twisty (one disclosure per
+          // run, not one per paragraph). Normal chunks render inline
+          // as before. The streaming cursor still sits on the final
+          // chunk of the final block — that's now either a normal
+          // chunk (rendered directly) or a muted chunk inside a
+          // NarrationGroup which auto-expands while streaming.
+          const groups = groupChunks(chunks);
           return (
             <div key={i} className="space-y-1.5">
-              {chunks.map((c, ci) => {
-                const isLastChunk = ci === chunks.length - 1;
-                // The streaming cursor must sit on the FINAL chunk of
-                // the FINAL block so it tracks the model's typing.
-                const showCursor =
-                  isStreamingTail && isLast && isLastChunk;
-                if (c.muted) {
-                  // Muted classes:
-                  //   - text-[11px]: noticeably smaller than the 13px
-                  //     baseline, signals "secondary" without being
-                  //     hard to read.
-                  //   - text-text-dim opacity-80: lower contrast.
-                  //   - italic: extra visual differentiation; helps the
-                  //     eye skip these blocks on scan.
-                  //   - title attribute explains the why for any user
-                  //     who hovers, so we don't look like we're hiding
-                  //     anything.
+              {groups.map((g, gi) => {
+                if (g.kind === 'muted') {
                   return (
-                    <div
-                      key={ci}
-                      title="Filtered as internal-state narration (memory / compaction / status pings). The text is still here — just visually de-emphasized."
-                      className={clsx(
-                        'text-[11px] text-text-dim italic opacity-80 break-words',
-                        showCursor &&
-                          'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
-                      )}
-                    >
-                      <RichText text={c.text} />
-                    </div>
+                    <NarrationGroup
+                      key={gi}
+                      group={g}
+                      isStreamingTail={isStreamingTail}
+                      isLastBlock={isLast}
+                      totalChunksInBlock={chunks.length}
+                    />
                   );
                 }
+                // Normal group: render each chunk as plain assistant
+                // text. The streaming cursor sits on the FINAL chunk
+                // of the FINAL block — which is only this group when
+                // it owns the last chunk index in the whole block.
                 return (
-                  <div
-                    key={ci}
-                    className={clsx(
-                      'text-[13px] text-text break-words',
-                      showCursor &&
-                        'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
-                    )}
-                  >
-                    <RichText text={c.text} />
+                  <div key={gi} className="space-y-1.5">
+                    {g.chunks.map((c, ci) => {
+                      const chunkIndex = g.firstIndex + ci;
+                      const isLastChunk = chunkIndex === chunks.length - 1;
+                      const showCursor =
+                        isStreamingTail && isLast && isLastChunk;
+                      return (
+                        <div
+                          key={ci}
+                          className={clsx(
+                            'text-[13px] text-text break-words',
+                            showCursor &&
+                              'after:content-["▍"] after:ml-0.5 after:text-accent after:animate-pulse'
+                          )}
+                        >
+                          <RichText text={c.text} />
+                        </div>
+                      );
+                    })}
                   </div>
                 );
               })}

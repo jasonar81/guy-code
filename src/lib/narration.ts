@@ -200,3 +200,65 @@ export function classifyAssistantText(text: string): ClassifiedChunk[] {
     muted: isInternalNarration(chunk),
   }));
 }
+
+/**
+ * A run of consecutive chunks of a single kind. Returned by
+ * `groupChunks` so the renderer can collapse muted runs behind a
+ * single twisty (one disclosure per run of muted paragraphs, not
+ * one per paragraph) while leaving substantive content rendered
+ * inline as before.
+ *
+ * `firstIndex` / `lastIndex` are the original chunk positions in the
+ * pre-grouping array. The renderer uses them to figure out whether
+ * the streaming-cursor's "last chunk of the last block" sits inside
+ * a given group (which forces auto-expansion so the user sees text
+ * arriving live instead of just "▶ 1 internal note").
+ */
+export interface ChunkGroup {
+  kind: 'muted' | 'normal';
+  chunks: ClassifiedChunk[];
+  /** Position of the first chunk in the original `classifyAssistantText` array. */
+  firstIndex: number;
+  /** Position of the last chunk in the original array (inclusive). */
+  lastIndex: number;
+}
+
+/**
+ * Group an array of classified chunks into consecutive runs by
+ * `muted` flag. Returns one ChunkGroup per maximal run.
+ *
+ * Examples:
+ *   [muted, muted, normal, muted] →
+ *     [{kind:'muted', 2 chunks}, {kind:'normal', 1 chunk}, {kind:'muted', 1 chunk}]
+ *   [normal, normal] →
+ *     [{kind:'normal', 2 chunks}]
+ *   [] → []
+ *
+ * Order is preserved end-to-end — the original [muted, muted,
+ * normal, muted] sequence maps to a 3-group output in the same
+ * positions. Callers that render each group in order will produce
+ * the same paragraph ordering as the model emitted.
+ */
+export function groupChunks(chunks: ClassifiedChunk[]): ChunkGroup[] {
+  if (chunks.length === 0) return [];
+  const out: ChunkGroup[] = [];
+  let current: ChunkGroup = {
+    kind: chunks[0].muted ? 'muted' : 'normal',
+    chunks: [chunks[0]],
+    firstIndex: 0,
+    lastIndex: 0,
+  };
+  for (let i = 1; i < chunks.length; i++) {
+    const c = chunks[i];
+    const kind: 'muted' | 'normal' = c.muted ? 'muted' : 'normal';
+    if (kind === current.kind) {
+      current.chunks.push(c);
+      current.lastIndex = i;
+    } else {
+      out.push(current);
+      current = { kind, chunks: [c], firstIndex: i, lastIndex: i };
+    }
+  }
+  out.push(current);
+  return out;
+}

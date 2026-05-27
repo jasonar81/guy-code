@@ -38,7 +38,17 @@ export function getClient(apiKeyId?: string | null): Anthropic {
       `Failed to decrypt API key (id=${resolvedId}). The key was probably encrypted on a different OS user / machine — re-enter it in Settings.`
     );
   }
-  const client = new Anthropic({ apiKey });
+  // maxRetries: the SDK retries on connection errors and on 408 / 409 /
+  // 429 / 5xx with exponential backoff (default backoff with jitter).
+  // The default is 2 retries (3 attempts total), which we've seen
+  // exhausted in the wild — a single Anthropic upstream blip during a
+  // long turn ends with the user staring at "500 status code (no body)"
+  // even though a 4th or 5th attempt would have succeeded. Bumping to 5
+  // (6 attempts total) costs nothing in the happy path and substantially
+  // smooths over transient upstream issues. The total wall-clock with
+  // backoff still caps out under ~45s, well below the 60s "session
+  // looks hung" threshold from the user's perspective.
+  const client = new Anthropic({ apiKey, maxRetries: 5 });
   _clients.set(resolvedId, client);
   return client;
 }

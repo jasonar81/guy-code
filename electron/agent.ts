@@ -53,6 +53,7 @@ import {
   saveTextAttachment,
   buildAttachmentPreview,
 } from './attachments';
+import { classifyApiError } from './apiErrors';
 import { maybeSummarize } from './toolSummarizer';
 import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
 import { renderActivePlanBlock } from './planManager';
@@ -1549,6 +1550,68 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
             // batch and then re-stream so the model gets the nudge.
             continue;
           }
+          // ---- WaitForUser auto-pickup of queued interrupts ----------
+          //
+          // If the user typed a message while the previous round was
+          // running and that message is still sitting in the interrupt
+          // queue, treat it as the answer to this WaitForUser instead
+          // of transitioning the session to "waiting-on-user".
+          //
+          // Without this special case the session would land in "needs
+          // you" state with the user's already-typed answer sitting
+          // unread in the queue (the post-tool-loop drainInterrupts
+          // would still append it, but the turn ends with
+          // `wait_for_user` so the next streamMessage never fires —
+          // the user has to type ANOTHER message to make the session
+          // pick up the queue, which is confusing and undesired).
+          //
+          // Behavior:
+          //   • Drain the queue.
+          //   • Synthesize a tool_result whose content IS the user's
+          //     message (joined if multiple). This matches the
+          //     contract of WaitForUser — its tool_result IS the user's
+          //     answer, fed into the next assistant turn.
+          //   • Mirror the messages as `interrupt_picked_up` events so
+          //     the chat shows them as user bubbles (otherwise they'd
+          //     be invisible).
+          //   • Do NOT set state=waiting-on-user, do NOT emit
+          //     wait_for_user, do NOT set waitedForUser.
+          //   • `continue` — let the for-loop fall through and the
+          //     post-loop drain (which now finds an empty queue) ride
+          //     to the next streamMessage iteration.
+          if (peekInterrupts(sessionId) > 0) {
+            const drained = drainInterrupts(sessionId);
+            const answer =
+              drained.length === 1
+                ? drained[0]
+                : drained.map((t, i) => `(${i + 1}) ${t}`).join('\n\n');
+            toolResultBlocks.push({
+              type: 'tool_result',
+              tool_use_id: tu.id,
+              content: answer,
+            });
+            for (const t of drained) {
+              onEv({ type: 'interrupt_picked_up', sessionId, text: t });
+            }
+            log.info(
+              `[agent] WaitForUser auto-answered from ${drained.length} queued interrupt(s) for ${sessionId}`
+            );
+            // Same UI shape we'd give a normal tool_result so the
+            // tool card resolves cleanly. Use the question as the
+            // input-display so the user can see what they answered.
+            onEv({
+              type: 'tool_result',
+              sessionId,
+              id: tu.id,
+              content: `Auto-answered from queued message: ${answer.slice(0, 200)}${answer.length > 200 ? '…' : ''}`,
+              isError: false,
+              ms: 0,
+            });
+            // Keep going — there might be more tool_uses in the batch
+            // (rare for WaitForUser, but possible) and we want the
+            // post-loop logic to ride to the next streamMessage.
+            continue;
+          }
           // ---- Normal WaitForUser path -------------------------------
           //
           // Synthesize a tool_result so the conversation history is well-formed
@@ -1804,13 +1867,23 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // shrink, or a tail that's already minimal) that no automated
       // strategy works. Tell the user to fork.
       const ptl = isPromptTooLongError(e);
-      const message = ptl.hit
-        ? `Context overflow: this turn would have sent ${ptl.tokens.toLocaleString()} tokens, ` +
+      let message: string;
+      if (ptl.hit) {
+        message =
+          `Context overflow: this turn would have sent ${ptl.tokens.toLocaleString()} tokens, ` +
           `over the model's input cap. The auto-compactor couldn't shrink the conversation enough ` +
           `to fit. To continue, start a new session — your existing JSONL is preserved on disk and ` +
           `can be re-opened later. You can also try a shorter follow-up message; if your last user ` +
-          `message contained large attachments, removing them may be enough on its own.`
-        : (e?.message ?? String(e));
+          `message contained large attachments, removing them may be enough on its own.`;
+      } else {
+        // Anthropic SDK / transport errors (5xx, auth, rate-limit, etc.)
+        // get user-facing rephrasing via `classifyApiError`. The raw
+        // message ("500 status code (no body)") is technically accurate
+        // but unhelpful — the classifier wraps it with "this is
+        // transient, try again in a minute" or "check your key in
+        // Settings" or whatever's appropriate. See `electron/apiErrors.ts`.
+        message = classifyApiError(e).message;
+      }
       onEv({
         type: 'error',
         sessionId,
