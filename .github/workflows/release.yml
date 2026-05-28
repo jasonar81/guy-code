@@ -6,13 +6,28 @@
 #
 # Matrix design rationale:
 #   • macOS runs on `macos-latest` (Apple Silicon by default).
-#     `electron-builder --mac` cross-compiles the x64 arch from
-#     ARM, producing a Universal binary. Building on a Linux or
-#     Windows runner would NOT work — only Apple's xcrun
-#     toolchain can produce signed/notarized .app bundles.
+#     `electron-builder --mac` with our `arch: ["x64", "arm64"]`
+#     config produces TWO separate DMGs and ZIPs — one per arch —
+#     not a Universal binary. The arm64 build runs natively on
+#     M-series Macs; the x64 build runs on Intel Macs natively
+#     and on M-series under Rosetta 2 translation.
+#     Building on a Linux or Windows runner would NOT work — only
+#     Apple's xcrun toolchain can produce launchable .app bundles
+#     (even ad-hoc-signed ones need `codesign` from xcrun).
 #   • Windows runs on `windows-latest`. NSIS installer + portable
 #     .exe come out of the box.
 #   • Linux runs on `ubuntu-latest`. AppImage + .deb.
+#
+# macOS signing (v0.1.8+):
+#   We ship ad-hoc-signed (`identity: "-"` in package.json). This
+#   satisfies the kernel-level rule that arm64 binaries must carry
+#   AT LEAST an ad-hoc signature to launch — without it, M-series
+#   Macs reject the binary as "invalid" / "damaged" at load time,
+#   no right-click-Open workaround possible.
+#   First-launch UX is still "right-click → Open" because we don't
+#   have an Apple Developer certificate. When we get one, set
+#   identity to the cert name and add notarization (see Code
+#   signing block at the bottom of this file).
 #
 # Auto-update integration:
 #   electron-updater reads `latest-mac.yml`, `latest.yml` (Win),

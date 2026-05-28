@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS entitlements for Guy Code.
+
+  Why this file exists, even though we ship ad-hoc-signed without
+  notarization:
+    1. Apple Silicon refuses to launch unsigned arm64 binaries. We
+       satisfy that with electron-builder's `identity: "-"` (ad-hoc
+       signature via codesign -s -). Ad-hoc signing requires
+       SOMETHING to sign, and electron-builder applies the
+       entitlements named here during that step. Without an
+       entitlements file, the ad-hoc sign still works but Chromium
+       can be denied capabilities at runtime that we want it to
+       have (JIT for V8, dyld variables for the renderer, etc.).
+    2. When we eventually buy an Apple Developer cert and turn on
+       `hardenedRuntime: true` + notarization, THIS file is what
+       Apple's notary service inspects. Shipping it now means the
+       eventual signing/notarization PR is purely a secrets +
+       config change — no entitlements scramble at the finish line.
+
+  What's enabled and why:
+    com.apple.security.cs.allow-jit                  — V8 JIT
+    com.apple.security.cs.allow-unsigned-executable-memory
+                                                     — Node's V8
+                                                       requires
+                                                       writable+
+                                                       executable
+                                                       memory pages
+    com.apple.security.cs.allow-dyld-environment-variables
+                                                     — Electron's
+                                                       launcher
+                                                       sets DYLD_*
+                                                       for the
+                                                       helper procs
+    com.apple.security.cs.disable-library-validation
+                                                     — Allows
+                                                       loading
+                                                       Chromium
+                                                       helper
+                                                       frameworks
+                                                       signed with
+                                                       a different
+                                                       team ID
+                                                       (electron's)
+                                                       than ours.
+                                                       Standard
+                                                       requirement
+                                                       for any
+                                                       Electron
+                                                       app.
+
+  What's NOT enabled and why:
+    No network/files/microphone/camera/etc. entitlements — under
+    hardenedRuntime+sandbox those would matter, but we're not
+    sandboxed (we're a developer tool that needs to drive the user's
+    filesystem and arbitrary subprocesses; sandboxing would be
+    crippling). Leaving these out keeps the entitlement set minimal
+    and reviewable.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
