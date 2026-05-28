@@ -2,7 +2,7 @@
   "name": "guy-code",
   "productName": "Guy Code",
   "private": false,
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Cross-platform Claude Code-compatible desktop app",
   "author": {
     "name": "Jason Arnold",
@@ -73,6 +73,7 @@
     "vitest": "^4.1.7"
   },
   "build": {
+    "afterPack": "build/afterPack.js",
     "appId": "io.github.jasonar81.guycode",
     "productName": "Guy Code",
     "copyright": "Copyright © 2026 Jason Arnold",
@@ -127,9 +128,7 @@
       "category": "public.app-category.developer-tools",
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
-      "identity": "-",
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist",
+      "identity": null,
       "icon": "build/icon.icns"
     },
     "dmg": {

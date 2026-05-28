@@ -18,16 +18,31 @@
 #     .exe come out of the box.
 #   • Linux runs on `ubuntu-latest`. AppImage + .deb.
 #
-# macOS signing (v0.1.8+):
-#   We ship ad-hoc-signed (`identity: "-"` in package.json). This
-#   satisfies the kernel-level rule that arm64 binaries must carry
-#   AT LEAST an ad-hoc signature to launch — without it, M-series
-#   Macs reject the binary as "invalid" / "damaged" at load time,
-#   no right-click-Open workaround possible.
+# macOS signing (v0.1.9+):
+#   We ship ad-hoc-signed via a custom afterPack hook at
+#   build/afterPack.js. The hook runs after electron-builder
+#   produces the .app bundle and before DMG/zip packaging, and
+#   invokes `codesign -s - --deep --force --options runtime
+#   --entitlements build/entitlements.mac.plist` to apply an
+#   ad-hoc signature.
+#
+#   Why not use `mac.identity: "-"` in package.json? Our pinned
+#   electron-builder 25.1.8 doesn't recognize the `-` shorthand —
+#   it treats it as a literal cert name to look up in the keychain,
+#   finds nothing, and silently skips signing. (Newer 26.x releases
+#   honor the documented shorthand.) The afterPack hook bypasses
+#   that limitation without forcing a major-version bump of
+#   electron-builder.
+#
+#   The ad-hoc signature satisfies the kernel-level rule that arm64
+#   binaries must carry AT LEAST an ad-hoc signature to launch —
+#   without it, M-series Macs reject the binary as "invalid" /
+#   "damaged" at load time with no right-click-Open workaround.
 #   First-launch UX is still "right-click → Open" because we don't
-#   have an Apple Developer certificate. When we get one, set
-#   identity to the cert name and add notarization (see Code
-#   signing block at the bottom of this file).
+#   have an Apple Developer certificate. When we get one, swap
+#   afterPack's `-` for the cert's common name, flip
+#   `hardenedRuntime: true` in package.json, and add an afterSign
+#   hook that calls @electron/notarize.
 #
 # Auto-update integration:
 #   electron-updater reads `latest-mac.yml`, `latest.yml` (Win),
