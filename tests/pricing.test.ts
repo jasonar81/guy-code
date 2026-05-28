@@ -17,6 +17,18 @@ describe('getPricing', () => {
     expect(opus.outputUsdPerMillion).toBe(25 * M);
   });
 
+  it('Opus 4.8 uses $5/$25 (same as 4.7)', () => {
+    const opus = getPricing('claude-opus-4-8');
+    expect(opus.inputUsdPerMillion).toBe(5 * M);
+    expect(opus.outputUsdPerMillion).toBe(25 * M);
+  });
+
+  it('Opus 4.8 with [1m] suffix uses $5/$25', () => {
+    const opus = getPricing('claude-opus-4-8[1m]');
+    expect(opus.inputUsdPerMillion).toBe(5 * M);
+    expect(opus.outputUsdPerMillion).toBe(25 * M);
+  });
+
   it('strips trailing [1m] suffix tags', () => {
     const opus = getPricing('claude-opus-4-7[1m]');
     expect(opus.inputUsdPerMillion).toBe(5 * M);
@@ -76,10 +88,19 @@ describe('getPricing', () => {
     expect(p.inputUsdPerMillion).toBe(1 * M);
   });
 
-  it('falls back to sonnet pricing as the default', () => {
-    const p = getPricing('totally-fake-model');
+  it('falls back to sonnet pricing for unknown models naming the sonnet family', () => {
+    const p = getPricing('claude-sonnet-9000-experimental');
     expect(p.inputUsdPerMillion).toBe(3 * M);
     expect(p.outputUsdPerMillion).toBe(15 * M);
+  });
+
+  it('falls back to Opus-class $5/$25 for an unknown model that names no known family', () => {
+    // Default model is Opus; a brand-new Anthropic flagship whose alias we
+    // haven't tabled yet is far more likely Opus-priced than Sonnet-priced.
+    // Erring high avoids silently under-reporting spend on an expensive model.
+    const p = getPricing('totally-fake-model');
+    expect(p.inputUsdPerMillion).toBe(5 * M);
+    expect(p.outputUsdPerMillion).toBe(25 * M);
   });
 });
 

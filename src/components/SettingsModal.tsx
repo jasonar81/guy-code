@@ -30,7 +30,7 @@ interface Props {
 // Keep this in sync with `electron/anthropic.ts` DEFAULT_MODEL. The `[1m]`
 // suffix is the Claude Code convention for opting into the 1M-context
 // window — at sub-1M sizes the 200K cap forces aggressive compaction.
-const DEFAULT_MODEL = 'claude-opus-4-7[1m]';
+const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
 
 export function SettingsModal({ open, onClose }: Props) {
   const [model, setModel] = useState<string>(DEFAULT_MODEL);
@@ -202,7 +202,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <Field
             icon={<Cpu size={14} />}
             label="Model"
-            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-opus-4-7[1m]) — strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless."
+            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-opus-4-8[1m]) — strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless."
           >
             <input
               type="text"

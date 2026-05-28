@@ -70,13 +70,13 @@ export function resetClient(apiKeyId?: string | null): void {
 // client. Behaves like the old singleton path — uses the default key.
 void getApiKey;
 
-// Opus 4.7 with the 1M-context alias. The `[1m]` suffix follows Claude
+// Opus 4.8 with the 1M-context alias. The `[1m]` suffix follows Claude
 // Code's convention — we strip it before passing the real model ID to the
 // Anthropic API and turn it into the `context-1m-2025-08-07` beta header.
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-export const DEFAULT_MODEL = 'claude-opus-4-7[1m]';
+export const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
 
 /**
  * Detect the `[1m]` suffix on a model string and return the bare model ID

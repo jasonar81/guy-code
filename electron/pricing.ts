@@ -30,10 +30,12 @@ function pricing(input: number, output: number): ModelPricing {
 
 // Per-million-token prices in USD. Verified against Anthropic's public
 // pricing page in May 2026. Opus 4.5 onward is $5/$25 — Anthropic dropped
-// Opus from the prior $15/$75 to broaden agentic use; Opus 4.7 (released
-// April 2026) kept that pricing. Earlier Opus 4 / Claude 3 Opus retain
-// the legacy $15/$75 rate.
+// Opus from the prior $15/$75 to broaden agentic use; Opus 4.7 and 4.8
+// kept that pricing. Earlier Opus 4 / Claude 3 Opus retain the legacy
+// $15/$75 rate.
 const TABLE: Record<string, ModelPricing> = {
+  'claude-opus-4-8': pricing(5, 25),
+  'claude-opus-4-8-1m': pricing(5, 25),
   'claude-opus-4-7': pricing(5, 25),
   'claude-opus-4-7-1m': pricing(5, 25),
   'claude-opus-4-6': pricing(5, 25),
@@ -59,7 +61,15 @@ function familyFallback(model: string): ModelPricing {
   // current users.
   if (lc.includes('opus')) return pricing(5, 25);
   if (lc.includes('haiku')) return pricing(1, 5);
-  return pricing(3, 15); // sonnet default
+  if (lc.includes('sonnet')) return pricing(3, 15);
+  // Unknown model that doesn't name a known family: assume Opus-class
+  // $5/$25. The default model is Opus, and any brand-new Anthropic model
+  // id we haven't added to the table yet (e.g. a freshly-released Opus
+  // whose alias doesn't literally contain "opus", or a next-gen flagship)
+  // is far more likely to be Opus-priced than Sonnet-priced. Erring high
+  // means the cost pill slightly over-estimates rather than silently
+  // under-reporting spend on an expensive model.
+  return pricing(5, 25);
 }
 
 export function getPricing(model: string): ModelPricing {
