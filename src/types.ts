@@ -178,6 +178,34 @@ export type Attachment =
       name: string;
       text: string;
       sizeBytes: number;
+    }
+  /**
+   * Rich document that needs server-side (main-process) text extraction:
+   * Office Open XML (Word .docx, Excel .xlsx, PowerPoint .pptx) and Rich
+   * Text Format (.rtf). The renderer ships the raw file bytes as base64;
+   * the main process extracts plain text (see `electron/office.ts` and
+   * `electron/rtf.ts`), writes the extracted text under
+   * `~/.guycode/attachments/<sessionId>/` as a `.txt`, and emits the same
+   * disk-backed reference block as `text-file`.
+   *
+   * Why base64 of the original bytes (not pre-extracted text in the
+   * renderer): the office extraction depends on `fflate` (a main-process
+   * dependency) and the parsers live in `electron/`. Doing it in the
+   * renderer would mean bundling those into the web build and trusting
+   * renderer-side parsing of untrusted file bytes. Keeping extraction in
+   * main matches where the disk-write already happens and keeps the
+   * renderer thin. RTF rides the same path for consistency even though
+   * it's technically text.
+   *
+   * `docKind` tells main which extractor to run.
+   * `sizeBytes` is the original file size (for the chip + cap checks).
+   */
+  | {
+      kind: 'rich-doc';
+      name: string;
+      docKind: 'docx' | 'xlsx' | 'pptx' | 'rtf';
+      dataBase64: string;
+      sizeBytes: number;
     };
 
 export interface ChatMessage {

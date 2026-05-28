@@ -61,11 +61,45 @@ const MAX_TEXT_FILE_BYTES = 50_000_000;
 const MAX_TOTAL_BYTES = 60_000_000;
 
 const TEXT_EXTENSIONS = new Set([
-  'txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'log', 'xml',
-  'yaml', 'yml', 'toml', 'ini', 'env', 'sh', 'bash', 'zsh',
-  'js', 'jsx', 'ts', 'tsx', 'py', 'rb', 'go', 'rs', 'java',
-  'c', 'cpp', 'h', 'hpp', 'cs', 'php', 'sql', 'html', 'css', 'scss',
+  // Docs / data / markup
+  'txt', 'text', 'md', 'markdown', 'mdx', 'rst', 'tex', 'adoc', 'asciidoc',
+  'json', 'jsonl', 'ndjson', 'json5', 'csv', 'tsv', 'psv', 'log', 'xml',
+  'svg', 'html', 'htm', 'xhtml', 'rss', 'atom',
+  'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'config', 'properties',
+  'env', 'dotenv', 'editorconfig', 'patch', 'diff',
+  // Shell / scripting
+  'sh', 'bash', 'zsh', 'fish', 'ps1', 'psm1', 'bat', 'cmd', 'awk', 'sed',
+  // Programming languages
+  'js', 'cjs', 'mjs', 'jsx', 'ts', 'cts', 'mts', 'tsx', 'vue', 'svelte',
+  'py', 'pyi', 'pyw', 'rb', 'rake', 'go', 'rs', 'java', 'kt', 'kts',
+  'scala', 'sc', 'clj', 'cljs', 'cljc', 'edn', 'ex', 'exs', 'erl', 'hrl',
+  'c', 'cc', 'cpp', 'cxx', 'h', 'hh', 'hpp', 'hxx', 'cs', 'fs', 'fsx',
+  'php', 'pl', 'pm', 'lua', 'r', 'jl', 'dart', 'swift', 'm', 'mm',
+  'groovy', 'gradle', 'vb', 'pas', 'd', 'nim', 'zig', 'v', 'hs', 'lhs',
+  'ml', 'mli', 'elm', 'purs', 'rkt', 'scm', 'lisp', 'el', 'vim',
+  // Query / schema / IDL
+  'sql', 'graphql', 'gql', 'proto', 'thrift', 'avsc', 'prisma',
+  // Styles
+  'css', 'scss', 'sass', 'less', 'styl',
+  // Build / infra / config-as-code
+  'dockerfile', 'containerfile', 'makefile', 'mk', 'cmake', 'bazel', 'bzl',
+  'tf', 'tfvars', 'hcl', 'nomad', 'tffile', 'jenkinsfile', 'nix',
 ]);
+
+// Filenames (no extension or special-cased) that are plain text.
+const TEXT_FILENAMES = new Set([
+  'dockerfile', 'containerfile', 'makefile', 'gnumakefile', 'jenkinsfile',
+  'rakefile', 'gemfile', 'procfile', 'vagrantfile', 'brewfile',
+  'cmakelists.txt', '.gitignore', '.gitattributes', '.npmrc', '.nvmrc',
+  '.prettierrc', '.eslintrc', '.babelrc', '.editorconfig', 'license',
+  'readme', 'changelog', 'authors', 'notice', 'codeowners',
+]);
+
+// RTF and Office Open XML extensions get special routing (text extraction).
+const RTF_EXTENSIONS = new Set(['rtf']);
+const OFFICE_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx']);
+// Legacy binary Office (pre-2007 OLE) we do NOT support — clear message.
+const LEGACY_OFFICE_EXTENSIONS = new Set(['doc', 'xls', 'ppt']);
 
 type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
 
@@ -125,8 +159,52 @@ async function fileToAttachment(file: File): Promise<Attachment | { error: strin
     return { kind: 'pdf', name: file.name, dataBase64: bytesToBase64(buf), sizeBytes };
   }
 
-  // Plain-text branch (md, code, csv, json, …)
-  if (TEXT_EXTENSIONS.has(ext) || mime.startsWith('text/')) {
+  // Rich-document branch (docx/xlsx/pptx/rtf): ship the raw bytes to main
+  // for text extraction. We cap at the same ceiling as text files since
+  // the extracted text lands in the same disk-backed pipeline.
+  if (OFFICE_EXTENSIONS.has(ext) || RTF_EXTENSIONS.has(ext)) {
+    if (sizeBytes > MAX_TEXT_FILE_BYTES) {
+      const mb = (sizeBytes / 1_048_576).toFixed(1);
+      const capMb = (MAX_TEXT_FILE_BYTES / 1_048_576).toFixed(0);
+      return {
+        error: `${file.name} is ${mb} MB; max attachment size is ${capMb} MB.`,
+      };
+    }
+    const buf = await file.arrayBuffer();
+    const docKind = (RTF_EXTENSIONS.has(ext) ? 'rtf' : ext) as
+      | 'docx'
+      | 'xlsx'
+      | 'pptx'
+      | 'rtf';
+    return {
+      kind: 'rich-doc',
+      name: file.name,
+      docKind,
+      dataBase64: bytesToBase64(buf),
+      sizeBytes,
+    };
+  }
+
+  // Legacy binary Office (pre-2007 OLE): not supported — point the user at
+  // the modern format or PDF. These are old enough + rare enough that a
+  // robust parser isn't worth the dependency weight.
+  if (LEGACY_OFFICE_EXTENSIONS.has(ext)) {
+    const modern = ext + 'x'; // doc→docx, xls→xlsx, ppt→pptx
+    return {
+      error:
+        `${file.name}: legacy ${ext.toUpperCase()} format isn't supported. ` +
+        `Re-save it as .${modern} (File → Save As) or export to PDF, then attach that.`,
+    };
+  }
+
+  // Plain-text branch (md, code, csv, json, svg, html, …). The `name`-based
+  // check catches extension-less text files (Dockerfile, Makefile, LICENSE).
+  const baseName = (file.name.split(/[\\/]/).pop() || '').toLowerCase();
+  if (
+    TEXT_EXTENSIONS.has(ext) ||
+    TEXT_FILENAMES.has(baseName) ||
+    mime.startsWith('text/')
+  ) {
     // Hard ceiling first. Anything bigger than this is rejected with
     // a message that points the user toward the workaround (slice /
     // grep before attaching). Disk-backed mode could in principle go
@@ -162,8 +240,10 @@ async function fileToAttachment(file: File): Promise<Attachment | { error: strin
 
   return {
     error:
-      `${file.name}: unsupported type. Images (PNG/JPEG/GIF/WebP), PDFs, and plain-text files are supported. ` +
-      `Office documents (Word/Excel) need to be exported as PDF first.`,
+      `${file.name}: unsupported type. Supported: images (PNG/JPEG/GIF/WebP), PDF, ` +
+      `Word/Excel/PowerPoint (.docx/.xlsx/.pptx), RTF, and plain-text/code/data files ` +
+      `(.txt, .md, .csv, .json, .svg, .html, source code, config, etc.). ` +
+      `For anything else, export to PDF or a text format first.`,
   };
 }
 
@@ -745,7 +825,7 @@ export function Composer({ sessionId, visible }: Props) {
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*,.md,.json,.csv,.log,.yaml,.yml,.toml,.txt,.py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.c,.cpp,.h,.sh,.html,.css,.sql"
+          accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/rtf,text/rtf,.docx,.xlsx,.pptx,.rtf,.md,.markdown,.json,.jsonl,.csv,.tsv,.log,.xml,.svg,.html,.htm,.yaml,.yml,.toml,.ini,.cfg,.conf,.env,.txt,.rst,.tex,.py,.js,.cjs,.mjs,.ts,.tsx,.jsx,.vue,.svelte,.go,.rs,.java,.kt,.scala,.rb,.php,.lua,.r,.jl,.dart,.swift,.c,.cc,.cpp,.cxx,.h,.hpp,.cs,.fs,.sh,.bash,.zsh,.ps1,.bat,.sql,.graphql,.proto,.html,.css,.scss,.sass,.less,.dockerfile,.makefile,.cmake,.tf,.hcl,.gradle,.nix"
           className="hidden"
           onChange={async (e) => {
             const files = e.target.files;
@@ -882,14 +962,21 @@ function AttachmentPill({
   }
   // Sub-label for the chip:
   //   - 'PDF'  → kind: 'pdf'
+  //   - 'DOCX'/'XLSX'/'PPTX'/'RTF' → kind: 'rich-doc' (main extracts text)
   //   - 'file' → kind: 'text-file' (disk-backed; model will Read on demand)
   //   - 'text' → kind: 'text' (inlined directly into the prompt)
-  // The user-visible distinction is intentionally subtle — both work
-  // identically from the user's perspective. The 'file' label is a
-  // small affordance for power users who want to know what's
-  // happening behind the scenes (inline vs disk-backed).
+  // The user-visible distinction is intentionally subtle — they all work
+  // identically from the user's perspective. The label is a small
+  // affordance for power users who want to know what's happening behind
+  // the scenes (inline vs disk-backed vs extracted).
   const subLabel =
-    a.kind === 'pdf' ? 'PDF' : a.kind === 'text-file' ? 'file' : 'text';
+    a.kind === 'pdf'
+      ? 'PDF'
+      : a.kind === 'rich-doc'
+        ? a.docKind.toUpperCase()
+        : a.kind === 'text-file'
+          ? 'file'
+          : 'text';
   return (
     <div className="relative inline-flex items-center gap-1.5 rounded-md border border-border bg-bg-elevated px-2 py-1.5 pr-7 text-[11px] text-text-muted">
       <FileText size={14} className={a.kind === 'pdf' ? 'text-state-attention' : 'text-text-dim'} />

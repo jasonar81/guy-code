@@ -53,6 +53,8 @@ import {
   saveTextAttachment,
   buildAttachmentPreview,
 } from './attachments';
+import { extractOfficeText, type OfficeKind } from './office';
+import { rtfToText } from './rtf';
 import { classifyApiError } from './apiErrors';
 import { maybeSummarize } from './toolSummarizer';
 import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
@@ -464,7 +466,19 @@ type IncomingAttachment =
    * for the storage layout and `buildUserContent` below for the
    * reference-block format.
    */
-  | { kind: 'text-file'; name?: string; text: string };
+  | { kind: 'text-file'; name?: string; text: string }
+  /**
+   * Rich document (docx/xlsx/pptx/rtf). Renderer ships base64 of the
+   * original file bytes; main decodes, extracts text (office via
+   * `extractOfficeText`, rtf via `rtfToText`), then writes the extracted
+   * text disk-backed (same as `text-file`).
+   */
+  | {
+      kind: 'rich-doc';
+      name?: string;
+      docKind: OfficeKind | 'rtf';
+      dataBase64: string;
+    };
 
 interface RunArgs {
   sessionId: string;
@@ -538,6 +552,23 @@ function normalizeAttachments(raw: unknown[] | undefined): IncomingAttachment[] 
         kind: 'text-file',
         name: typeof r.name === 'string' ? r.name : undefined,
         text: r.text,
+      });
+    } else if (
+      r.kind === 'rich-doc' &&
+      typeof r.dataBase64 === 'string' &&
+      (r.docKind === 'docx' ||
+        r.docKind === 'xlsx' ||
+        r.docKind === 'pptx' ||
+        r.docKind === 'rtf')
+    ) {
+      // Rich document (docx/xlsx/pptx/rtf). Carries base64 of the original
+      // file bytes; main extracts text in `buildUserContent` and routes it
+      // disk-backed.
+      out.push({
+        kind: 'rich-doc',
+        name: typeof r.name === 'string' ? r.name : undefined,
+        docKind: r.docKind,
+        dataBase64: r.dataBase64,
       });
     }
   }
@@ -619,6 +650,76 @@ function buildUserContent(
           `Size: ${sizeKb} KB\n` +
           `Use the Read tool with the absolute path above to access the contents. ` +
           `For very large files, pass offset/limit to read in chunks.\n` +
+          `\nPreview (first ~500 chars):\n${preview}\n` +
+          `--- end ${rawName} ---`,
+      });
+    } else if (a.kind === 'rich-doc') {
+      // ---- Rich document (docx / xlsx / pptx / rtf) --------------
+      //
+      // We carry the original file bytes (base64) over IPC, decode
+      // them here, and extract plain text:
+      //   - docx/xlsx/pptx → extractOfficeText (fflate ZIP+XML parse,
+      //     see electron/office.ts)
+      //   - rtf            → rtfToText (control-word strip,
+      //     see electron/rtf.ts)
+      // The extracted text is then written disk-backed exactly like a
+      // `text-file`, with the saved `.txt` named after the original
+      // document so the model can Read it.
+      //
+      // If extraction fails (corrupt file, not really the claimed
+      // format, an encrypted/password-protected document), we emit an
+      // error text block instead of failing the whole turn — the user
+      // still gets their typed message through, just without the
+      // attachment content.
+      const label = a.docKind.toUpperCase();
+      const rawName = a.name ?? `document.${a.docKind}`;
+      let extracted: string;
+      try {
+        const bytes = Buffer.from(a.dataBase64, 'base64');
+        if (a.docKind === 'rtf') {
+          extracted = rtfToText(bytes.toString('utf8'));
+        } else {
+          extracted = extractOfficeText(new Uint8Array(bytes), a.docKind);
+        }
+      } catch (e) {
+        log.warn(`[agent] ${label} extraction failed for ${rawName}: ${(e as Error).message}`);
+        blocks.push({
+          type: 'text',
+          text:
+            `\n\n--- Attached ${label} (could not extract text): ${rawName} ---\n` +
+            `The file couldn't be parsed (it may be corrupt, password-protected, ` +
+            `or saved in an older/unsupported format). Ask the user to re-save it ` +
+            `as .${a.docKind} or export to PDF.\n` +
+            `--- end ${rawName} ---`,
+        });
+        continue;
+      }
+      if (!extracted.trim()) {
+        blocks.push({
+          type: 'text',
+          text:
+            `\n\n--- Attached ${label}: ${rawName} ---\n` +
+            `(No extractable text — the document may contain only images / charts.)\n` +
+            `--- end ${rawName} ---`,
+        });
+        continue;
+      }
+      // Save the EXTRACTED TEXT under a .txt leaf derived from the
+      // original name, so the on-disk file is human-readable and the
+      // model Reads plain text rather than a binary blob.
+      const txtName = `${rawName}.extracted.txt`;
+      const saved = saveTextAttachment(sessionId, txtName, extracted);
+      const sizeKb = Math.max(1, Math.round(saved.sizeBytes / 1024));
+      const preview = buildAttachmentPreview(extracted, 500);
+      blocks.push({
+        type: 'text',
+        text:
+          `\n\n--- Attached ${label} (text extracted): ${rawName} ---\n` +
+          `Extracted text saved at: ${saved.absPath}\n` +
+          `Extracted size: ${sizeKb} KB\n` +
+          `Use the Read tool with the absolute path above to access the full ` +
+          `extracted text. For very large files, pass offset/limit to read in ` +
+          `chunks. (Formatting/layout is not preserved — this is plain text.)\n` +
           `\nPreview (first ~500 chars):\n${preview}\n` +
           `--- end ${rawName} ---`,
       });
