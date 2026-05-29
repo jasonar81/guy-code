@@ -452,6 +452,87 @@ export function listGuyMemory(args: {
 }
 
 /**
+ * Enumerate the read-only Claude-import memory leaves the loader would
+ * consider for THIS session, so `list_memory` can surface them too.
+ *
+ * Why this exists: `list_memory` historically showed ONLY Guy-owned leaves
+ * under `~/.guycode`. That meant a model orienting itself ("what reference /
+ * feedback docs do I have?") was blind to the imported `~/.claude` tree —
+ * which is where authoritative checklists like the pre-PR hardening
+ * reference live. A real bug followed from this: the hardening doc was
+ * skipped because nothing surfaced it on the trigger word. Discovery should
+ * not depend on which tree a leaf lives in.
+ *
+ * This returns the SAME set the session-start loader walks (global
+ * CLAUDE.md, the cwd-matched project memory, and — for cwd-less Guy
+ * sessions — the cross-project fallback), each with its parsed `name` /
+ * `description` frontmatter so the trigger text is visible in the listing.
+ * Read-only: these are never writable via save/delete.
+ *
+ * Note this lists by the loader's discovery rules, NOT by what actually fit
+ * under the load cap — so even a leaf that got truncated/dropped from the
+ * in-context bundle is still discoverable here (the model can then `Read`
+ * it directly by path).
+ */
+export function listClaudeMemory(args: {
+  cwd: string;
+  projectId?: string;
+}): {
+  path: string;
+  name: string | null;
+  description: string | null;
+  bytes: number;
+  mtime: number;
+}[] {
+  const { cwd } = args;
+  const projectId = args.projectId ?? '';
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const add = (p: string) => {
+    if (!p || seen.has(p)) return;
+    seen.add(p);
+    paths.push(p);
+  };
+
+  // Mirror loadMemory's ~/.claude discovery order (steps 1–4 there), minus
+  // the Guy-owned dirs which listGuyMemory already covers.
+  if (cwd && cwd.trim()) {
+    for (const p of walkUpForClaudeMd(cwd)) add(p);
+  }
+  const globalClaude = join(homedir(), '.claude', 'CLAUDE.md');
+  if (existsSync(globalClaude)) add(globalClaude);
+  for (const p of findClaudeProjectMemory(projectId)) add(p);
+  const cwdLess = !cwd || !cwd.trim() || projectId.startsWith('__guy_');
+  if (cwdLess) {
+    for (const p of findAllClaudeProjectMemory()) add(p);
+  }
+
+  const out: {
+    path: string;
+    name: string | null;
+    description: string | null;
+    bytes: number;
+    mtime: number;
+  }[] = [];
+  for (const p of paths) {
+    try {
+      const st = statSync(p);
+      const meta = parseMdFrontmatter(p);
+      out.push({
+        path: p,
+        name: meta.name,
+        description: meta.description,
+        bytes: st.size,
+        mtime: st.mtimeMs,
+      });
+    } catch {
+      /* ignore unreadable */
+    }
+  }
+  return out;
+}
+
+/**
  * Delete a Guy-owned memory leaf. Refuses any path that resolves outside
  * Guy's writable tree.
  */
@@ -551,13 +632,13 @@ function walkSkills(
       // Look for SKILL.md inside the directory (anthropic/skill convention).
       const skillFile = join(full, 'SKILL.md');
       if (existsSync(skillFile)) {
-        const meta = parseSkillMd(skillFile);
+        const meta = parseMdFrontmatter(skillFile);
         out.push({ path: skillFile, name: meta.name ?? e.name, description: meta.description });
       } else {
         walkSkills(full, out);
       }
     } else if (e.isFile() && e.name.toLowerCase().endsWith('.md')) {
-      const meta = parseSkillMd(full);
+      const meta = parseMdFrontmatter(full);
       out.push({
         path: full,
         name: meta.name ?? parsePath(e.name).name,
@@ -567,7 +648,7 @@ function walkSkills(
   }
 }
 
-function parseSkillMd(path: string): { name: string | null; description: string | null } {
+function parseMdFrontmatter(path: string): { name: string | null; description: string | null } {
   try {
     const text = readFileSync(path, 'utf8');
     if (!text.startsWith('---')) {

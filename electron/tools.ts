@@ -22,6 +22,7 @@ import {
   recallFromBundle,
   saveMemory,
   listGuyMemory,
+  listClaudeMemory,
   deleteGuyMemory,
 } from './memory';
 import type { MemoryBundle } from './memory';
@@ -1214,7 +1215,7 @@ const RECALL_MEMORY: ToolDef = {
   schema: {
     name: 'recall_memory',
     description:
-      'Search the project memory (CLAUDE.md / MEMORY.md leaves loaded at session start) for a substring. Returns matching paragraphs with their source path. Use this when you need to look something up without re-quoting the entire memory tree.',
+      'Search ALL memory loaded at session start — both Guy-owned writable leaves (~/.guycode) AND read-only imported Claude memory (~/.claude CLAUDE.md / reference_* / feedback_* / project_* leaves) — for a substring. Returns matching paragraphs with their source path. Use this to look something up (a convention, a prior decision, a checklist trigger like "hardening") without re-quoting the whole tree. Note: matches only content that fit under the session load cap; to enumerate every available leaf (including ones too large to fully load), use list_memory and then Read the path.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1287,28 +1288,71 @@ const LIST_MEMORY: ToolDef = {
   schema: {
     name: 'list_memory',
     description:
-      'List Guy-owned writable memory leaves. Only shows files under ~/.guycode (not the imported Claude memory). Use this to discover what you have saved before adding more.',
+      'List memory leaves the model knows about. Covers BOTH the Guy-owned writable leaves under ~/.guycode AND the read-only imported Claude memory under ~/.claude (reference/feedback/project docs loaded at session start). Claude-import rows show their name + description (the trigger text) so you can tell when one applies — e.g. a "when Jason says hardening…" reference. Read-only imports can be Read by path but not saved/deleted. Use this to discover what guidance already exists before acting or before saving something new. Default scope "all" returns everything; "guy" = only writable Guy leaves; "claude" = only read-only imports.',
     input_schema: {
       type: 'object',
       properties: {
         scope: {
           type: 'string',
-          enum: ['global', 'project', 'all'],
-          description: "Default 'all'.",
+          enum: ['global', 'project', 'all', 'guy', 'claude'],
+          description:
+            "Default 'all' (Guy leaves + Claude imports). 'global'/'project' = the matching Guy-owned subset. 'guy' = all Guy-owned. 'claude' = read-only Claude imports only.",
         },
       },
     },
   },
   async execute(input, ctx) {
-    const scope = (input.scope as 'global' | 'project' | 'all' | undefined) ?? 'all';
-    const rows = listGuyMemory({ scope, projectId: ctx.projectId });
-    if (rows.length === 0) return '(no Guy-owned memory saved yet)';
-    return rows
-      .map(
-        (r) =>
-          `[${r.scope}] ${r.path}\n    ${r.bytes}b, last modified ${new Date(r.mtime).toISOString()}`
-      )
-      .join('\n');
+    const scope = (input.scope as string | undefined) ?? 'all';
+    const wantGuy = scope === 'all' || scope === 'guy' || scope === 'global' || scope === 'project';
+    const wantClaude = scope === 'all' || scope === 'claude';
+
+    const sections: string[] = [];
+
+    if (wantGuy) {
+      // For the Guy listing, 'guy' behaves like 'all' (both global + project);
+      // 'global'/'project' narrow to that subset.
+      const guyScope: 'global' | 'project' | 'all' =
+        scope === 'global' ? 'global' : scope === 'project' ? 'project' : 'all';
+      const rows = listGuyMemory({ scope: guyScope, projectId: ctx.projectId });
+      if (rows.length > 0) {
+        sections.push(
+          'WRITABLE (Guy-owned, ~/.guycode — save_memory / delete_memory work here):\n' +
+            rows
+              .map(
+                (r) =>
+                  `  [${r.scope}] ${r.path}\n      ${r.bytes}b, last modified ${new Date(r.mtime).toISOString()}`
+              )
+              .join('\n')
+        );
+      }
+    }
+
+    if (wantClaude) {
+      const claude = listClaudeMemory({ cwd: ctx.cwd, projectId: ctx.projectId });
+      if (claude.length > 0) {
+        sections.push(
+          'READ-ONLY (imported Claude memory, ~/.claude — Read by path; cannot save/delete):\n' +
+            claude
+              .map((r) => {
+                const label = r.name ? r.name : '(no name)';
+                const desc = r.description
+                  ? `\n      ${r.description.length > 400 ? r.description.slice(0, 400) + '…' : r.description}`
+                  : '';
+                return `  [claude-import] ${r.path}\n      ${label} · ${r.bytes}b${desc}`;
+              })
+              .join('\n')
+        );
+      }
+    }
+
+    if (sections.length === 0) {
+      return wantClaude && !wantGuy
+        ? '(no imported Claude memory found for this session)'
+        : wantGuy && !wantClaude
+          ? '(no Guy-owned memory saved yet)'
+          : '(no memory found — neither Guy-owned leaves nor Claude imports)';
+    }
+    return sections.join('\n\n');
   },
 };
 
