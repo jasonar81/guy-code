@@ -175,6 +175,57 @@ export function sanitizeMessages(
 ): Anthropic.MessageParam[] {
   if (messages.length === 0) return messages;
 
+  // -- Pass -1: strip `thinking` / `redacted_thinking` blocks ----------------
+  // We do NOT send the `thinking` request param (extended thinking is off),
+  // so any thinking block in the OUTBOUND history is invalid. The API
+  // rejects it with, e.g.:
+  //
+  //   400 invalid_request_error
+  //   "messages.565.content.0.thinking: each thinking block must contain
+  //    thinking"
+  //
+  // How a thinking block ends up in our history despite thinking being off:
+  //   - The live loop pushes the SDK's `response.content` verbatim into the
+  //     message array (agent.ts) and persists it to JSONL. If the model ever
+  //     returns a thinking (or redacted_thinking) block — including an EMPTY
+  //     one from a partial/interrupted stream assembly — it gets re-sent on
+  //     the next API call and trips the 400. The empty-thinking variant is
+  //     exactly what "each thinking block must contain thinking" means.
+  //   - Imported Claude Code sessions were recorded WITH extended thinking,
+  //     so their JSONL is full of thinking blocks. (loadMessagesFromJsonl
+  //     already strips these, but stripping here too makes every path safe
+  //     and keeps the invariant in one obvious place.)
+  //
+  // This pass is idempotent and runs before everything else so later passes
+  // (tool pairing, alternation) operate on clean content. Assistant messages
+  // whose ONLY block was a thinking block become empty and are dropped here;
+  // pass 3's same-role-merge + tail-fixup handle any resulting adjacency.
+  {
+    let strippedAny = false;
+    const deThunk = messages.map((m) => {
+      if (typeof m.content === 'string') return m;
+      if (!Array.isArray(m.content)) return m;
+      const kept = m.content.filter(
+        (b: any) => b?.type !== 'thinking' && b?.type !== 'redacted_thinking'
+      );
+      if (kept.length !== m.content.length) {
+        strippedAny = true;
+        return { ...m, content: kept as any };
+      }
+      return m;
+    });
+    if (strippedAny) {
+      // Drop messages emptied by the strip so we don't emit a zero-block
+      // content array (the API rejects empty content too).
+      messages = deThunk.filter((m) => {
+        if (typeof m.content === 'string') return true;
+        return Array.isArray(m.content) && m.content.length > 0;
+      });
+      log.warn('[sessionRuntime] stripped thinking/redacted_thinking block(s) from outbound history');
+      if (messages.length === 0) return messages;
+    }
+  }
+
   // -- Pass 0: drop tool_use blocks for tools that no longer exist -----------
   // Real-world failure: MCP servers sometimes get keyed by random UUIDs in
   // older sessions (e.g. imported Claude Code transcripts where the slack
@@ -403,6 +454,27 @@ export function sanitizeMessages(
   }
 
   return pass3;
+}
+
+/**
+ * Strip `thinking` / `redacted_thinking` blocks from a single assistant
+ * `content` value. Used at the point where the live agent loop pushes the
+ * SDK's `response.content` into the running message array AND persists it
+ * to JSONL — so neither the in-memory history nor the on-disk transcript
+ * ever carries a thinking block (we don't enable extended thinking, so any
+ * thinking block is invalid to re-send; see Pass -1 in `sanitizeMessages`).
+ *
+ * Accepts the raw SDK content (string or block array) and returns the same
+ * shape minus thinking blocks. A string passes through unchanged. If every
+ * block was a thinking block, returns an empty array (callers/`sanitize`
+ * drop empty messages).
+ */
+export function stripThinkingBlocks(content: unknown): unknown {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content;
+  return content.filter(
+    (b: any) => b?.type !== 'thinking' && b?.type !== 'redacted_thinking'
+  );
 }
 
 /**

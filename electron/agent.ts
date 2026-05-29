@@ -20,6 +20,7 @@ import {
   ourJsonlPath,
   platformShortName,
   sanitizeMessages,
+  stripThinkingBlocks,
 } from './sessionRuntime';
 import {
   executeTool,
@@ -1348,6 +1349,16 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
 
       stopReason = response.stop_reason;
 
+      // Strip any thinking / redacted_thinking blocks from the model's
+      // content BEFORE we persist it or push it back into the running
+      // history. We don't enable extended thinking, so a thinking block in
+      // the outbound history is invalid and the API rejects it with
+      // "each thinking block must contain thinking" (especially the empty
+      // variant from a partial stream). `sanitizeMessages` strips these at
+      // send time too (Pass -1) as a backstop, but doing it here keeps the
+      // JSONL transcript + in-memory array clean in the first place.
+      const persistedContent = stripThinkingBlocks(response.content);
+
       // Persist assistant message + usage
       appendJsonlEvent(ourPath, {
         type: 'assistant',
@@ -1357,7 +1368,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         message: {
           role: 'assistant',
           model: response.model,
-          content: response.content,
+          content: persistedContent,
           usage: response.usage,
           stop_reason: response.stop_reason,
         },
@@ -1401,10 +1412,12 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         usage: response.usage,
       });
 
-      // Append assistant to messages
-      messages.push({ role: 'assistant', content: response.content });
+      // Append assistant to messages (thinking blocks already stripped).
+      messages.push({ role: 'assistant', content: persistedContent as any });
 
-      // Check for tool_use blocks
+      // Check for tool_use blocks. Read from the original response.content
+      // (thinking blocks were never tool_use, so the filter result is
+      // identical, and this avoids depending on the stripped shape).
       const toolUses = response.content.filter(
         (b: any) => b.type === 'tool_use'
       ) as Anthropic.ToolUseBlock[];
