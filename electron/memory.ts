@@ -21,6 +21,7 @@ import {
   readdirSync,
   statSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -33,8 +34,78 @@ import log from 'electron-log';
 // Memory contents are prompt-cached after the first turn, so per-turn cost
 // stays low even at this size.
 const MAX_TOTAL_MEMORY_BYTES = 256 * 1024;
-// Cap one giant leaf so it can't eat the whole budget by itself.
+// Cap one giant leaf so it can't eat the whole budget by itself. Applies to
+// pinned leaves (which are uncapped in spirit but still get a sanity ceiling)
+// and to Claude imports.
 const MAX_PER_FILE_BYTES = 64 * 1024;
+// Tighter per-file cap for non-pinned Guy leaves (normal + archived). A
+// single 64KB per-task state dump used to evict ~15-20 small permanent
+// rules; 16KB means even a runaway leaf can't starve the budget, and it
+// nudges toward consolidating finished sagas into short outcomes.
+const NONPINNED_PER_FILE_BYTES = 16 * 1024;
+// A non-pinned Guy leaf untouched for longer than this is treated as
+// archived (lowest load priority) even if its frontmatter doesn't say so.
+// Editing the leaf refreshes its mtime, which automatically promotes it
+// back to `normal` — that's how "unarchive on write" works for free.
+const STALE_ARCHIVE_DAYS = 14;
+
+/**
+ * Memory load tiers. Higher tiers load first and are harder to evict.
+ *   - pinned:   permanent always-applies rules (conventions, safety rules,
+ *               durable workflow). Always loaded first; never auto-archived;
+ *               not subject to the tight non-pinned per-file cap.
+ *   - normal:   active / recent task state. Loaded after pinned, newest
+ *               first, until the budget runs out.
+ *   - archived: completed-task state. Loaded last (only if budget remains),
+ *               but kept on disk and fully searchable via recall_memory.
+ */
+export type MemoryTier = 'pinned' | 'normal' | 'archived';
+
+/**
+ * Read the EXPLICIT tier from a leaf's frontmatter `priority:` field, if
+ * present. Returns null when the file has no frontmatter or no priority
+ * line (the common case for older leaves) — callers then fall back to the
+ * staleness rule. Tolerant of unreadable / malformed files.
+ */
+export function readExplicitTier(path: string): MemoryTier | null {
+  try {
+    const text = readFileSync(path, 'utf8');
+    if (!text.startsWith('---')) return null;
+    const end = text.indexOf('\n---', 3);
+    if (end === -1) return null;
+    const fm = text.slice(3, end);
+    const raw = /^\s*priority:\s*(.*)$/m.exec(fm)?.[1]?.trim()?.toLowerCase();
+    if (raw === 'pinned' || raw === 'normal' || raw === 'archived') return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compute the EFFECTIVE tier of a Guy-owned leaf at load time, combining the
+ * explicit frontmatter tier with the staleness rule. No file writes happen
+ * here — auto-archive is a pure computation, so it never churns the mtime it
+ * depends on.
+ *
+ *   pinned    → if frontmatter says pinned (sticky; staleness never demotes).
+ *   archived  → if frontmatter says archived, OR (not pinned AND the leaf is
+ *               older than STALE_ARCHIVE_DAYS).
+ *   normal    → otherwise.
+ */
+export function getEffectiveTier(path: string, mtimeMs: number): MemoryTier {
+  const explicit = readExplicitTier(path);
+  if (explicit === 'pinned') return 'pinned';
+  if (explicit === 'archived') return 'archived';
+  const ageDays = (Date.now() - mtimeMs) / (1000 * 60 * 60 * 24);
+  if (ageDays > STALE_ARCHIVE_DAYS) return 'archived';
+  return 'normal';
+}
+
+/** Numeric rank for sorting: pinned(0) loads before normal(1) before archived(2). */
+function tierRank(t: MemoryTier): number {
+  return t === 'pinned' ? 0 : t === 'normal' ? 1 : 2;
+}
 
 export interface MemoryBundle {
   /** Concatenated, ready to drop into a system block. May be empty. */
@@ -222,12 +293,13 @@ export function loadMemory(args: {
   let total = 0;
   let truncated = 0;
 
-  // Helper: include a single file with the running cap.
-  const include = (p: string) => {
+  // Helper: include a single file with the running cap. `perFileCap` lets
+  // callers apply a tighter ceiling to non-pinned Guy leaves.
+  const include = (p: string, perFileCap = MAX_PER_FILE_BYTES) => {
     if (sources.includes(p)) return;
     const remaining = MAX_TOTAL_MEMORY_BYTES - total;
     if (remaining <= 0) return;
-    const cap = Math.min(MAX_PER_FILE_BYTES, remaining);
+    const cap = Math.min(perFileCap, remaining);
     const { text, truncated: t } = readCapped(p, cap);
     if (!text) return;
     sources.push(p);
@@ -236,13 +308,42 @@ export function loadMemory(args: {
     truncated += t;
   };
 
-  // 0a. Guy-owned global memory (writable). Loaded first so it wins under cap.
-  for (const p of listMdFiles(guyGlobalMemoryDir())) include(p);
-
-  // 0b. Guy-owned per-project memory. Always loaded if the projectId has any
-  // (works for cwd-bound AND cwd-less Guy sessions — the projectId is stable).
-  if (projectId) {
-    for (const p of listMdFiles(guyProjectMemoryDir(projectId))) include(p);
+  // 0. Guy-owned memory (writable), loaded FIRST so it wins the budget over
+  // the read-only Claude imports. Within the Guy tree we load by TIER, not by
+  // filename: pinned rules first (always, uncapped-ish), then normal task
+  // state newest-first, then archived completed-task state last. This is the
+  // fix for the eviction bug where small permanent rules (worktree workflow,
+  // never-* rules, release workflow) lost the alphabetical lottery to large
+  // dead per-task state dumps and never reached the model's context.
+  {
+    const guyPaths: string[] = [
+      ...listMdFiles(guyGlobalMemoryDir()),
+      ...(projectId ? listMdFiles(guyProjectMemoryDir(projectId)) : []),
+    ];
+    // Stat once; compute effective tier from frontmatter + staleness.
+    const entries = guyPaths
+      .map((p) => {
+        try {
+          const st = statSync(p);
+          return { path: p, mtime: st.mtimeMs, tier: getEffectiveTier(p, st.mtimeMs) };
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is { path: string; mtime: number; tier: MemoryTier } => e !== null);
+    // Sort: tier rank asc (pinned→normal→archived), then mtime desc (newest
+    // first within a tier). Pinned therefore always precedes everything and
+    // is included before the budget can be consumed by anything else.
+    entries.sort((a, b) => {
+      const r = tierRank(a.tier) - tierRank(b.tier);
+      if (r !== 0) return r;
+      return b.mtime - a.mtime;
+    });
+    for (const e of entries) {
+      const perFileCap =
+        e.tier === 'pinned' ? MAX_PER_FILE_BYTES : NONPINNED_PER_FILE_BYTES;
+      include(e.path, perFileCap);
+    }
   }
 
   // 1. Project-level CLAUDE.md (walked from cwd up). Only if cwd is real.
@@ -340,6 +441,34 @@ export interface SaveMemoryResult {
 }
 
 /**
+ * Insert or update a `priority:` line inside a leaf's YAML frontmatter,
+ * returning the new full text. If the content has no frontmatter block, one
+ * is created with just the priority line. Preserves all existing frontmatter
+ * keys and the body verbatim. Used by saveMemory (when a priority arg is
+ * passed) and by setMemoryPriority.
+ */
+export function upsertPriorityFrontmatter(content: string, priority: MemoryTier): string {
+  if (content.startsWith('---')) {
+    const end = content.indexOf('\n---', 3);
+    if (end !== -1) {
+      const fm = content.slice(3, end); // between the opening --- and closing ---
+      const rest = content.slice(end); // starts at "\n---"
+      let newFm: string;
+      if (/^[ \t]*priority:[ \t]*.*$/m.test(fm)) {
+        newFm = fm.replace(/^[ \t]*priority:[ \t]*.*$/m, `priority: ${priority}`);
+      } else {
+        // Append the priority line at the end of the existing frontmatter.
+        newFm = `${fm.replace(/\s*$/, '')}\npriority: ${priority}\n`;
+      }
+      return `---${newFm}${rest}`;
+    }
+    // Malformed frontmatter (opening --- but no close): fall through and
+    // prepend a fresh block so we never corrupt the file further.
+  }
+  return `---\npriority: ${priority}\n---\n\n${content}`;
+}
+
+/**
  * Persist a memory leaf under Guy's writable tree. Scope chooses the target:
  *   - 'global'  → ~/.guycode/memory/<key>.md
  *   - 'project' → ~/.guycode/projects/<projectId>/memory/<key>.md
@@ -356,8 +485,14 @@ export function saveMemory(args: {
   content: string;
   mode?: 'replace' | 'append';
   projectId?: string;
+  /**
+   * Optional load tier. When omitted on a REPLACE of an existing leaf, the
+   * leaf's current explicit tier (if any) is preserved. When omitted on a
+   * new leaf, the leaf defaults to `normal` (no frontmatter written).
+   */
+  priority?: MemoryTier;
 }): SaveMemoryResult {
-  const { scope, content, mode = 'replace', projectId } = args;
+  const { scope, content, mode = 'replace', projectId, priority } = args;
   const key = sanitizeKey(args.key);
   if (!key) return { ok: false, error: 'invalid key (must contain letters/digits)' };
   if (typeof content !== 'string' || !content.trim()) {
@@ -403,12 +538,25 @@ export function saveMemory(args: {
       const existing = readFileSync(path, 'utf8');
       const stamp = new Date().toISOString();
       final = `${existing.trimEnd()}\n\n---\n<!-- appended ${stamp} -->\n${content}`;
-      if (final.length > MAX_MEMORY_WRITE_BYTES) {
-        return {
-          ok: false,
-          error: `appended file would exceed limit (${final.length} > ${MAX_MEMORY_WRITE_BYTES} bytes)`,
-        };
-      }
+    }
+    // Resolve the tier to stamp. Explicit arg wins. Otherwise, on a replace/
+    // append of an existing leaf, preserve whatever explicit tier it already
+    // had (so editing a pinned rule keeps it pinned without re-passing the
+    // arg). A brand-new leaf with no arg gets no frontmatter (defaults to
+    // `normal` via the loader's staleness logic).
+    const tierToStamp: MemoryTier | null =
+      priority ?? (existsSync(path) ? readExplicitTier(path) : null);
+    if (tierToStamp) {
+      // For append mode we just appended to `existing` which may already have
+      // frontmatter; upsert handles both the has-frontmatter and no-frontmatter
+      // cases idempotently.
+      final = upsertPriorityFrontmatter(final, tierToStamp);
+    }
+    if (final.length > MAX_MEMORY_WRITE_BYTES) {
+      return {
+        ok: false,
+        error: `file would exceed limit (${final.length} > ${MAX_MEMORY_WRITE_BYTES} bytes)`,
+      };
     }
     writeFileSync(path, final, 'utf8');
     log.info(`[memory] saved ${scope} memory ${key} (${final.length}b) -> ${path}`);
@@ -418,35 +566,116 @@ export function saveMemory(args: {
   }
 }
 
+export interface SetPriorityResult {
+  ok: boolean;
+  path?: string;
+  priority?: MemoryTier;
+  error?: string;
+}
+
+/**
+ * Set the explicit load tier of an existing Guy-owned leaf by upserting its
+ * frontmatter `priority:` line. This is the manual pin / archive / unarchive
+ * control (the automatic side is the staleness rule in getEffectiveTier).
+ *
+ * Preserves the file's mtime so that toggling tier does NOT reset the
+ * staleness clock — important when un-archiving: a leaf set back to `normal`
+ * keeps its true age, so if it's still old the staleness rule can re-archive
+ * it, and if it was recently worked on it stays active. (Editing CONTENT via
+ * saveMemory is the thing that legitimately refreshes mtime / unarchives.)
+ *
+ * Refuses to write under ~/.claude (read-only import tree).
+ */
+export function setMemoryPriority(args: {
+  scope: 'global' | 'project';
+  key: string;
+  priority: MemoryTier;
+  projectId?: string;
+}): SetPriorityResult {
+  const { scope, priority, projectId } = args;
+  const key = sanitizeKey(args.key);
+  if (!key) return { ok: false, error: 'invalid key' };
+  if (priority !== 'pinned' && priority !== 'normal' && priority !== 'archived') {
+    return { ok: false, error: `invalid priority '${priority}'` };
+  }
+  const dir = scope === 'global' ? guyGlobalMemoryDir() : guyProjectMemoryDir(projectId ?? '');
+  if (scope === 'project' && (!projectId || !projectId.trim())) {
+    return { ok: false, error: 'project scope requires a non-empty projectId' };
+  }
+  const path = join(dir, `${key}.md`);
+  if (resolvePath(path).startsWith(resolvePath(join(homedir(), '.claude')))) {
+    return { ok: false, error: 'refusing to write under ~/.claude (read-only import)' };
+  }
+  if (!existsSync(path)) return { ok: false, error: `no such memory leaf: ${key}` };
+  try {
+    const original = readFileSync(path, 'utf8');
+    const updated = upsertPriorityFrontmatter(original, priority);
+    if (updated === original) {
+      return { ok: true, path, priority }; // already at that tier
+    }
+    // Preserve mtime so changing tier doesn't lie about staleness.
+    let prevMtime: Date | null = null;
+    try {
+      prevMtime = statSync(path).mtime;
+    } catch {
+      /* ignore */
+    }
+    writeFileSync(path, updated, 'utf8');
+    if (prevMtime) {
+      try {
+        utimesSync(path, prevMtime, prevMtime);
+      } catch {
+        /* best-effort */
+      }
+    }
+    log.info(`[memory] set priority of ${scope} memory ${key} -> ${priority}`);
+    return { ok: true, path, priority };
+  } catch (e: any) {
+    return { ok: false, error: `write failed: ${e?.message ?? e}` };
+  }
+}
+
 /**
  * Enumerate Guy-owned memory leaves for a scope. Returns absolute paths,
- * sizes, and last-modified timestamps for display in the memory tool's
- * `list` mode.
+ * sizes, last-modified timestamps, and effective/explicit tier for display
+ * in the memory tool's `list` mode.
  */
+export interface GuyMemoryRow {
+  path: string;
+  scope: 'global' | 'project';
+  bytes: number;
+  mtime: number;
+  /** Effective tier the loader will use (explicit frontmatter + staleness). */
+  tier: MemoryTier;
+  /** Explicit frontmatter tier, or null if it relies on staleness/default. */
+  explicitTier: MemoryTier | null;
+}
+
 export function listGuyMemory(args: {
   scope: 'global' | 'project' | 'all';
   projectId?: string;
-}): { path: string; scope: 'global' | 'project'; bytes: number; mtime: number }[] {
-  const out: { path: string; scope: 'global' | 'project'; bytes: number; mtime: number }[] = [];
-  if (args.scope === 'global' || args.scope === 'all') {
-    for (const p of listMdFiles(guyGlobalMemoryDir())) {
-      try {
-        const st = statSync(p);
-        out.push({ path: p, scope: 'global', bytes: st.size, mtime: st.mtimeMs });
-      } catch {
-        /* ignore */
-      }
+}): GuyMemoryRow[] {
+  const out: GuyMemoryRow[] = [];
+  const push = (p: string, scope: 'global' | 'project') => {
+    try {
+      const st = statSync(p);
+      out.push({
+        path: p,
+        scope,
+        bytes: st.size,
+        mtime: st.mtimeMs,
+        tier: getEffectiveTier(p, st.mtimeMs),
+        explicitTier: readExplicitTier(p),
+      });
+    } catch {
+      /* ignore */
     }
+  };
+  if (args.scope === 'global' || args.scope === 'all') {
+    for (const p of listMdFiles(guyGlobalMemoryDir())) push(p, 'global');
   }
   if ((args.scope === 'project' || args.scope === 'all') && args.projectId) {
-    for (const p of listMdFiles(guyProjectMemoryDir(args.projectId))) {
-      try {
-        const st = statSync(p);
-        out.push({ path: p, scope: 'project', bytes: st.size, mtime: st.mtimeMs });
-      } catch {
-        /* ignore */
-      }
-    }
+    for (const p of listMdFiles(guyProjectMemoryDir(args.projectId))) push(p, 'project');
   }
   return out;
 }
@@ -591,6 +820,71 @@ export function recallFromBundle(
       }
     }
     if (out.length >= maxResults) break;
+  }
+  return out.length === 0 ? `(no matches for "${query}")` : out.join('\n\n---\n\n');
+}
+
+/**
+ * Search ALL memory leaves ON DISK for a substring, NOT just the ones that
+ * fit in the session-load bundle. This is what makes archived (and otherwise
+ * evicted-by-budget) content findable: recall must see the full tree, or the
+ * whole point of "archived is still searchable" fails.
+ *
+ * Scans every Guy-owned leaf (global + this project) regardless of tier, plus
+ * the Claude-import leaves the loader would consider, reads each from disk,
+ * and returns matching paragraphs tagged with their source path and tier.
+ * Bounded by design — the whole tree is on the order of a couple MB.
+ */
+export function recallFromDisk(args: {
+  cwd: string;
+  projectId?: string;
+  query: string;
+  maxResults?: number;
+}): string {
+  const { cwd, projectId, query } = args;
+  const maxResults = args.maxResults ?? 8;
+  if (!query.trim()) return '(empty query)';
+  const q = query.toLowerCase();
+
+  // Collect candidate paths: all Guy leaves (every tier) + Claude leaves.
+  const guyPaths = [
+    ...listMdFiles(guyGlobalMemoryDir()),
+    ...(projectId ? listMdFiles(guyProjectMemoryDir(projectId)) : []),
+  ];
+  const claudePaths = listClaudeMemory({ cwd, projectId }).map((r) => r.path);
+  // Search Guy leaves first (writable, usually more task-relevant), then Claude.
+  const all = [...guyPaths, ...claudePaths];
+
+  const out: string[] = [];
+  for (const p of all) {
+    if (out.length >= maxResults) break;
+    let text: string;
+    try {
+      text = readFileSync(p, 'utf8');
+    } catch {
+      continue;
+    }
+    if (!text.toLowerCase().includes(q)) continue;
+    // Annotate Guy leaves with their effective tier so the caller can see
+    // when a hit comes from archived state.
+    let tierTag = '';
+    try {
+      if (guyPaths.includes(p)) {
+        const st = statSync(p);
+        tierTag = ` [${getEffectiveTier(p, st.mtimeMs)}]`;
+      } else {
+        tierTag = ' [claude-import]';
+      }
+    } catch {
+      /* ignore */
+    }
+    const paras = text.split(/\n{2,}/);
+    for (const para of paras) {
+      if (para.toLowerCase().includes(q)) {
+        out.push(`<<< ${p}${tierTag} >>>\n${para.trim()}`);
+        if (out.length >= maxResults) break;
+      }
+    }
   }
   return out.length === 0 ? `(no matches for "${query}")` : out.join('\n\n---\n\n');
 }

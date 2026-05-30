@@ -19,13 +19,14 @@ import log from 'electron-log';
 import { setSessionState, setSessionWakeAt } from './db';
 import {
   listClaudeSkills,
-  recallFromBundle,
+  recallFromDisk,
   saveMemory,
+  setMemoryPriority,
   listGuyMemory,
   listClaudeMemory,
   deleteGuyMemory,
 } from './memory';
-import type { MemoryBundle } from './memory';
+import type { MemoryBundle, MemoryTier } from './memory';
 import { broadcastStateChanged } from './agentEvents';
 import { getMcpToolSchemas, invokeMcpTool } from './mcp';
 import { loadMessagesWithTsFromJsonl, ourJsonlPath } from './sessionRuntime';
@@ -1215,7 +1216,7 @@ const RECALL_MEMORY: ToolDef = {
   schema: {
     name: 'recall_memory',
     description:
-      'Search ALL memory loaded at session start — both Guy-owned writable leaves (~/.guycode) AND read-only imported Claude memory (~/.claude CLAUDE.md / reference_* / feedback_* / project_* leaves) — for a substring. Returns matching paragraphs with their source path. Use this to look something up (a convention, a prior decision, a checklist trigger like "hardening") without re-quoting the whole tree. Note: matches only content that fit under the session load cap; to enumerate every available leaf (including ones too large to fully load), use list_memory and then Read the path.',
+      'Search ALL memory ON DISK — both Guy-owned writable leaves (~/.guycode, EVERY tier including archived/completed-task state) AND read-only imported Claude memory (~/.claude CLAUDE.md / reference_* / feedback_* / project_* leaves) — for a substring. Returns matching paragraphs with their source path and (for Guy leaves) their tier. Unlike the session-start load (which is budget-capped and tiered), this reads the full tree, so archived and otherwise-evicted content is still findable. Use it to look something up (a convention, a prior decision, a checklist trigger like "hardening", or details from a finished task) without re-quoting the whole tree.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1226,8 +1227,12 @@ const RECALL_MEMORY: ToolDef = {
     },
   },
   async execute(input, ctx) {
-    if (!ctx.memory) return '(no memory loaded for this session)';
-    return recallFromBundle(ctx.memory, String(input.query), input.max_results ?? 8);
+    return recallFromDisk({
+      cwd: ctx.cwd,
+      projectId: ctx.projectId,
+      query: String(input.query),
+      maxResults: input.max_results ?? 8,
+    });
   },
 };
 
@@ -1266,18 +1271,29 @@ const SAVE_MEMORY: ToolDef = {
           enum: ['replace', 'append'],
           description: "Default 'replace'. Use 'append' to add a timestamped section to an existing leaf.",
         },
+        priority: {
+          type: 'string',
+          enum: ['pinned', 'normal', 'archived'],
+          description:
+            "Load tier. 'pinned' = a permanent always-applies rule/convention that must ALWAYS load at session start (use sparingly, for durable rules). 'normal' (default) = active task state. 'archived' = completed-task state kept for reference but loaded last. Omit to leave an existing leaf's tier unchanged (or default a new leaf to normal). Non-pinned leaves auto-archive after ~14 days untouched; editing a leaf un-archives it.",
+        },
       },
       required: ['scope', 'key', 'content'],
     },
   },
   async execute(input, ctx) {
     const scope = String(input.scope) as 'global' | 'project';
+    const priority =
+      input.priority === 'pinned' || input.priority === 'normal' || input.priority === 'archived'
+        ? (input.priority as MemoryTier)
+        : undefined;
     const r = saveMemory({
       scope,
       key: String(input.key),
       content: String(input.content ?? ''),
       mode: input.mode === 'append' ? 'append' : 'replace',
       projectId: ctx.projectId,
+      priority,
     });
     if (!r.ok) return `error: ${r.error}`;
     return `Saved ${scope} memory (${r.bytes}b) at ${r.path}. Will be loaded into context at the start of every future session.`;
@@ -1315,14 +1331,35 @@ const LIST_MEMORY: ToolDef = {
         scope === 'global' ? 'global' : scope === 'project' ? 'project' : 'all';
       const rows = listGuyMemory({ scope: guyScope, projectId: ctx.projectId });
       if (rows.length > 0) {
+        // Group by tier so the model can see at a glance what's pinned
+        // (always loads), what's normal (active), and what's archived
+        // (completed; loads last but still recall-searchable).
+        const order: MemoryTier[] = ['pinned', 'normal', 'archived'];
+        const byTier = order
+          .map((tier) => ({ tier, items: rows.filter((r) => r.tier === tier) }))
+          .filter((g) => g.items.length > 0);
+        const body = byTier
+          .map(({ tier, items }) => {
+            const lines = items
+              .sort((a, b) => b.mtime - a.mtime)
+              .map((r) => {
+                // Mark whether the tier is explicit (frontmatter) or
+                // auto-derived (staleness) so archive surprises are legible.
+                const how =
+                  r.explicitTier === tier
+                    ? ''
+                    : tier === 'archived'
+                      ? ' (auto: stale >14d)'
+                      : '';
+                return `    [${r.scope}] ${r.path}\n        ${r.bytes}b · modified ${new Date(r.mtime).toISOString()}${how}`;
+              })
+              .join('\n');
+            return `  ${tier.toUpperCase()} (${items.length}):\n${lines}`;
+          })
+          .join('\n');
         sections.push(
-          'WRITABLE (Guy-owned, ~/.guycode — save_memory / delete_memory work here):\n' +
-            rows
-              .map(
-                (r) =>
-                  `  [${r.scope}] ${r.path}\n      ${r.bytes}b, last modified ${new Date(r.mtime).toISOString()}`
-              )
-              .join('\n')
+          'WRITABLE (Guy-owned, ~/.guycode — save_memory / delete_memory / set_memory_priority work here):\n' +
+            body
         );
       }
     }
@@ -1381,6 +1418,36 @@ const DELETE_MEMORY: ToolDef = {
       projectId: ctx.projectId,
     });
     return r.ok ? `Deleted ${scope} memory "${input.key}".` : `error: ${r.error}`;
+  },
+};
+
+const SET_MEMORY_PRIORITY: ToolDef = {
+  schema: {
+    name: 'set_memory_priority',
+    description:
+      "Set the load tier of an existing Guy-owned memory leaf. Tiers: 'pinned' (a permanent always-applies rule that must ALWAYS load at session start — use sparingly), 'normal' (active task state, the default), 'archived' (completed-task state kept for reference but loaded last; still searchable via recall_memory). Use this to PIN a durable rule so it can never be evicted by the session-load budget, to ARCHIVE a finished task's state so it stops crowding the budget, or to UNARCHIVE one. Non-pinned leaves also auto-archive after ~14 days untouched. Only works under ~/.guycode (Claude imports are read-only).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['global', 'project'] },
+        key: { type: 'string', description: 'Same key you used when saving.' },
+        priority: { type: 'string', enum: ['pinned', 'normal', 'archived'] },
+      },
+      required: ['scope', 'key', 'priority'],
+    },
+  },
+  async execute(input, ctx) {
+    const scope = String(input.scope) as 'global' | 'project';
+    const priority = String(input.priority) as MemoryTier;
+    const r = setMemoryPriority({
+      scope,
+      key: String(input.key),
+      priority,
+      projectId: ctx.projectId,
+    });
+    return r.ok
+      ? `Set ${scope} memory "${input.key}" to ${priority}.`
+      : `error: ${r.error}`;
   },
 };
 
@@ -2257,6 +2324,7 @@ export const TOOLS: Record<string, ToolDef> = {
   save_memory: SAVE_MEMORY,
   list_memory: LIST_MEMORY,
   delete_memory: DELETE_MEMORY,
+  set_memory_priority: SET_MEMORY_PRIORITY,
   list_skills: LIST_SKILLS,
   read_skill: READ_SKILL,
   Skill: SKILL_TOOL,
