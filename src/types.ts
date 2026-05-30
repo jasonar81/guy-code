@@ -255,6 +255,14 @@ export type AgentEvent =
       messageCount: number;
     }
   | { type: 'response_started'; sessionId: string; latencyMs: number }
+  | {
+      type: 'transient_retry';
+      sessionId: string;
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      message: string;
+    }
   | { type: 'error'; sessionId: string; message: string };
 
 export interface AuditEventRow {

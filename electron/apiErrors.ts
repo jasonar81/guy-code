@@ -44,7 +44,14 @@
  */
 export interface ClassifiedApiError {
   /** A short category label, mostly for logging / future telemetry. */
-  category: 'upstream-5xx' | 'auth' | 'rate-limit' | 'bad-request' | 'unknown';
+  category:
+    | 'upstream-5xx'
+    | 'overloaded'
+    | 'connection'
+    | 'auth'
+    | 'rate-limit'
+    | 'bad-request'
+    | 'unknown';
   /**
    * `true` when retrying the same request later is likely to succeed.
    * `false` when the user needs to do something (fix their key, shrink
@@ -117,6 +124,89 @@ export function is5xxError(e: unknown): boolean {
 }
 
 /**
+ * `overloaded_error` — Anthropic returns HTTP 529 with a body of
+ * `{"type":"overloaded_error","message":"Overloaded"}` when the service
+ * is shedding load. This is the single most common transient error in
+ * practice and is ALWAYS worth retrying. We match it three ways because
+ * it can arrive as a structured APIError (status 529), as an SDK error
+ * whose `.error.type` is `overloaded_error`, or as a bare message string.
+ */
+export function isOverloadedError(e: unknown): boolean {
+  if (statusOf(e) === 529) return true;
+  if (e && typeof e === 'object') {
+    const r = e as Record<string, unknown>;
+    // SDK shape: e.error = { type: 'overloaded_error', ... }
+    const inner = r.error;
+    if (inner && typeof inner === 'object') {
+      const t = (inner as Record<string, unknown>).type;
+      if (typeof t === 'string' && /overloaded/i.test(t)) return true;
+    }
+    // Some shapes carry the type at the top level.
+    if (typeof r.type === 'string' && /overloaded/i.test(r.type)) return true;
+  }
+  return /overloaded/i.test(messageOf(e));
+}
+
+/**
+ * Connection / network-layer failures: the request never got a clean HTTP
+ * response. The Anthropic SDK throws `APIConnectionError` /
+ * `APIConnectionTimeoutError` for these; the underlying fetch/undici layer
+ * surfaces `ECONNRESET`, `ETIMEDOUT`, `fetch failed`, `socket hang up`,
+ * `terminated`, etc. All are transient and worth retrying.
+ */
+export function isConnectionError(e: unknown): boolean {
+  if (e && typeof e === 'object') {
+    const name = (e as Record<string, unknown>).name;
+    if (
+      typeof name === 'string' &&
+      /APIConnection(Timeout)?Error|FetchError|AbortError/i.test(name)
+    ) {
+      // NB: a *user-initiated* AbortError is handled separately upstream
+      // (we rethrow it before reaching the transient path), so matching
+      // it here is harmless — it never reaches this check during a real
+      // cancel.
+      if (/APIConnection|FetchError/i.test(name)) return true;
+    }
+    // undici/node sometimes nest the OS error under `.cause.code`.
+    const cause = (e as Record<string, unknown>).cause;
+    if (cause && typeof cause === 'object') {
+      const code = (cause as Record<string, unknown>).code;
+      if (typeof code === 'string' && /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|EPIPE/i.test(code)) {
+        return true;
+      }
+    }
+  }
+  const m = messageOf(e);
+  return /\b(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|EPIPE|fetch failed|socket hang up|network (?:error|timeout)|connection (?:error|reset|closed|timeout)|terminated)\b/i.test(
+    m
+  );
+}
+
+/**
+ * Is this error worth retrying transparently (without bothering the user)?
+ * True for: 5xx upstream, 529 overloaded, 429 rate-limit, and connection /
+ * network failures. False for auth (401/403), bad-request (400), and
+ * anything we can't classify — those need the user to act, so retrying
+ * silently would just hang.
+ *
+ * This is the gate the agent's outer retry loop uses to decide whether to
+ * wait-and-retry vs. surface immediately.
+ */
+export function isTransientApiError(e: unknown): boolean {
+  if (e && typeof e === 'object' && (e as Record<string, unknown>).name === 'AbortError') {
+    // User cancel — never "transient" in the retry sense.
+    return false;
+  }
+  const status = statusOf(e);
+  if (status === 401 || status === 403 || status === 400) return false;
+  if (is5xxError(e)) return true;
+  if (isOverloadedError(e)) return true;
+  if (status === 429 || /\b429\b|rate\s*limit|too\s+many\s+requests/i.test(messageOf(e))) return true;
+  if (isConnectionError(e)) return true;
+  return false;
+}
+
+/**
  * Classify an error into a user-facing category. The returned
  * `message` is what the renderer should show — it's already
  * phrased as something the user can act on rather than as a raw
@@ -138,6 +228,22 @@ export function is5xxError(e: unknown): boolean {
 export function classifyApiError(e: unknown): ClassifiedApiError {
   const status = statusOf(e);
   const raw = messageOf(e).trim();
+
+  // Check overloaded (529) BEFORE the generic 5xx branch — 529 is in the
+  // 5xx range so is5xxError would otherwise swallow it into 'upstream-5xx'.
+  // Overloaded gets its own clearer copy and category.
+  if (isOverloadedError(e)) {
+    return {
+      category: 'overloaded',
+      transient: true,
+      status: status ?? 529,
+      message:
+        `Anthropic's API is overloaded (HTTP 529) and is temporarily shedding load. ` +
+        `This is transient and not a problem with your message or this app. ` +
+        `It usually clears within a few minutes. ` +
+        `If it persists, check https://status.anthropic.com/ for an active incident.`,
+    };
+  }
 
   if (is5xxError(e)) {
     const code = status ?? extractStatusFromMessage(raw) ?? 5;
@@ -172,6 +278,18 @@ export function classifyApiError(e: unknown): ClassifiedApiError {
       message:
         `Anthropic rate limit hit (HTTP 429). Wait 30 seconds and try again. ` +
         `If this happens repeatedly, your org's tier may need a usage cap raise on the Anthropic dashboard.`,
+    };
+  }
+
+  if (isConnectionError(e)) {
+    return {
+      category: 'connection',
+      transient: true,
+      status,
+      message:
+        `Couldn't reach Anthropic's API (network/connection error). ` +
+        `This is usually a transient local-network or upstream blip. ` +
+        `Check your internet connection and try again in a moment.`,
     };
   }
 

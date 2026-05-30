@@ -56,7 +56,12 @@ import {
 } from './attachments';
 import { extractOfficeText, type OfficeKind } from './office';
 import { rtfToText } from './rtf';
-import { classifyApiError } from './apiErrors';
+import { classifyApiError, isTransientApiError } from './apiErrors';
+import {
+  sleepUnlessAborted,
+  DEFAULT_TRANSIENT_RETRY_INTERVAL_MS,
+  DEFAULT_TRANSIENT_RETRY_MAX_ATTEMPTS,
+} from './transientRetry';
 import { maybeSummarize } from './toolSummarizer';
 import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
 import { renderActivePlanBlock } from './planManager';
@@ -141,6 +146,22 @@ export type AgentEvent =
       messageCount: number;
     }
   | { type: 'response_started'; sessionId: string; latencyMs: number }
+  /**
+   * A transient upstream failure (Anthropic 529 overloaded, 5xx, 429, or a
+   * connection blip) was caught and the agent is going to wait and retry
+   * rather than surface an error. The session stays in a working state —
+   * this is NOT an error event. The renderer shows a non-fatal "retrying"
+   * status so the user knows it's not hung. Only after `maxAttempts`
+   * consecutive failures does a real `error` event fire.
+   */
+  | {
+      type: 'transient_retry';
+      sessionId: string;
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      message: string;
+    }
   | { type: 'error'; sessionId: string; message: string };
 
 const activeRuns = new Map<string, AbortController>();
@@ -1185,6 +1206,16 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // original error so the outer catch can surface it cleanly.
       let response: Anthropic.Message;
       let promptTooLongAttempts = 0;
+      // Transient-error retry state. We retry overloaded (529) / 5xx / 429 /
+      // connection failures on a fixed cadence rather than surfacing them
+      // immediately, and only give up after a long run of CONSECUTIVE
+      // failures. The count resets on any success. Configurable via
+      // settings; defaults are ~once-a-minute up to ~15 attempts (~15 min).
+      let consecutiveTransient = 0;
+      const retryIntervalMs =
+        Number(getSetting('transient_retry_interval_ms')) || DEFAULT_TRANSIENT_RETRY_INTERVAL_MS;
+      const retryMaxAttempts =
+        Number(getSetting('transient_retry_max_attempts')) || DEFAULT_TRANSIENT_RETRY_MAX_ATTEMPTS;
       // eslint-disable-next-line no-constant-condition
       while (true) {
         try {
@@ -1271,11 +1302,63 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           }
         },
       });
+          consecutiveTransient = 0; // success — reset the transient run
           break; // success — exit retry loop
         } catch (err: any) {
           // AbortError: user cancelled mid-stream. Re-throw so the
           // outer catch handles it normally (no compaction recovery).
           if (err?.name === 'AbortError') throw err;
+          // Transient upstream failure (529 overloaded / 5xx / 429 /
+          // connection blip): wait and retry on a fixed cadence rather
+          // than aborting the turn. Only surface after a long run of
+          // consecutive failures. AbortError is handled above, so a user
+          // cancel still takes effect instantly; a cancel DURING the wait
+          // is caught by sleepUnlessAborted below.
+          if (isTransientApiError(err)) {
+            consecutiveTransient++;
+            if (consecutiveTransient >= retryMaxAttempts) {
+              log.error(
+                `[agent] transient API error persisted ${consecutiveTransient}x; surfacing to user`
+              );
+              throw err;
+            }
+            const cls = classifyApiError(err);
+            log.warn(
+              `[agent] transient API error (${cls.category}) attempt ${consecutiveTransient}/${retryMaxAttempts}; retrying in ${retryIntervalMs}ms`
+            );
+            onEv({
+              type: 'transient_retry',
+              sessionId,
+              attempt: consecutiveTransient,
+              maxAttempts: retryMaxAttempts,
+              delayMs: retryIntervalMs,
+              message: cls.message,
+            });
+            const slept = await sleepUnlessAborted(retryIntervalMs, ctrl.signal);
+            if (slept === 'aborted') {
+              const ab: any = new Error('aborted');
+              ab.name = 'AbortError';
+              throw ab;
+            }
+            // Reset stream-local state so the retry's awaiting/streaming
+            // UI semantics stay correct (mirrors the prompt-too-long path).
+            partials.clear();
+            pendingText = '';
+            firstEventAt = 0;
+            let estTok = 0;
+            try {
+              estTok = estimateTokens(messagesToSend);
+            } catch {
+              estTok = 0;
+            }
+            onEv({
+              type: 'awaiting_response',
+              sessionId,
+              estimatedInputTokens: estTok,
+              messageCount: messagesToSend.length,
+            });
+            continue;
+          }
           const ptl = isPromptTooLongError(err);
           if (!ptl.hit || promptTooLongAttempts >= 1) throw err;
           promptTooLongAttempts++;

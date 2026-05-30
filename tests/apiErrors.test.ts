@@ -13,7 +13,13 @@
  *     digits and must always include something the user can act on.
  */
 import { describe, expect, it } from 'vitest';
-import { classifyApiError, is5xxError } from '../electron/apiErrors';
+import {
+  classifyApiError,
+  is5xxError,
+  isOverloadedError,
+  isConnectionError,
+  isTransientApiError,
+} from '../electron/apiErrors';
 
 describe('is5xxError', () => {
   it('matches structured 5xx errors via status field', () => {
@@ -185,5 +191,96 @@ describe('classifyApiError — output contract', () => {
     expect(classifyApiError({ status: 401 }).transient).toBe(false);
     expect(classifyApiError({ status: 400 }).transient).toBe(false);
     expect(classifyApiError({ message: 'unknown' }).transient).toBe(false);
+  });
+});
+
+describe('isOverloadedError', () => {
+  it('matches HTTP 529', () => {
+    expect(isOverloadedError({ status: 529 })).toBe(true);
+  });
+  it('matches the SDK structured shape { error: { type: overloaded_error } }', () => {
+    expect(
+      isOverloadedError({ error: { type: 'overloaded_error', message: 'Overloaded' } })
+    ).toBe(true);
+  });
+  it('matches a top-level type field', () => {
+    expect(isOverloadedError({ type: 'overloaded_error' })).toBe(true);
+  });
+  it('matches a bare "Overloaded" message', () => {
+    expect(isOverloadedError({ message: 'Overloaded' })).toBe(true);
+  });
+  it('does not match unrelated errors', () => {
+    expect(isOverloadedError({ status: 400, message: 'bad request' })).toBe(false);
+    expect(isOverloadedError({ message: 'invalid x-api-key' })).toBe(false);
+  });
+});
+
+describe('isConnectionError', () => {
+  it('matches common network message forms', () => {
+    expect(isConnectionError({ message: 'fetch failed' })).toBe(true);
+    expect(isConnectionError({ message: 'socket hang up' })).toBe(true);
+    expect(isConnectionError({ message: 'request to https://api... failed, reason: ECONNRESET' })).toBe(true);
+    expect(isConnectionError({ message: 'Connection error.' })).toBe(true);
+  });
+  it('matches a nested cause.code', () => {
+    expect(isConnectionError({ message: 'x', cause: { code: 'ECONNRESET' } })).toBe(true);
+    expect(isConnectionError({ message: 'x', cause: { code: 'ETIMEDOUT' } })).toBe(true);
+    expect(isConnectionError({ message: 'x', cause: { code: 'ENOTFOUND' } })).toBe(true);
+  });
+  it('matches the SDK APIConnectionError by name', () => {
+    expect(isConnectionError({ name: 'APIConnectionError', message: 'Connection error.' })).toBe(true);
+    expect(isConnectionError({ name: 'APIConnectionTimeoutError', message: 'Request timed out.' })).toBe(true);
+  });
+  it('does not match HTTP-level errors', () => {
+    expect(isConnectionError({ status: 400, message: 'bad request' })).toBe(false);
+    expect(isConnectionError({ status: 500, message: 'server error' })).toBe(false);
+  });
+});
+
+describe('isTransientApiError', () => {
+  it('is true for overloaded / 5xx / 429 / connection', () => {
+    expect(isTransientApiError({ status: 529 })).toBe(true);
+    expect(isTransientApiError({ error: { type: 'overloaded_error' } })).toBe(true);
+    expect(isTransientApiError({ status: 500 })).toBe(true);
+    expect(isTransientApiError({ status: 503 })).toBe(true);
+    expect(isTransientApiError({ message: '500 status code (no body)' })).toBe(true);
+    expect(isTransientApiError({ status: 429 })).toBe(true);
+    expect(isTransientApiError({ message: 'rate limit exceeded' })).toBe(true);
+    expect(isTransientApiError({ message: 'fetch failed' })).toBe(true);
+    expect(isTransientApiError({ message: 'socket hang up' })).toBe(true);
+    expect(isTransientApiError({ cause: { code: 'ECONNRESET' } })).toBe(true);
+  });
+  it('is false for auth / bad-request / cancel / unknown', () => {
+    expect(isTransientApiError({ status: 400, message: 'invalid_request_error' })).toBe(false);
+    expect(isTransientApiError({ status: 401, message: 'invalid x-api-key' })).toBe(false);
+    expect(isTransientApiError({ status: 403, message: 'forbidden' })).toBe(false);
+    expect(isTransientApiError({ name: 'AbortError', message: 'aborted' })).toBe(false);
+    expect(isTransientApiError({ message: 'some unrecognized thing' })).toBe(false);
+  });
+  it('treats overloaded as transient even though 529 is in the 5xx range', () => {
+    // 529 should be caught (either by is5xx or isOverloaded); the point is
+    // it must be retryable.
+    expect(isTransientApiError({ status: 529, message: 'Overloaded' })).toBe(true);
+  });
+});
+
+describe('classifyApiError — overloaded + connection categories', () => {
+  it('classifies 529 as overloaded + transient', () => {
+    const c = classifyApiError({ status: 529, error: { type: 'overloaded_error', message: 'Overloaded' } });
+    expect(c.category).toBe('overloaded');
+    expect(c.transient).toBe(true);
+    expect(c.message).toMatch(/overloaded/i);
+    expect(c.message).not.toMatch(/^\s*5?29/);
+  });
+  it('classifies a bare Overloaded message as overloaded', () => {
+    const c = classifyApiError({ message: 'Overloaded' });
+    expect(c.category).toBe('overloaded');
+    expect(c.transient).toBe(true);
+  });
+  it('classifies a connection failure as connection + transient', () => {
+    const c = classifyApiError({ message: 'fetch failed' });
+    expect(c.category).toBe('connection');
+    expect(c.transient).toBe(true);
+    expect(c.message).toMatch(/connection|network|reach/i);
   });
 });

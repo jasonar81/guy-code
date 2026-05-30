@@ -326,6 +326,7 @@ export function Composer({ sessionId, visible }: Props) {
   const interruptTurn = useApp((s) => s.interruptTurn);
   const queuedCount = chat?.pendingInterrupts.length ?? 0;
   const awaiting = chat?.awaitingResponse ?? null;
+  const retryNotice = chat?.retryNotice ?? null;
   // Pull the matching session row so we can detect sleeping-budget state and
   // show the force-resume affordance only when it's actionable.
   const sessionRow = useApp((s) => s.sessions.find((r) => r.id === sessionId));
@@ -729,6 +730,19 @@ export function Composer({ sessionId, visible }: Props) {
             >
               <X size={10} />
             </button>
+          </span>
+        ) : retryNotice ? (
+          // A transient upstream failure (Anthropic 529 overloaded / 5xx /
+          // 429 / connection blip) is being retried on a fixed cadence.
+          // This is NOT an error — keep it amber/working, not red. We show
+          // the attempt counter so the user knows it's making progress
+          // toward giving up, not silently stuck.
+          <span
+            className="text-state-attention"
+            title={retryNotice.message}
+          >
+            ↻ retrying… (attempt {retryNotice.attempt}/{retryNotice.maxAttempts})
+            <span className="ml-1 text-text-dim">· Anthropic temporarily unavailable</span>
           </span>
         ) : awaiting ? (
           <span

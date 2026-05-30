@@ -43,6 +43,20 @@ interface SessionChat {
   pendingQuestion: { id: string; question: string } | null;
   /** Last error string, if any. */
   errorMessage: string | null;
+  /**
+   * Non-fatal "retrying a transient upstream failure" notice. Set when the
+   * agent emits `transient_retry` (Anthropic 529 overloaded / 5xx / 429 /
+   * connection blip) and is waiting to retry rather than surfacing an
+   * error. The session stays in a working state; the Composer shows this
+   * as an info line (not the red error banner). Cleared by
+   * `response_started`, `turn_done`, `error`, and `turn_start`.
+   */
+  retryNotice: {
+    attempt: number;
+    maxAttempts: number;
+    message: string;
+    at: number;
+  } | null;
   /** Cost accumulated during the most recent turn (resets on next turn_start). */
   liveTurnCostMicros: number;
   /** Whether we've loaded prior history at least once. */
@@ -91,6 +105,7 @@ const emptyChat = (): SessionChat => ({
   streaming: false,
   pendingQuestion: null,
   errorMessage: null,
+  retryNotice: null,
   liveTurnCostMicros: 0,
   loaded: false,
   pendingInterrupts: [],
@@ -753,6 +768,7 @@ export const useApp = create<AppState>((set, get) => ({
           next.streaming = true;
           next.pendingQuestion = null;
           next.errorMessage = null;
+          next.retryNotice = null;
           next.liveTurnCostMicros = 0;
           // Normally sendMessage() pre-appended the user message. But the
           // budget governor's auto-resume path skips that and goes straight
@@ -964,15 +980,30 @@ export const useApp = create<AppState>((set, get) => ({
           };
           break;
         }
+        case 'transient_retry': {
+          // Non-fatal: a transient upstream failure (529 overloaded / 5xx
+          // / 429 / connection) is being retried. Keep the session in its
+          // working state — do NOT set errorMessage or clear streaming.
+          next.retryNotice = {
+            attempt: e.attempt,
+            maxAttempts: e.maxAttempts,
+            message: e.message,
+            at: Date.now(),
+          };
+          next.errorMessage = null;
+          break;
+        }
         case 'response_started': {
           // First token / tool-use block landed — switch back to
           // normal streaming display.
           next.awaitingResponse = null;
+          next.retryNotice = null;
           break;
         }
         case 'turn_done': {
           next.streaming = false;
           next.awaitingResponse = null;
+          next.retryNotice = null;
           // mark last assistant message non-streaming
           const msgs = next.messages.slice();
           for (let i = msgs.length - 1; i >= 0; i--) {
@@ -998,6 +1029,7 @@ export const useApp = create<AppState>((set, get) => ({
         case 'error':
           next.streaming = false;
           next.awaitingResponse = null;
+          next.retryNotice = null;
           next.errorMessage = e.message;
           break;
         case 'state_changed': {
