@@ -259,6 +259,40 @@ export function shouldShowRichBudget(budget: BudgetStatus | null): boolean {
 }
 
 /**
+ * Compute the "this hour" budget display from a BudgetStatus.
+ *
+ * The denominator is the EFFECTIVE hourly cap (`hourCapMicros`) = the base
+ * per-hour slice (daily / active-hours) PLUS the carry-over adjustment. The
+ * carry-over goes negative once the key has banked overspend, so the
+ * effective cap CAN be negative — and we surface it that way on purpose
+ * (e.g. "$0.00 / -$210.50"): it honestly says "this hour starts with no room
+ * and a $210.50 deficit" instead of pretending the full base slice is
+ * available. This is exactly the number the governor enforces.
+ *
+ * "over" means this clock-hour's actual spend EXCEEDS the effective cap:
+ *   - effective cap $95.83, spent $0   → NOT over (you have room)
+ *   - effective cap $95.83, spent $100 → over
+ *   - effective cap -$210 (deficit), spent $0 → over (no room; in deficit)
+ *
+ * The earlier v0.1.17 logic was wrong on both counts: it used the BASE cap
+ * as the denominator (so a deficit showed as "$0.00 / $95.83") and defined
+ * "over" as "effective cap <= 0", which flagged over at $0 spend whenever a
+ * deficit existed — producing the nonsensical "$0.00 / $95.83 (over)".
+ */
+export function computeHourBudget(budget: BudgetStatus): {
+  effHourCap: number;
+  hourSpent: number;
+  overHour: boolean;
+  hourPct: number;
+} {
+  const effHourCap = budget.hourCapMicros ?? 0;
+  const hourSpent = budget.hourSpentMicros;
+  const overHour = hourSpent > effHourCap;
+  const hourPct = effHourCap > 0 ? hourSpent / effHourCap : overHour ? 1 : 0;
+  return { effHourCap, hourSpent, overHour, hourPct };
+}
+
+/**
  * Sidebar budget pill — two lines: "this hour: $X / $Y" (the cap the
  * governor enforces) and "today: $X / $Y" (informational, against the
  * configured daily budget). Color-coded against the hour cap because
@@ -302,22 +336,15 @@ function BudgetPill({
       </>
     );
   }
-  const hourSpent = budget!.hourSpentMicros;
-  // Denominator for the "this hour" line: the BASE per-hour slice
-  // (daily / active-hours), which stays positive. The EFFECTIVE cap
-  // (hourCap) goes negative once the key is over budget, so it's the
-  // wrong thing to divide by / display as the cap.
-  const hourCapForDisplay = budget!.baseHourCapMicros ?? hourCap ?? 0;
-  // Over budget THIS HOUR when the effective cap is <= 0 (overspend has
-  // eaten the whole bucket). Flag it red regardless of the ratio.
-  const overHour = hourCap != null && hourCap <= 0;
-  const hourPct = hourCapForDisplay > 0 ? hourSpent / hourCapForDisplay : 1;
-  const hourCls =
-    overHour || hourPct >= 1
-      ? 'text-state-error'
-      : hourPct >= 0.8
-        ? 'text-state-attention'
-        : 'text-text-muted';
+  // Effective (carry-over-adjusted) hourly cap is the denominator — it may
+  // be negative (a deficit), which we show honestly. "over" = spent exceeds
+  // that effective cap. See computeHourBudget for the full rationale.
+  const { effHourCap, hourSpent, overHour, hourPct } = computeHourBudget(budget!);
+  const hourCls = overHour
+    ? 'text-state-error'
+    : hourPct >= 0.8
+      ? 'text-state-attention'
+      : 'text-text-muted';
   const dayPct = dailyCap && dailyCap > 0 ? budget!.daySpentMicros / dailyCap : 0;
   const dayCls =
     dayPct >= 1
@@ -339,7 +366,7 @@ function BudgetPill({
           'A session whose key has hit the cap pauses until the top of the next clock hour. ' +
           'New sessions get one free turn per hour even when the bucket is exhausted (the min-one-turn-per-session-per-hour exemption).' +
           (overHour
-            ? ' This key is currently OVER budget: accumulated overspend has driven the effective hourly room to zero, so sessions on it pause until the carry-over recovers.'
+            ? ' This key is OVER its hourly allowance: the effective cap (base hourly slice + carry-over) is shown, and goes negative when accumulated overspend has banked a deficit. Sessions on it pause until the carry-over recovers above this hour\'s spend.'
             : '') +
           (dailyCap
             ? ` Daily budget is ${formatUsdMicros(dailyCap)} spread across the key's active-hours window (= daily / N active hours; default N=24).`
@@ -349,7 +376,7 @@ function BudgetPill({
         <div className={clsx('flex justify-between', hourCls)}>
           <span>this hour{overHour ? ' (over)' : ''}</span>
           <span>
-            {formatUsdMicros(hourSpent)} / {formatUsdMicros(hourCapForDisplay)}
+            {formatUsdMicros(hourSpent)} / {formatUsdMicros(effHourCap)}
           </span>
         </div>
         {dailyCap && dailyCap > 0 && (

@@ -49,6 +49,17 @@ describe('formatUsdMicros', () => {
   it('returns $0.00 for zero', () => {
     expect(formatUsdMicros(0)).toBe('$0.00');
   });
+
+  it('renders NEGATIVE amounts with a leading minus (carryover deficit)', () => {
+    // The budget governor's effective hourly cap goes negative once a key
+    // banks overspend; the sidebar shows that deficit honestly. Without sign
+    // handling these all fell through to "$0.00".
+    expect(formatUsdMicros(-50 * M)).toBe('-$50.00');
+    expect(formatUsdMicros(-50.5 * M)).toBe('-$50.50');
+    expect(formatUsdMicros(-210.5 * M)).toBe('-$211'); // $100+ drops decimals
+    expect(formatUsdMicros(-3200 * M)).toBe('-$3.2k');
+    expect(formatUsdMicros(-0.05 * M)).toBe('-$0.05');
+  });
 });
 
 describe('formatTokens', () => {

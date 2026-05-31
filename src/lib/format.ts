@@ -3,12 +3,19 @@ import type { SessionRow } from '@/types';
 const MICROS_PER_DOLLAR = 1_000_000;
 
 export function formatUsdMicros(micros: number, opts?: { precise?: boolean }): string {
-  const dollars = micros / MICROS_PER_DOLLAR;
-  if (dollars >= 1000) return `$${(dollars / 1000).toFixed(1)}k`;
-  if (dollars >= 100) return `$${dollars.toFixed(0)}`;
-  if (dollars >= 1) return `$${dollars.toFixed(2)}`;
-  if (opts?.precise) return `$${dollars.toFixed(4)}`;
-  if (dollars > 0) return `$${dollars.toFixed(2)}`;
+  // Handle negatives explicitly. Negative amounts occur for the budget
+  // governor's EFFECTIVE hourly cap, which goes below zero once a key has
+  // banked overspend (a carry-over deficit). The sidebar shows that deficit
+  // honestly (e.g. "-$210.50"); without sign handling a negative value fell
+  // through every threshold below and rendered as "$0.00", hiding it.
+  const neg = micros < 0;
+  const sign = neg ? '-' : '';
+  const dollars = Math.abs(micros) / MICROS_PER_DOLLAR;
+  if (dollars >= 1000) return `${sign}$${(dollars / 1000).toFixed(1)}k`;
+  if (dollars >= 100) return `${sign}$${dollars.toFixed(0)}`;
+  if (dollars >= 1) return `${sign}$${dollars.toFixed(2)}`;
+  if (opts?.precise) return `${sign}$${dollars.toFixed(4)}`;
+  if (dollars > 0) return `${sign}$${dollars.toFixed(2)}`;
   return '$0.00';
 }
 

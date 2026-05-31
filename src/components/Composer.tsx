@@ -497,6 +497,24 @@ export function Composer({ sessionId, visible }: Props) {
     return () => cancelAnimationFrame(id);
   }, [visible, sessionId]);
 
+  // Refocus the textarea when a turn FINISHES (streaming flips false), so
+  // the user can immediately type the next message without an extra click.
+  // Part of the fix for the intermittent "no cursor" state: turn-end UI
+  // changes could leave focus on a non-typeable element with nothing
+  // restoring it. Skips if the user is typing in another text host.
+  useEffect(() => {
+    if (!visible || streaming || archived) return;
+    const ae = document.activeElement as HTMLElement | null;
+    const tag = ae?.tagName;
+    const isTextHost =
+      ae != null &&
+      (tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable === true) &&
+      ae !== taRef.current;
+    if (isTextHost) return;
+    const id = requestAnimationFrame(() => taRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(id);
+  }, [streaming, visible, archived]);
+
   const totalBytes = attachments.reduce((sum, a) => sum + a.sizeBytes, 0);
 
   const addFiles = async (files: FileList | File[]) => {
@@ -825,7 +843,23 @@ export function Composer({ sessionId, visible }: Props) {
         </div>
       )}
 
-      <div className="px-3 pb-3 flex items-end gap-2 relative">
+      <div
+        className="px-3 pb-3 flex items-end gap-2 relative"
+        onMouseDown={(e) => {
+          // Click anywhere in the composer input row that isn't itself an
+          // interactive control → focus the textarea, so the user always
+          // gets a cursor. Fixes an intermittent "no cursor / can't type"
+          // state where focus had landed on a non-typeable element
+          // mid-session and nothing refocused the box (the workaround was
+          // opening + cancelling the attach dialog, which returned focus).
+          const target = e.target as HTMLElement;
+          if (target === taRef.current) return; // already the textarea
+          if (target.closest('button, a, input, [role="button"]')) return; // real controls
+          if (archived) return;
+          // Defer so we don't fight the native focus from this mousedown.
+          requestAnimationFrame(() => taRef.current?.focus({ preventScroll: true }));
+        }}
+      >
         {menuOpen && !menuDismissed && (
           <SlashCommandMenu
             items={filteredSkills}
