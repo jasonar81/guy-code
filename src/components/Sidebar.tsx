@@ -238,6 +238,27 @@ export function Sidebar() {
 }
 
 /**
+ * Whether to show the rich "this hour / today" budget view vs the bare
+ * "24h: $X" fallback. The rule is: show rich iff a daily budget is
+ * CONFIGURED for the selected key — keyed off `dailyCapMicros` /
+ * `baseHourCapMicros`, NOT the effective `hourCapMicros`.
+ *
+ * Why this matters (the bug this fixes): the effective hourly cap goes
+ * NEGATIVE once a key accumulates overspend (it's `base + carryover`, and
+ * carryover is negative when over budget). The old gate (`hourCapMicros <= 0`
+ * → fallback) therefore treated an over-budget key with a real $2,300/day
+ * budget IDENTICALLY to a key with no budget at all, silently hiding the
+ * hourly + daily numbers. Gating on "is a budget configured" keeps the rich
+ * view up (flagged over-budget) instead of making it vanish.
+ */
+export function shouldShowRichBudget(budget: BudgetStatus | null): boolean {
+  if (!budget) return false;
+  const hasDaily = budget.dailyCapMicros != null && budget.dailyCapMicros > 0;
+  const hasBase = budget.baseHourCapMicros != null && budget.baseHourCapMicros > 0;
+  return hasDaily || hasBase;
+}
+
+/**
  * Sidebar budget pill — two lines: "this hour: $X / $Y" (the cap the
  * governor enforces) and "today: $X / $Y" (informational, against the
  * configured daily budget). Color-coded against the hour cap because
@@ -259,8 +280,11 @@ function BudgetPill({
 }) {
   const hourCap = budget?.hourCapMicros ?? null;
   const dailyCap = budget?.dailyCapMicros ?? null;
-  if (!budget || hourCap == null || hourCap <= 0) {
-    // Governor disabled for the selected key. Show 24h spend for context.
+  if (!shouldShowRichBudget(budget)) {
+    // No daily budget configured for the selected key (governor disabled).
+    // Show 24h spend for context. NOTE: a key that HAS a budget but is
+    // currently OVER it (effective hourCap <= 0) is NOT this case — it
+    // takes the rich branch below. See shouldShowRichBudget.
     const last24h = budget?.last24hSpentMicros ?? fallback24h;
     return (
       <>
@@ -278,15 +302,23 @@ function BudgetPill({
       </>
     );
   }
-  const hourSpent = budget.hourSpentMicros;
-  const hourPct = hourCap > 0 ? hourSpent / hourCap : 0;
+  const hourSpent = budget!.hourSpentMicros;
+  // Denominator for the "this hour" line: the BASE per-hour slice
+  // (daily / active-hours), which stays positive. The EFFECTIVE cap
+  // (hourCap) goes negative once the key is over budget, so it's the
+  // wrong thing to divide by / display as the cap.
+  const hourCapForDisplay = budget!.baseHourCapMicros ?? hourCap ?? 0;
+  // Over budget THIS HOUR when the effective cap is <= 0 (overspend has
+  // eaten the whole bucket). Flag it red regardless of the ratio.
+  const overHour = hourCap != null && hourCap <= 0;
+  const hourPct = hourCapForDisplay > 0 ? hourSpent / hourCapForDisplay : 1;
   const hourCls =
-    hourPct >= 1
+    overHour || hourPct >= 1
       ? 'text-state-error'
       : hourPct >= 0.8
         ? 'text-state-attention'
         : 'text-text-muted';
-  const dayPct = dailyCap && dailyCap > 0 ? budget.daySpentMicros / dailyCap : 0;
+  const dayPct = dailyCap && dailyCap > 0 ? budget!.daySpentMicros / dailyCap : 0;
   const dayCls =
     dayPct >= 1
       ? 'text-state-error'
@@ -306,22 +338,25 @@ function BudgetPill({
           'Headline number is spend in the current clock-hour bucket — that is what the governor enforces. ' +
           'A session whose key has hit the cap pauses until the top of the next clock hour. ' +
           'New sessions get one free turn per hour even when the bucket is exhausted (the min-one-turn-per-session-per-hour exemption).' +
+          (overHour
+            ? ' This key is currently OVER budget: accumulated overspend has driven the effective hourly room to zero, so sessions on it pause until the carry-over recovers.'
+            : '') +
           (dailyCap
             ? ` Daily budget is ${formatUsdMicros(dailyCap)} spread across the key's active-hours window (= daily / N active hours; default N=24).`
             : '')
         }
       >
         <div className={clsx('flex justify-between', hourCls)}>
-          <span>this hour</span>
+          <span>this hour{overHour ? ' (over)' : ''}</span>
           <span>
-            {formatUsdMicros(hourSpent)} / {formatUsdMicros(hourCap)}
+            {formatUsdMicros(hourSpent)} / {formatUsdMicros(hourCapForDisplay)}
           </span>
         </div>
         {dailyCap && dailyCap > 0 && (
           <div className={clsx('flex justify-between', dayCls)}>
             <span>today</span>
             <span>
-              {formatUsdMicros(budget.daySpentMicros)} / {formatUsdMicros(dailyCap)}
+              {formatUsdMicros(budget!.daySpentMicros)} / {formatUsdMicros(dailyCap)}
             </span>
           </div>
         )}

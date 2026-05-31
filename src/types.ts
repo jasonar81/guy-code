@@ -317,6 +317,17 @@ export interface BudgetStatus {
    * has already taken a turn this hour.
    */
   hourCapMicros: number | null;
+  /**
+   * The UN-adjusted base hourly cap (= daily budget / active-hours-per-day),
+   * or null when no daily budget is configured. Unlike `hourCapMicros` (the
+   * effective cap, which goes NEGATIVE when the key has accumulated
+   * overspend), this is the steady-state per-hour slice. The sidebar uses it
+   * as the "this hour" denominator so an over-budget key still shows a
+   * sensible "$X / $95.83" instead of dividing by a negative number — and so
+   * that "budget configured but currently over" is distinguishable from "no
+   * budget configured at all".
+   */
+  baseHourCapMicros: number | null;
   /** Current clock-hour spend on this key (excludes in-flight reservations). */
   hourSpentMicros: number;
   /**

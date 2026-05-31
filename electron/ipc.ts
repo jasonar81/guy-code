@@ -33,6 +33,7 @@ import {
   currentHourSpendMicros,
   getDailyBudgetMicros,
   getHourCapMicros,
+  getBaseHourCapMicros,
   setBypassNextTurn,
   resetBudgetAdjustment,
 } from './budget';
@@ -320,8 +321,14 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     return {
       apiKeyId: id,
       // Hourly cap in micros (= daily / 24), or null when uncapped.
-      // This is the cap the governor actually enforces.
+      // This is the cap the governor actually enforces. NOTE: this is the
+      // EFFECTIVE cap and goes NEGATIVE when the key has accumulated
+      // overspend — callers deciding "is a budget configured" must use
+      // dailyCapMicros / baseHourCapMicros, not `hourCapMicros > 0`.
       hourCapMicros: hourCap,
+      // Un-adjusted base hourly slice (daily / active-hours-per-day), or
+      // null when no daily budget is set. Stable denominator for the UI.
+      baseHourCapMicros: getBaseHourCapMicros(id),
       // Current clock-hour bucket spend on this key.
       hourSpentMicros: currentHourSpendMicros(now, id),
       // Daily budget in micros, or null when uncapped. Informational
