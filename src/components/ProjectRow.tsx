@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import clsx from 'clsx';
-import { Archive, ArchiveRestore } from 'lucide-react';
+import { Archive, ArchiveRestore, Infinity as InfinityIcon } from 'lucide-react';
 import type { SessionRow } from '@/types';
 import { useApp } from '@/lib/store';
 import { formatUsdMicros, sessionDisplayTitle, relativeTime } from '@/lib/format';
@@ -66,7 +66,18 @@ export function SessionListRow({ session: s, showCwd = false }: Props) {
       </span>
       {s.emoji && <span className="text-[13px] leading-none mt-1">{s.emoji}</span>}
       <div className="flex-1 min-w-0">
-        <div className="text-[13px] truncate text-text">{sessionDisplayTitle(s)}</div>
+        <div className="text-[13px] truncate text-text flex items-center gap-1">
+          {s.force_continue === 1 && (
+            <span
+              className="shrink-0 inline-flex text-state-success"
+              title="Force continue ON — this session auto-bypasses budget pauses"
+              aria-label="Force continue on"
+            >
+              <InfinityIcon size={11} />
+            </span>
+          )}
+          <span className="truncate">{sessionDisplayTitle(s)}</span>
+        </div>
         {showCwd && s.cwd && (
           <div className="text-[10px] text-text-dim truncate font-mono">{s.cwd}</div>
         )}

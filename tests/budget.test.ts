@@ -74,6 +74,8 @@ const _setSessionPendingCalls: Array<{
   ts: number | null;
 }> = [];
 
+const _forceContinueSessions = new Set<string>();
+
 function resetFixtures() {
   _spendRows.length = 0;
   _apiKeyRows.clear();
@@ -82,6 +84,7 @@ function resetFixtures() {
   _sessionsByState.clear();
   _setSessionStateCalls.length = 0;
   _setSessionPendingCalls.length = 0;
+  _forceContinueSessions.clear();
 }
 
 // ----- vi.mock('./db') ---------------------------------------------------
@@ -171,6 +174,9 @@ vi.mock('../electron/db', () => {
     },
     listSessionsByState(state: string) {
       return _sessionsByState.get(state) ?? [];
+    },
+    getSessionForceContinue(id: string) {
+      return _forceContinueSessions.has(id);
     },
   };
 });
@@ -684,6 +690,39 @@ describe('precheckCall', () => {
     expect(r.allowed).toBe(false);
     expect(r.reason).toMatch(/hour spend/);
     expect(r.spentMicros).toBe(5 * $1);
+  });
+
+  it('force-continue: a session in force-continue mode is ALWAYS allowed, even when it would otherwise block', () => {
+    // Same exhausted-bucket + prior-call setup as Step 5 (which blocks)...
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
+    // ...but with force-continue ON for s1, every call passes.
+    _forceContinueSessions.add('s1');
+    const r = precheckCall('s1', 'k1', now);
+    expect(r.allowed).toBe(true);
+    expect(r.reason).toMatch(/force-continue/);
+    // Spend is still reported (accounting is unchanged; only the gate lifts).
+    expect(r.spentMicros).toBe(5 * $1);
+  });
+
+  it('force-continue: only affects the flagged session, not siblings on the same key', () => {
+    setKey('k1', {
+      dailyUsd: 24,
+      adjustmentUsd: 0,
+      adjustmentHourTs: hourTs('2026-05-23T13:00:00'),
+    });
+    const now = hourTs('2026-05-23T13:30:00');
+    addSpend({ ts: now, costMicros: 5 * $1, apiKeyId: 'k1', sessionId: 's1' });
+    addSpend({ ts: now, costMicros: 1 * $1, apiKeyId: 'k1', sessionId: 's2' });
+    _forceContinueSessions.add('s1');
+    expect(precheckCall('s1', 'k1', now).allowed).toBe(true); // forced
+    // s2 (not forced) still blocks on the exhausted bucket with a prior call.
+    expect(precheckCall('s2', 'k1', now).allowed).toBe(false);
   });
 
   it('block reason names the effective cap (after carry-over), not base', () => {

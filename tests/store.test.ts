@@ -173,3 +173,91 @@ describe('store: TodoWrite → currentTodos', () => {
     expect(useApp.getState().chats[SESSION]?.currentTodos).toHaveLength(1);
   });
 });
+
+describe('store: sendMessage attachment handling (RTF/text-file regression)', () => {
+  const SID = 'attach-session';
+  beforeEach(() => {
+    const runMock = vi.fn().mockResolvedValue({ started: true });
+    (globalThis as any).window.api.agent = {
+      ...(globalThis as any).window.api.agent,
+      run: runMock,
+    };
+    (globalThis as any).__runMock = runMock;
+    // Seed a session so sendMessage finds it.
+    useApp.setState((s) => ({
+      sessions: [
+        ...s.sessions.filter((x) => x.id !== SID),
+        { id: SID, project_id: 'p', cwd: '', jsonl_path: null } as any,
+      ],
+      chats: { ...s.chats, [SID]: undefined as any },
+    }));
+  });
+
+  it('sends an RTF (rich-doc) attachment with NO typed text (does not silently abort)', async () => {
+    await useApp.getState().sendMessage(SID, '', [
+      {
+        kind: 'rich-doc',
+        name: 'big.rtf',
+        docKind: 'rtf',
+        dataBase64: 'AAAA',
+        sizeBytes: 7_000_000,
+      } as any,
+    ]);
+    // The bug: with no text + an unhandled kind, localBlocks was empty and
+    // sendMessage returned BEFORE calling agent.run. Assert it DID call run.
+    const runMock = (globalThis as any).__runMock;
+    expect(runMock).toHaveBeenCalledTimes(1);
+    expect(runMock.mock.calls[0][0].attachments[0].kind).toBe('rich-doc');
+    // And a user bubble was added showing the attachment marker.
+    const msgs = useApp.getState().chats[SID]?.messages ?? [];
+    expect(msgs.length).toBe(1);
+    const block = (msgs[0].content as any[])[0];
+    expect(block.type).toBe('text');
+    expect(block.text).toContain('big.rtf');
+    expect(block.text).toContain('RTF');
+  });
+
+  it('sends a text-file attachment with no typed text', async () => {
+    await useApp.getState().sendMessage(SID, '', [
+      { kind: 'text-file', name: 'huge.log', text: 'x', sizeBytes: 2_000_000 } as any,
+    ]);
+    expect((globalThis as any).__runMock).toHaveBeenCalledTimes(1);
+    const block = (useApp.getState().chats[SID]!.messages[0].content as any[])[0];
+    expect(block.text).toContain('huge.log');
+  });
+
+  it('an unknown future kind still produces a block (no silent abort)', async () => {
+    await useApp.getState().sendMessage(SID, '', [
+      { kind: 'some-future-kind', name: 'mystery.xyz', sizeBytes: 1024 } as any,
+    ]);
+    expect((globalThis as any).__runMock).toHaveBeenCalledTimes(1);
+    const block = (useApp.getState().chats[SID]!.messages[0].content as any[])[0];
+    expect(block.text).toContain('mystery.xyz');
+  });
+});
+
+describe('store: setForceContinue', () => {
+  const SID = 'fc-session';
+  beforeEach(() => {
+    (globalThis as any).window.api.sessions = {
+      ...(globalThis as any).window.api.sessions,
+      setForceContinue: vi.fn().mockResolvedValue({
+        ok: true,
+        sessions: [{ id: SID, force_continue: 1 } as any],
+      }),
+    };
+    useApp.setState((s) => ({
+      sessions: [
+        ...s.sessions.filter((x) => x.id !== SID),
+        { id: SID, project_id: 'p', force_continue: 0 } as any,
+      ],
+    }));
+  });
+
+  it('optimistically flips the local flag and calls the IPC', async () => {
+    await useApp.getState().setForceContinue(SID, true);
+    expect((globalThis as any).window.api.sessions.setForceContinue).toHaveBeenCalledWith(SID, true);
+    const sess = useApp.getState().sessions.find((x) => x.id === SID);
+    expect(sess?.force_continue).toBe(1);
+  });
+});

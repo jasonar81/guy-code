@@ -713,6 +713,20 @@ function migrate(d: Database) {
         ALTER TABLE api_keys ADD COLUMN active_hour_end INTEGER NOT NULL DEFAULT 0;
       `,
     },
+    {
+      version: 10,
+      // Per-session "force continue" mode. When 1, the budget governor's
+      // hourly pause is auto-bypassed for this session: the per-call
+      // precheck returns allowed regardless of spend, and the resume
+      // sweep wakes the session even when the bucket is still exhausted.
+      // Spend is STILL recorded normally — this only changes the gate,
+      // not the accounting. The user toggles it via right-click on the
+      // session. Default 0 = normal governor behavior. Persists across
+      // restarts so a long unattended critical run keeps going.
+      up: `
+        ALTER TABLE sessions ADD COLUMN force_continue INTEGER NOT NULL DEFAULT 0;
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -856,6 +870,13 @@ export interface SessionRow {
   draft_text: string | null;
   /** API key this session uses; null = inherits the current default key. */
   api_key_id: string | null;
+  /**
+   * Force-continue mode. 1 = the budget governor's hourly pause is
+   * auto-bypassed for this session (precheck allows every call; the
+   * resume sweep wakes it even with an exhausted bucket). Spend is still
+   * recorded — only the gate changes. 0 = normal. Toggled via right-click.
+   */
+  force_continue: number;
 }
 
 export interface SessionFullRow extends SessionRow {
@@ -917,6 +938,21 @@ export function setSessionUserTitle(id: string, userTitle: string | null) {
 
 export function setSessionVisuals(id: string, color: string | null, emoji: string | null) {
   db().prepare('UPDATE sessions SET color = ?, emoji = ? WHERE id = ?').run(color, emoji, id);
+}
+
+/** Toggle force-continue mode for a session (budget pauses auto-bypassed). */
+export function setSessionForceContinue(id: string, on: boolean) {
+  db()
+    .prepare('UPDATE sessions SET force_continue = ? WHERE id = ?')
+    .run(on ? 1 : 0, id);
+}
+
+/** Read a session's force-continue flag. Missing row → false. */
+export function getSessionForceContinue(id: string): boolean {
+  const row = db()
+    .prepare('SELECT force_continue FROM sessions WHERE id = ?')
+    .get<{ force_continue: number }>(id);
+  return (row?.force_continue ?? 0) === 1;
 }
 
 export function setSessionArchived(id: string, archived: boolean) {
@@ -1202,11 +1238,13 @@ export function listSessionsByState(state: string): {
   jsonl_path: string;
   api_key_id: string | null;
   archived: number;
+  force_continue: number;
 }[] {
   return db()
     .prepare(
       `SELECT s.id, s.project_id, s.pending_user_text, s.sleeping_since,
-              p.cwd AS cwd, s.jsonl_path, s.api_key_id, s.archived
+              p.cwd AS cwd, s.jsonl_path, s.api_key_id, s.archived,
+              s.force_continue
          FROM sessions s
          LEFT JOIN projects p ON p.id = s.project_id
         WHERE s.state = ?`
@@ -1220,6 +1258,7 @@ export function listSessionsByState(state: string): {
       jsonl_path: string;
       api_key_id: string | null;
       archived: number;
+      force_continue: number;
     }>(state);
 }
 

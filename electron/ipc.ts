@@ -11,6 +11,7 @@ import {
   listSessionsAll,
   setSessionUserTitle,
   setSessionVisuals,
+  setSessionForceContinue,
   setSessionArchived,
   setSessionState,
   setSessionPending,
@@ -461,6 +462,39 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     }
     return { ok: true };
   });
+
+  ipcMain.handle(
+    'sessions:setForceContinue',
+    (_e, sessionId: string, on: boolean) => {
+      setSessionForceContinue(sessionId, !!on);
+      // If we just turned it ON and the session is sitting paused on the
+      // budget, resume it immediately (same path as a manual Force Resume)
+      // rather than waiting up to 60s for the next resume sweep. The
+      // precheck now allows every call for this session, so it won't
+      // re-pause. Turning it OFF is a no-op on a running session — the next
+      // budget pause will simply take effect normally.
+      if (on) {
+        const sess = listSessionsAll().find((s) => s.id === sessionId);
+        if (sess && sess.state === 'sleeping-budget') {
+          const pending = getSessionPending(sessionId);
+          setSessionState(sessionId, 'idle');
+          setSessionPending(sessionId, null, null);
+          const pendingText = pending?.pending_user_text?.trim() ?? '';
+          runUserTurn({
+            sessionId,
+            projectId: sess.project_id,
+            cwd: sess.cwd ?? '',
+            userText: pendingText,
+            continueExisting: pendingText === '',
+            seedFromJsonl: sess.jsonl_path,
+          }).catch(() => {
+            /* error is broadcast as agent:event */
+          });
+        }
+      }
+      return { ok: true, sessions: listSessionsAll() };
+    }
+  );
 
   // ---- Imports ----
   ipcMain.handle('import:run', async () => {

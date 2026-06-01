@@ -28,6 +28,8 @@ const api = {
       ipcRenderer.invoke('sessions:cancelPending', id),
     setApiKey: (id: string, apiKeyId: string | null) =>
       ipcRenderer.invoke('sessions:setApiKey', id, apiKeyId),
+    setForceContinue: (id: string, on: boolean) =>
+      ipcRenderer.invoke('sessions:setForceContinue', id, on),
   },
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),

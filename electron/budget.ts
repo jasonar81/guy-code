@@ -61,6 +61,7 @@ import {
   getApiKeyRow,
   getDefaultApiKeyRow,
   getSetting,
+  getSessionForceContinue,
   setApiKeyBudgetAdjustment,
   resetApiKeyBudgetAdjustment,
   type ApiKeyRow,
@@ -514,6 +515,22 @@ export function precheckCall(
     return { allowed: true, reason: '', capMicros: 0, spentMicros: 0, nextRetryTs };
   }
 
+  // Step 1.5. Force-continue mode. The user toggled this session into
+  // "ignore budget pauses" mode (right-click → Force continue). Every
+  // call is allowed regardless of spend, indefinitely, until they toggle
+  // it off. Spend is still recorded by the usage-event path — this only
+  // lifts the gate, it does not disable accounting. Distinct from the
+  // 60s Force-Resume grace below (which is a one-shot manual nudge).
+  if (sessionId && getSessionForceContinue(sessionId)) {
+    return {
+      allowed: true,
+      reason: 'force-continue',
+      capMicros: cap,
+      spentMicros: currentHourSpendMicros(now, apiKeyId),
+      nextRetryTs,
+    };
+  }
+
   // Step 2. Force-resume grace window. The user clicked Force Resume,
   // which set `_bypassUntil[sessionId] = now + 60s`. While inside that
   // window, EVERY API call for the session is allowed regardless of
@@ -704,7 +721,11 @@ export async function resumeSweep() {
     }
     const cap = getEffectiveHourCapMicros(s.api_key_id, now);
     let canWake = false;
-    if (cap == null) {
+    if (s.force_continue === 1) {
+      // Force-continue mode: wake regardless of bucket state. The precheck
+      // will also allow every call, so the resumed turn won't re-pause.
+      canWake = true;
+    } else if (cap == null) {
       canWake = true; // key became uncapped while sleeping
     } else {
       const spent = currentHourSpendMicros(now, s.api_key_id);

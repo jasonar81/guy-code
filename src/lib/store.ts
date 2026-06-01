@@ -372,6 +372,8 @@ interface AppState {
    */
   resetApiKeyBudgetAdjustment: (id: string) => Promise<boolean>;
   setSessionApiKey: (sessionId: string, apiKeyId: string | null) => Promise<void>;
+  /** Toggle force-continue mode (auto-bypass budget pauses) for a session. */
+  setForceContinue: (sessionId: string, on: boolean) => Promise<void>;
   setBudgetKeyFilter: (apiKeyId: string | null) => void;
 }
 
@@ -567,6 +569,19 @@ export const useApp = create<AppState>((set, get) => ({
     set({ sessions });
   },
 
+  setForceContinue: async (sessionId, on) => {
+    // Optimistic local flip so the indicator updates instantly, then the
+    // IPC returns the authoritative session list (it may also have changed
+    // state if turning on resumed a paused session).
+    set((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === sessionId ? { ...sess, force_continue: on ? 1 : 0 } : sess
+      ),
+    }));
+    const r = await window.api.sessions.setForceContinue(sessionId, on);
+    if (r && Array.isArray(r.sessions)) set({ sessions: r.sessions });
+  },
+
   setBudgetKeyFilter: (apiKeyId) => {
     try {
       // null means "All keys" — store as empty string so getItem can
@@ -662,6 +677,37 @@ export const useApp = create<AppState>((set, get) => ({
         localBlocks.push({
           type: 'text',
           text: `\n\n--- Attached: ${a.name} ---\n${a.text}\n--- end ${a.name} ---`,
+        });
+      } else if (a.kind === 'text-file') {
+        // Disk-backed large text file: the full content is NOT inlined in
+        // the bubble (the backend writes it to disk and the model Reads it
+        // on demand). We still render a marker block so the user sees the
+        // attachment AND — critically — so localBlocks is non-empty and the
+        // send isn't aborted by the `length === 0` guard below.
+        localBlocks.push({
+          type: 'text',
+          text: `\n\n--- Attached file: ${a.name} (${Math.max(1, Math.round(a.sizeBytes / 1024))} KB, read on demand) ---`,
+        });
+      } else if (a.kind === 'rich-doc') {
+        // Office / RTF document: text is extracted by the backend. Same
+        // deal as text-file — render a marker so it's visible and the send
+        // proceeds.
+        localBlocks.push({
+          type: 'text',
+          text: `\n\n--- Attached ${a.docKind.toUpperCase()}: ${a.name} (${Math.max(1, Math.round(a.sizeBytes / 1024))} KB, text extracted) ---`,
+        });
+      } else {
+        // Defensive catch-all: any current or FUTURE attachment kind we
+        // didn't explicitly branch on still produces a marker block, so a
+        // new kind can never silently abort the send via the empty-blocks
+        // guard. (This is exactly the bug that hid RTF/text-file attaches:
+        // an unhandled kind produced no block, and an attachment-only send
+        // with no typed text hit `localBlocks.length === 0` and returned.)
+        const anyA = a as { name?: string; sizeBytes?: number };
+        const kb = anyA.sizeBytes ? `${Math.max(1, Math.round(anyA.sizeBytes / 1024))} KB` : '';
+        localBlocks.push({
+          type: 'text',
+          text: `\n\n--- Attached: ${anyA.name ?? 'file'}${kb ? ` (${kb})` : ''} ---`,
         });
       }
     }

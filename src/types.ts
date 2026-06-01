@@ -47,6 +47,8 @@ export interface SessionRow {
   draft_text: string | null;
   /** API key id this session is bound to. Null = inherits the current default. */
   api_key_id: string | null;
+  /** Force-continue mode (1 = budget pauses auto-bypassed for this session). */
+  force_continue: number;
 }
 
 /**
@@ -395,6 +397,10 @@ declare global {
         setDraft: (id: string, draft: string | null) => Promise<void>;
         cancelPending: (id: string) => Promise<SessionRow[]>;
         setApiKey: (id: string, apiKeyId: string | null) => Promise<SessionRow[]>;
+        setForceContinue: (
+          id: string,
+          on: boolean
+        ) => Promise<{ ok: boolean; sessions?: SessionRow[] }>;
       };
       projects: {
         list: () => Promise<ProjectRow[]>;

@@ -10,6 +10,7 @@ import {
   Check,
   Star,
   Moon,
+  Infinity as InfinityIcon,
 } from 'lucide-react';
 import type { SessionRow } from '@/types';
 import { useApp } from '@/lib/store';
@@ -57,6 +58,7 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
   const markIdle = useApp((st) => st.markIdle);
   const apiKeys = useApp((st) => st.apiKeys);
   const setSessionApiKey = useApp((st) => st.setSessionApiKey);
+  const setForceContinue = useApp((st) => st.setForceContinue);
 
   // Inline rename mode lives inside the menu — when active, we swap
   // the menu items for an input field. This avoids window.prompt's
@@ -151,6 +153,14 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
       console.error('[setSessionApiKey] failed', err);
       alert('Setting API key failed — see DevTools console for details.');
     }
+    onClose();
+  };
+
+  const doToggleForceContinue = () => {
+    setForceContinue(s.id, s.force_continue !== 1).catch((err) => {
+      console.error('[setForceContinue] failed', err);
+      alert('Toggling force-continue failed — see DevTools console for details.');
+    });
     onClose();
   };
 
@@ -328,6 +338,21 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
             label="Change API key…"
             onClick={() => setPickingKey(true)}
           />
+          <MenuItem
+            icon={
+              <InfinityIcon
+                size={12}
+                className={s.force_continue === 1 ? 'text-state-success' : undefined}
+              />
+            }
+            label={
+              s.force_continue === 1
+                ? 'Force continue: ON (ignoring budget)'
+                : 'Force continue (ignore budget pauses)'
+            }
+            onClick={doToggleForceContinue}
+            title="When ON, this session keeps running past the hourly budget cap automatically (still tracked against spend) until you turn it off. Useful for critical work you don't want to babysit."
+          />
           {s.state !== 'idle' && !s.archived && (
             <MenuItem
               icon={<Moon size={12} />}
@@ -367,18 +392,21 @@ function MenuItem({
   onClick,
   destructive,
   muted,
+  title,
 }: {
   icon: React.ReactNode;
   label: string;
   onClick: () => void;
   destructive?: boolean;
   muted?: boolean;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       role="menuitem"
       onClick={onClick}
+      title={title}
       className={
         'w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-bg-hover ' +
         (destructive
