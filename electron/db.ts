@@ -1073,17 +1073,23 @@ export function setSessionState(id: string, state: string) {
 }
 
 /**
- * On app startup, any session whose persisted `state` is `running` or
- * `waiting-on-system` is stale — the only way to get there is mid-turn
- * execution, and there's no agent process anymore to drive it forward.
- * (Common cause: the app was force-killed, crashed, or restarted while
- * a turn was in flight. Without this sweep the sidebar shows those
- * sessions under "Running" with state=idle in the status bar, leaving
- * the user with two contradictory truths.)
+ * On app startup, any session whose persisted `state` is `running` is
+ * stale — it died mid-API-call (or mid-stream), and there's no clean way
+ * to resume from an interrupted streaming response. Idle it so the sidebar
+ * doesn't show a ghost-running session.
+ *
+ * `waiting-on-system` is handled SEPARATELY (see resumeWaitingOnSystemSessions
+ * in agent.ts): a session parked in WaitForFile/WaitForProcess/WaitForHttp
+ * when the app died CAN be resumed — the conversation is intact in the JSONL,
+ * and re-entering the turn re-issues the wait (sanitizeMessages synthesizes a
+ * placeholder result for the interrupted tool call). Idling it instead — as
+ * this function used to — was the bug where a WaitForFile session came back
+ * idle after a restart.
  *
  * Returns the number of rows updated so the caller can log it.
  *
  * Deliberately NOT reset:
+ *   - `waiting-on-system`— resumed by resumeWaitingOnSystemSessions instead.
  *   - `waiting-on-user`  — model genuinely asked a question; user can answer.
  *   - `sleeping-budget`  — budget governor owns this state; resume sweep handles it.
  *   - `sleeping-tool`    — wake_at_ts is durable; the wakeSleepingTool sweep
@@ -1100,7 +1106,7 @@ export function resetStaleRunningSessions(): number {
     .prepare(
       `SELECT COUNT(*) AS n
          FROM sessions
-        WHERE state IN ('running', 'waiting-on-system')`
+        WHERE state = 'running'`
     )
     .get<{ n: number }>();
   const n = row?.n ?? 0;
@@ -1109,11 +1115,34 @@ export function resetStaleRunningSessions(): number {
       .prepare(
         `UPDATE sessions
            SET state = 'idle'
-         WHERE state IN ('running', 'waiting-on-system')`
+         WHERE state = 'running'`
       )
       .run();
   }
   return n;
+}
+
+/**
+ * List non-archived sessions parked in `waiting-on-system` (a
+ * WaitForFile/WaitForProcess/WaitForHttp poll). Used at startup to resume
+ * them — the in-process poll loop didn't survive the restart, but the turn
+ * can be re-entered to re-issue the wait.
+ */
+export function listWaitingOnSystemSessions(): {
+  id: string;
+  project_id: string;
+  cwd: string | null;
+  jsonl_path: string;
+}[] {
+  return db()
+    .prepare(
+      `SELECT s.id, s.project_id, p.cwd AS cwd, s.jsonl_path
+         FROM sessions s
+         LEFT JOIN projects p ON p.id = s.project_id
+        WHERE s.state = 'waiting-on-system'
+          AND (s.archived = 0 OR s.archived IS NULL)`
+    )
+    .all<{ id: string; project_id: string; cwd: string | null; jsonl_path: string }>();
 }
 
 /**

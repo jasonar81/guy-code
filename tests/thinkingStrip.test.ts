@@ -152,3 +152,31 @@ describe('sanitizeMessages — Pass -1 (thinking strip)', () => {
     expect(twice).toEqual(once);
   });
 });
+
+describe('sanitizeMessages: interrupted WaitFor* tool (restart resume safety)', () => {
+  it('synthesizes a tool_result for a trailing WaitForFile tool_use with no result', () => {
+    // This is the exact shape when the app dies mid-WaitForFile and we
+    // resume the turn with continueExisting: the last assistant message has
+    // a tool_use (WaitForFile) but the JSONL has no matching tool_result
+    // because the poll never returned. Without repair, re-sending this 400s.
+    const out = sanitizeMessages([
+      { role: 'user', content: 'watch for the build output' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Watching the file.' },
+          { type: 'tool_use', id: 'wf1', name: 'WaitForFile', input: { file_path: '/tmp/done' } },
+        ] as any,
+      },
+    ]);
+    // A trailing user message with a synthetic tool_result for wf1 must exist
+    // so the API contract (every tool_use has a matching tool_result) holds.
+    const last = out[out.length - 1];
+    expect(last.role).toBe('user');
+    const results = (last.content as any[]).filter((b) => b.type === 'tool_result');
+    expect(results.some((r) => r.tool_use_id === 'wf1')).toBe(true);
+    // The assistant tool_use survives (we resume from it, not drop it).
+    const asst = out.find((m) => m.role === 'assistant')!;
+    expect((asst.content as any[]).some((b) => b.type === 'tool_use' && b.id === 'wf1')).toBe(true);
+  });
+});

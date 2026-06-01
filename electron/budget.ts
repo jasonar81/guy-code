@@ -831,6 +831,7 @@ export function startGovernor() {
   // boot, not 60 s later.
   resumeSweep().catch((e) => log.error('[budget] startup sweep error', e));
   void runSleepingToolSweep();
+  void runWaitingOnSystemResume();
 }
 
 /**
@@ -846,6 +847,21 @@ async function runSleepingToolSweep(): Promise<void> {
     await wakeSleepingToolSweep();
   } catch (e) {
     log.error('[budget] sleeping-tool sweep error', e);
+  }
+}
+
+/**
+ * Lazy wrapper around `resumeWaitingOnSystemSessions` (same dynamic-import
+ * dance as runSleepingToolSweep). Runs once at startup to resume sessions
+ * that were parked in WaitForFile/WaitForProcess/WaitForHttp when the app
+ * died — without this they'd come back idle.
+ */
+async function runWaitingOnSystemResume(): Promise<void> {
+  try {
+    const { resumeWaitingOnSystemSessions } = await import('./agent');
+    await resumeWaitingOnSystemSessions();
+  } catch (e) {
+    log.error('[budget] waiting-on-system resume error', e);
   }
 }
 

@@ -39,6 +39,7 @@ import {
   getSessionApiKey,
   listSessionsAll,
   listSleepingToolSessions,
+  listWaitingOnSystemSessions,
   upsertSession,
   getSetting,
 } from './db';
@@ -409,6 +410,43 @@ export async function wakeSleepingToolSweep() {
       // next 60s sweep tick.
       armWakeTimer(s.id, s.wake_at_ts);
     }
+  }
+}
+
+/**
+ * Resume sessions that were parked in `waiting-on-system` (a WaitForFile /
+ * WaitForProcess / WaitForHttp poll) when the app died. Those tools run an
+ * in-process polling loop that does NOT survive a restart, so without this
+ * the session would be stuck (the old behavior idled it — the bug Jason
+ * reported: "a WaitForFile session comes back idle after a restart").
+ *
+ * We re-enter the turn via `runUserTurn({ continueExisting: true })`, the
+ * same mechanism `wakeSleepingTool` uses. The JSONL conversation is intact;
+ * `sanitizeMessages` synthesizes a placeholder tool_result for the
+ * interrupted Wait* call (its tool_use has no matching result on disk), so
+ * the API contract holds and the model continues — typically re-issuing the
+ * wait, which is exactly the desired behavior.
+ *
+ * Called once at startup (after resetStaleRunningSessions, which now leaves
+ * `waiting-on-system` rows alone). Idempotent per session via the
+ * activeRuns guard inside runUserTurn.
+ */
+export async function resumeWaitingOnSystemSessions() {
+  const waiting = listWaitingOnSystemSessions();
+  if (waiting.length === 0) return;
+  log.info(`[agent] resuming ${waiting.length} waiting-on-system session(s) after restart`);
+  for (const s of waiting) {
+    if (activeRuns.has(s.id)) continue;
+    log.info(`[agent] resuming waiting-on-system session ${s.id}`);
+    // Don't await in the loop — one slow resume shouldn't block the others.
+    runUserTurn({
+      sessionId: s.id,
+      projectId: s.project_id,
+      cwd: s.cwd ?? '',
+      userText: '',
+      continueExisting: true,
+      seedFromJsonl: s.jsonl_path,
+    }).catch((e) => log.error(`[agent] resume of waiting-on-system ${s.id} failed`, e));
   }
 }
 
