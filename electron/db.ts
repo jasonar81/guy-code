@@ -1297,6 +1297,7 @@ export function listSessionsAll(): SessionFullRow[] {
         s.wake_at_ts,
         s.draft_text,
         s.api_key_id,
+        s.force_continue,
         p.cwd AS cwd,
         COALESCE(c.total, 0) AS cost_all_time_micros,
         COALESCE(c24.total, 0) AS cost_24h_micros
