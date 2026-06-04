@@ -2,7 +2,7 @@
   "name": "guy-code",
   "productName": "Guy Code",
   "private": false,
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Cross-platform Claude Code-compatible desktop app",
   "author": {
     "name": "Jason Arnold",
@@ -29,7 +29,7 @@
     "dist:win": "npm run build && electron-builder --win",
     "dist:linux": "npm run build && electron-builder --linux",
     "smoke:web": "node scripts/smoke-web-tools.cjs",
-    "smoke:web:electron": "electron scripts/smoke-web-tools-electron.cjs",
+    "smoke:web:electron": "electron --no-sandbox scripts/smoke-web-tools-electron.cjs",
     "release": "npm run build && npm run smoke:web && electron-builder --publish always"
   },
   "dependencies": {

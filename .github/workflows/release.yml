@@ -161,7 +161,13 @@ jobs:
         # step's chain isn't possible cross-platform, so we gate here on
         # Linux (the cheapest runner) — one platform is enough since the
         # failure is dependency-resolution, not OS-specific.
+        # ELECTRON_DISABLE_SANDBOX must be set so Electron skips the SUID
+        # sandbox check (chrome-sandbox isn't root-owned in the Actions
+        # checkout). Setting --no-sandbox from JS is too late — the check
+        # runs during early init — so we pass it via env + the binary args.
         if: runner.os == 'Linux'
+        env:
+          ELECTRON_DISABLE_SANDBOX: '1'
         run: |
           npm run build
           sudo apt-get update && sudo apt-get install -y xvfb
