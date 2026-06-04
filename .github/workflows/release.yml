@@ -149,6 +149,30 @@ jobs:
         # accidentally ship.
         run: npm run test
 
+      - name: Smoke-test web tools in the Electron runtime (Linux)
+        # WebSearch/WebFetch have shipped broken MORE THAN ONCE because a
+        # transitive jsdom dependency was unloadable in Electron's CommonJS
+        # main process (e.g. ERR_REQUIRE_ESM from an ESM-only dep). The
+        # node-based smoke (run inside `npm run release` below) does NOT
+        # catch this — system Node loads the dep differently than Electron's
+        # bundled Node. This step runs the SAME web-tools code inside the
+        # ACTUAL Electron main runtime, which is where it breaks. Linux needs
+        # a virtual display (xvfb); macOS/Windows run it directly in the next
+        # step's chain isn't possible cross-platform, so we gate here on
+        # Linux (the cheapest runner) — one platform is enough since the
+        # failure is dependency-resolution, not OS-specific.
+        if: runner.os == 'Linux'
+        run: |
+          npm run build
+          sudo apt-get update && sudo apt-get install -y xvfb
+          xvfb-run --auto-servernum npm run smoke:web:electron
+
+      - name: Smoke-test web tools in the Electron runtime (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: |
+          npm run build
+          npm run smoke:web:electron
+
       - name: Build & publish
         # `electron-builder --publish always` builds installers AND
         # uploads them to a GitHub Release matching the current tag.
