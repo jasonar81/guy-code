@@ -29,6 +29,14 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { app } = require('electron');
 
+// CI runners can't use Chrome's SUID sandbox (chrome-sandbox isn't root-owned
+// in the GitHub Actions checkout). This is a headless main-process smoke test
+// that never opens a window or renders untrusted content, so disabling the
+// sandbox is safe here. Without this, Electron aborts on Linux CI with
+// "The SUID sandbox helper binary ... is not configured correctly".
+app.commandLine.appendSwitch('no-sandbox');
+app.commandLine.appendSwitch('disable-gpu');
+
 function done(code, msg) {
   if (code === 0) console.log(`[smoke-web-electron] OK — ${msg}`);
   else console.error(`[smoke-web-electron] FAIL — ${msg}`);
