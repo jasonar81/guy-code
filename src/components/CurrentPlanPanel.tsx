@@ -70,7 +70,14 @@ export function CurrentPlanPanel({ sessionId }: Props) {
         )}
       </button>
       {!collapsed && (
-        <ol className="px-4 pb-3 space-y-1">
+        // Cap the plan list at ~30% of the viewport and scroll past that.
+        // Without this cap a long plan (or items with long content) grows
+        // the panel to its full content height, which on a tall plan can
+        // shove the message transcript and the composer's input box off
+        // screen — leaving the session unusable. The header above always
+        // shows done/total + the in-progress step, so the at-a-glance state
+        // survives even when the list is scrolled or collapsed.
+        <ol className="px-4 pb-3 space-y-1 max-h-[30vh] overflow-y-auto">
           {todos.map((t) => (
             <li
               key={t.id}

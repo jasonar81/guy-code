@@ -846,7 +846,12 @@ export function MessageList({ sessionId, visible }: Props) {
       // Render a small overscan so scrolling feels smooth without
       // mounting too many off-screen MessageBlocks.
       increaseViewportBy={{ top: 200, bottom: 400 }}
-      className="flex-1 select-text"
+      // `min-h-0` lets this flex child shrink below its content's min-content
+      // height. Without it, a tall sibling (e.g. a long plan panel) could
+      // overflow the flex column and push the composer off-screen instead of
+      // the transcript yielding space. Pairs with the plan panel's max-height
+      // cap as defense-in-depth so the input box is always reachable.
+      className="flex-1 min-h-0 select-text"
       style={{ height: '100%' }}
     />
   );
