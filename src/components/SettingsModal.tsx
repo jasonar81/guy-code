@@ -380,6 +380,9 @@ function ChromeConnectorSection({ open }: { open: boolean }) {
     error: string | null;
     connectedAt: number | null;
     tabCount: number;
+    extensionBuild?: number | null;
+    expectedExtensionBuild?: number;
+    extensionStale?: boolean;
   } | null>(null);
   const [busy, setBusy] = useState(false);
   // Local error message — Chrome connector errors are user-actionable
@@ -586,6 +589,17 @@ function ChromeConnectorSection({ open }: { open: boolean }) {
           {status?.error && (
             <div className="text-[10px] text-state-error truncate" title={status.error}>
               {status.error}
+            </div>
+          )}
+          {s === 'connected' && status?.extensionStale && (
+            <div
+              className="text-[10px] text-state-attention leading-snug mt-0.5"
+              title="The Chrome extension is loaded unpacked and does not auto-update. Reload it to pick up the latest fixes."
+            >
+              ⚠ Extension out of date (build {status.extensionBuild ?? 'unknown'}, expected{' '}
+              {status.expectedExtensionBuild}). Reload it at{' '}
+              <code className="font-mono">chrome://extensions/</code> (↻) to get the latest
+              fixes — e.g. screenshots of minimized/background windows.
             </div>
           )}
         </div>

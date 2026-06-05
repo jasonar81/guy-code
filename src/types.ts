@@ -492,6 +492,9 @@ declare global {
           error: string | null;
           connectedAt: number | null;
           tabCount: number;
+          extensionBuild?: number | null;
+          expectedExtensionBuild?: number;
+          extensionStale?: boolean;
         }>;
         connect: (port?: number) => Promise<{
           ok: boolean;

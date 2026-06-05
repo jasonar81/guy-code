@@ -64,6 +64,13 @@
  */
 
 const WS_URL = 'ws://127.0.0.1:9223';
+// Behavioral BUILD number of this extension. Reported in the `hello`
+// handshake so the Guy Code app can tell when the loaded (unpacked,
+// non-auto-updating) extension is older than the one the app ships and warn
+// the user to reload it. MUST stay in lockstep with EXTENSION_BUILD in
+// electron/extVersion.ts (a test enforces this). Bump BOTH whenever this
+// file's behavior changes. See electron/extVersion.ts for the history.
+const EXT_BUILD = 2;
 const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 5000, 10000];
 const KEEPALIVE_ALARM = 'guycode-keepalive';
 const KEEPALIVE_PERIOD_MIN = 0.5; // chrome.alarms minimum
@@ -110,6 +117,7 @@ function connect() {
       JSON.stringify({
         type: 'hello',
         version: '1',
+        extBuild: EXT_BUILD,
         ua: navigator.userAgent,
       })
     );

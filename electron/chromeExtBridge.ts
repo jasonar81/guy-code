@@ -68,6 +68,7 @@
  */
 import log from 'electron-log';
 import { createWsServer, type WsConnection, type WsServer } from './chromeWsServer';
+import { EXTENSION_BUILD, isExtensionStale } from './extVersion';
 
 /**
  * Optional injectable approval prompter. Production wiring (set in
@@ -157,6 +158,13 @@ interface BridgeState {
   /** Best-effort cache of the extension's last self-reported tab count. */
   lastTabCount: number;
   /**
+   * Behavioral build number the connected extension reported in its `hello`
+   * handshake, or null if it reported none (a pre-handshake / very old
+   * extension). Compared against EXTENSION_BUILD to detect a stale extension.
+   * Reset to null on disconnect.
+   */
+  extensionBuild: number | null;
+  /**
    * Tab ids the agent is allowed to operate on with write tools
    * (Click / Type / Press / Scroll / Eval) and Screenshot.
    *
@@ -187,6 +195,7 @@ const _state: BridgeState = {
   error: null,
   connectedAt: null,
   lastTabCount: 0,
+  extensionBuild: null,
   authorizedTabs: new Set<string>(),
 };
 
@@ -220,6 +229,16 @@ export interface ChromeStatus {
   error: string | null;
   connectedAt: number | null;
   tabCount: number;
+  /** Build the connected extension reported, or null if it reported none. */
+  extensionBuild: number | null;
+  /** Build the app ships / expects (EXTENSION_BUILD). */
+  expectedExtensionBuild: number;
+  /**
+   * True when connected AND the extension is older than the app's bundled
+   * one (or reports no build at all = pre-handshake). Drives the
+   * "reload your Chrome extension" warning in Settings.
+   */
+  extensionStale: boolean;
 }
 
 /**
@@ -233,6 +252,9 @@ export function getStatus(): ChromeStatus {
     error: _state.error,
     connectedAt: _state.connectedAt,
     tabCount: _state.lastTabCount,
+    extensionBuild: _state.extensionBuild,
+    expectedExtensionBuild: EXTENSION_BUILD,
+    extensionStale: isExtensionStale(_state.status, _state.extensionBuild, EXTENSION_BUILD),
   };
 }
 
@@ -331,6 +353,7 @@ export async function disconnect(): Promise<void> {
   _state.connectedAt = null;
   _state.error = null;
   _state.lastTabCount = 0;
+  _state.extensionBuild = null;
   // A fresh connect cycle gets a fresh authorization set — we don't
   // assume the user wants the agent to keep operating on the same
   // pre-existing tabs across reconnects (those tabs may even be
@@ -380,8 +403,12 @@ function _attachConnection(conn: WsConnection): void {
       // The extension says hi on every (re-)connect. Track the UA
       // for logs; if the protocol version ever changes we'd reject
       // mismatched versions here.
+      _state.extensionBuild = typeof msg.extBuild === 'number' ? msg.extBuild : null;
+      const stale = isExtensionStale(_state.status, _state.extensionBuild, EXTENSION_BUILD);
       log.info(
-        `[chromeExtBridge] extension hello: version=${msg.version} ua=${msg.ua}`
+        `[chromeExtBridge] extension hello: version=${msg.version} ` +
+          `extBuild=${_state.extensionBuild ?? 'none'} (app expects ${EXTENSION_BUILD}` +
+          `${stale ? '; STALE — user should reload the extension' : ''}) ua=${msg.ua}`
       );
       return;
     }
@@ -394,7 +421,24 @@ function _attachConnection(conn: WsConnection): void {
       clearTimeout(pending.timer);
       _pending.delete(msg.id);
       if ('error' in msg) {
-        pending.reject(new Error(`Chrome connector: ${String(msg.error)}`));
+        let errText = String(msg.error);
+        // If a capture/readback error comes back from a STALE extension,
+        // the most likely fix is reloading the extension (the current build
+        // has a chrome.debugger fallback that captures minimized/occluded
+        // windows where the old captureVisibleTab readback fails). Append an
+        // actionable hint so the model surfaces it to the user instead of
+        // retrying forever.
+        if (
+          /readback|capture|screenshot/i.test(errText) &&
+          isExtensionStale(_state.status, _state.extensionBuild, EXTENSION_BUILD)
+        ) {
+          errText +=
+            ' — NOTE: your Chrome extension is out of date (build ' +
+            `${_state.extensionBuild ?? 'unknown'}, app expects ${EXTENSION_BUILD}). ` +
+            'Reload it at chrome://extensions; the current build captures ' +
+            'minimized/occluded windows via a fallback that the loaded one lacks.';
+        }
+        pending.reject(new Error(`Chrome connector: ${errText}`));
       } else {
         pending.resolve(msg.result);
       }
@@ -418,6 +462,7 @@ function _detachConnection(): void {
     // side) so the UI knows. The Settings poll will pick this up.
     _state.status = 'connecting';
     _state.lastTabCount = 0;
+    _state.extensionBuild = null;
   }
 }
 
