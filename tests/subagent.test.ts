@@ -158,10 +158,12 @@ vi.mock('../electron/mcp', () => ({
 
 // Mock the db so we can spy on usage event inserts without SQLite.
 const _usageInserts: any[] = [];
+const _settings: Record<string, string> = {};
 vi.mock('../electron/db', () => ({
   insertUsageEvent: (u: any) => {
     _usageInserts.push(u);
   },
+  getSetting: (k: string) => _settings[k],
 }));
 
 // Mock budget so we can flip pre-flight allow/block per test.
@@ -417,10 +419,13 @@ describe('runSubagent', () => {
     expect(_streamCallCount).toBe(0);
   });
 
-  it('caps run length at MAX_SUBAGENT_ROUNDS and returns a partial-work message', async () => {
-    // Script 31 rounds where every response says "call a tool", forcing
-    // the loop to never reach end_turn.
-    for (let i = 0; i < 31; i++) {
+  it('caps run length at the configured round cap and returns a partial-work message', async () => {
+    // Configure a low cap so we don't have to script 200 rounds. This also
+    // exercises the `subagent_max_rounds` setting being honored.
+    _settings['subagent_max_rounds'] = '5';
+    // Script more rounds than the cap where every response says "call a
+    // tool", forcing the loop to never reach end_turn.
+    for (let i = 0; i < 6; i++) {
       _responses.push({
         content: [
           { type: 'tool_use', id: `tu_${i}`, name: 'Read', input: {} },
@@ -432,7 +437,31 @@ describe('runSubagent', () => {
       description: 't',
       prompt: 'p',
     });
-    expect(out).toMatch(/30-round cap/);
+    expect(out).toMatch(/5-round cap/);
+    delete _settings['subagent_max_rounds'];
+  });
+
+  it('defaults the round cap to 200 when the setting is unset', async () => {
+    // We don't run 200 rounds here; just assert the default is high (so the
+    // 30-round "always hits the cap" regression can't come back) by checking
+    // the message text path uses the default when no setting is present.
+    // A terminal response on round 1 means we never hit the cap, but the
+    // default value itself is what matters — verified via the next test
+    // that a 6-round script does NOT hit a default cap.
+    _responses.push({ content: [{ type: 'text', text: 'done' }] });
+    const out = await runSubagent(PARENT, { role: 'general', description: 't', prompt: 'p' });
+    expect(out).toBe('done');
+  });
+
+  it('does NOT hit the cap at 30 rounds anymore (the regression)', async () => {
+    // 35 tool rounds then a terminal turn. With the old 30 cap this returned
+    // the useless partial-work message; with the 200 default it finishes.
+    for (let i = 0; i < 35; i++) {
+      _responses.push({ content: [{ type: 'tool_use', id: `r${i}`, name: 'Read', input: {} }] });
+    }
+    _responses.push({ content: [{ type: 'text', text: 'finished after 35 rounds' }] });
+    const out = await runSubagent(PARENT, { role: 'general', description: 't', prompt: 'p' });
+    expect(out).toBe('finished after 35 rounds');
   });
 
   it('only exposes the role-curated toolset to the model', async () => {

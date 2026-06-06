@@ -51,8 +51,12 @@ export function detectSlashContext(text: string, cursor: number): SlashContext |
   if (text[i] !== '/') return null;
   const slashStart = i;
   const next = text[i + 1];
-  // `/[whitespace]` or `//foo` or trailing `/` alone → not a command.
-  if (next === undefined || next === '/' || /\s/.test(next)) return null;
+  // Reject `//foo` (comment-ish) and `/ thing` (slash then space). But a
+  // BARE trailing `/` (next === undefined) IS valid: that's the user opening
+  // the picker to browse the full alphabetical list because they can't
+  // remember the skill name — the headline UX of this menu. It yields an
+  // empty query, which filterSkills('') turns into the full sorted list.
+  if (next === '/' || (next !== undefined && /\s/.test(next))) return null;
   // Walk to end of the command name (first whitespace/newline OR end).
   let j = i + 1;
   while (j < text.length && !/\s/.test(text[j])) j++;

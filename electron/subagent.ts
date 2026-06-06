@@ -44,15 +44,33 @@ import { TOOLS, executeTool, type ToolContext } from './tools';
 import { maybeSummarize } from './toolSummarizer';
 import { getMcpToolSchemas } from './mcp';
 import { computeCostMicros } from './pricing';
-import { insertUsageEvent } from './db';
+import { insertUsageEvent, getSetting } from './db';
 import { precheckCall } from './budget';
 import type { MemoryBundle } from './memory';
 
 /** Roles supported by the subagent system. */
 export type SubagentRole = 'plan' | 'execute' | 'review' | 'general';
 
-/** Hard cap on rounds inside a single subagent run. */
-const MAX_SUBAGENT_ROUNDS = 30;
+/**
+ * Backstop cap on rounds inside a single subagent run. This is NOT the
+ * primary limiter — the per-round budget governor (precheckCall in the loop)
+ * is what actually stops a runaway child. The round cap only exists so a
+ * pathologically looping child (e.g. retrying the same failing tool forever)
+ * can't spin without bound.
+ *
+ * It used to be 30, which a real Execute/Review child hits ALL THE TIME — a
+ * multi-file change that reads a dozen files, edits several, builds, and runs
+ * tests easily burns 30+ tool rounds, so the child returned a useless "hit
+ * the cap" message with no work product. The default is now high enough that
+ * only genuine loops hit it; normal work finishes (or the budget governor
+ * stops it) long before. Configurable via the `subagent_max_rounds` setting
+ * for anyone who wants to tune it.
+ */
+const DEFAULT_MAX_SUBAGENT_ROUNDS = 200;
+function getMaxSubagentRounds(): number {
+  const n = Number(getSetting('subagent_max_rounds'));
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_SUBAGENT_ROUNDS;
+}
 
 /**
  * Tool subsets per role. Each entry is a list of native tool names; we
@@ -342,7 +360,8 @@ export async function runSubagent(
   ];
 
   let finalText = '';
-  for (let round = 0; round < MAX_SUBAGENT_ROUNDS; round++) {
+  const maxRounds = getMaxSubagentRounds();
+  for (let round = 0; round < maxRounds; round++) {
     if (parent.signal?.aborted) {
       log.info(`[${tag}] aborted by parent before round ${round}`);
       throw new Error('subagent aborted by parent');
@@ -548,10 +567,8 @@ export async function runSubagent(
   }
 
   if (!finalText) {
-    log.warn(
-      `[${tag}] hit MAX_SUBAGENT_ROUNDS (${MAX_SUBAGENT_ROUNDS}) without a terminal turn`
-    );
-    return `[subagent ${input.role} hit ${MAX_SUBAGENT_ROUNDS}-round cap without producing a final answer; partial work above may be useful but the run did not finish cleanly]`;
+    log.warn(`[${tag}] hit subagent round cap (${maxRounds}) without a terminal turn`);
+    return `[subagent ${input.role} hit the ${maxRounds}-round cap without producing a final answer; partial work above may be useful but the run did not finish cleanly. If this role legitimately needs more rounds, raise the 'subagent_max_rounds' setting.]`;
   }
   return finalText;
 }

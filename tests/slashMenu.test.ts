@@ -44,10 +44,27 @@ describe('detectSlashContext', () => {
     expect(detectSlashContext('hello', 5)).toBeNull();
   });
 
-  it('detects a bare leading slash with cursor right after', () => {
+  it('opens the menu (empty query) for a bare leading slash — the picker UX', () => {
+    // Typing just `/` is how the user browses the full alphabetical list
+    // when they can't remember a skill name. It must yield a context with an
+    // empty query (filterSkills('') then returns the full sorted list).
     const r = detectSlashContext('/', 1);
-    // Bare `/` alone has no second char → null (matches parser rule).
-    expect(r).toBeNull();
+    expect(r).not.toBeNull();
+    expect(r!.query).toBe('');
+    expect(r!.slashStart).toBe(0);
+    expect(r!.queryEnd).toBe(1);
+  });
+
+  it('opens the menu for a bare slash after leading whitespace', () => {
+    const r = detectSlashContext('  /', 3);
+    expect(r).not.toBeNull();
+    expect(r!.query).toBe('');
+    expect(r!.slashStart).toBe(2);
+  });
+
+  it('still rejects // (comment-ish) and "/ " (slash then space)', () => {
+    expect(detectSlashContext('//', 2)).toBeNull();
+    expect(detectSlashContext('/ ', 1)).toBeNull();
   });
 
   it('detects /foo with cursor at the end of foo', () => {
