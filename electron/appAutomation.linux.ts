@@ -243,6 +243,37 @@ export class LinuxBackend extends BaseBackend implements AutomationBackend {
     runOn(s.display, 'xdotool', ['click', '--window', windowId, btn]);
   }
 
+  async drag(
+    appId: string,
+    windowId: string,
+    path: Array<{ x: number; y: number }>,
+    button: 'left' | 'right' = 'left'
+  ): Promise<void> {
+    const s = this.sessionFor(appId);
+    if (path.length === 0) throw new Error('drag needs at least one point');
+    const btn = button === 'right' ? '3' : '1';
+    // Real X drag: move to start, press, move through interpolated points,
+    // release. Interpolate so the app samples a smooth motion (a single jump
+    // wouldn't draw a curve).
+    const pts: Array<{ x: number; y: number }> = [];
+    pts.push(path[0]);
+    for (let k = 1; k < path.length; k++) {
+      const a = path[k - 1];
+      const b = path[k];
+      const dist = Math.hypot(b.x - a.x, b.y - a.y);
+      const steps = Math.max(1, Math.min(60, Math.round(dist / 6)));
+      for (let s2 = 1; s2 <= steps; s2++) {
+        pts.push({ x: Math.round(a.x + ((b.x - a.x) * s2) / steps), y: Math.round(a.y + ((b.y - a.y) * s2) / steps) });
+      }
+    }
+    runOn(s.display, 'xdotool', ['mousemove', '--window', windowId, String(pts[0].x), String(pts[0].y)]);
+    runOn(s.display, 'xdotool', ['mousedown', '--window', windowId, btn]);
+    for (let k = 1; k < pts.length; k++) {
+      runOn(s.display, 'xdotool', ['mousemove', '--window', windowId, String(pts[k].x), String(pts[k].y)]);
+    }
+    runOn(s.display, 'xdotool', ['mouseup', '--window', windowId, btn]);
+  }
+
   async type(appId: string, windowId: string, text: string): Promise<void> {
     const s = this.sessionFor(appId);
     runOn(s.display, 'xdotool', ['type', '--window', windowId, '--', text]);

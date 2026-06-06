@@ -60,11 +60,27 @@ static class Native {
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+
+  // SendInput: injects real mouse/keyboard events into the desktop the
+  // CALLING THREAD is attached to. Because the helper's thread is bound to
+  // the hidden desktop (SetThreadDesktop), these land there - producing real
+  // mouse drags the canvas honors - without touching the user's real desktop.
+  [StructLayout(LayoutKind.Sequential)]
+  public struct INPUT { public uint type; public MOUSEINPUT mi; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr extra; }
+  [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] inp, int sz);
 
   public const uint DESKTOP_ALL = 0x01FF;
   public const uint PW_RENDERFULLCONTENT = 0x00000002;
   public const uint WM_CHAR = 0x0102, WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101;
   public const uint WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205;
+  // SendInput mouse flags.
+  public const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_ABSOLUTE = 0x8000;
+  public const uint MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
+  public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010;
+  public const int SM_CXSCREEN = 0, SM_CYSCREEN = 1;
 }
 
 // Minimal JSON writer/reader (no external deps; csc-only build).
@@ -165,6 +181,7 @@ class Helper {
       case "list": List(id, req); break;
       case "screenshot": Screenshot(id, req); break;
       case "click": Click(id, req); break;
+      case "drag": Drag(id, req); break;
       case "type": Type(id, req); break;
       case "key": Key(id, req); break;
       case "close": Close(id, req); break;
@@ -231,6 +248,100 @@ class Helper {
     return ws.Count > 0 ? ws[0] : IntPtr.Zero;
   }
 
+  // ---- Real mouse input via SendInput (lands on the hidden desktop) ----
+
+  static void MouseMoveAbs(int screenX, int screenY) {
+    int sw = Native.GetSystemMetrics(Native.SM_CXSCREEN);
+    int sh = Native.GetSystemMetrics(Native.SM_CYSCREEN);
+    if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+    var inp = new Native.INPUT[1];
+    inp[0].type = 0; // INPUT_MOUSE
+    inp[0].mi.dx = (int)(((long)screenX * 65535) / sw);
+    inp[0].mi.dy = (int)(((long)screenY * 65535) / sh);
+    inp[0].mi.dwFlags = Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE;
+    Native.SendInput(1, inp, Marshal.SizeOf(typeof(Native.INPUT)));
+  }
+
+  static void MouseBtn(uint flag) {
+    var inp = new Native.INPUT[1];
+    inp[0].type = 0;
+    inp[0].mi.dwFlags = flag;
+    Native.SendInput(1, inp, Marshal.SizeOf(typeof(Native.INPUT)));
+  }
+
+  // Parse a JSON array of {"x":N,"y":N} points from the request.
+  static List<int[]> ParsePath(string req) {
+    var pts = new List<int[]>();
+    int i = req.IndexOf("\"path\"");
+    if (i < 0) return pts;
+    i = req.IndexOf('[', i); if (i < 0) return pts;
+    int end = req.IndexOf(']', i); if (end < 0) end = req.Length;
+    string seg = req.Substring(i, end - i);
+    int p = 0;
+    while (true) {
+      int br = seg.IndexOf('{', p); if (br < 0) break;
+      int brEnd = seg.IndexOf('}', br); if (brEnd < 0) break;
+      string obj = seg.Substring(br, brEnd - br + 1);
+      int x = J.Int(obj, "x", int.MinValue), y = J.Int(obj, "y", int.MinValue);
+      if (x != int.MinValue && y != int.MinValue) pts.Add(new int[] { x, y });
+      p = brEnd + 1;
+    }
+    return pts;
+  }
+
+  static void Drag(int id, string req) {
+    IntPtr h = ResolveWindow(J.Str(req, "appId"), J.Str(req, "windowId"));
+    if (h == IntPtr.Zero) { Err(id, "no window"); return; }
+    var path = ParsePath(req);
+    // Convenience: accept fromX/fromY/toX/toY if no explicit path.
+    if (path.Count == 0) {
+      int fx = J.Int(req, "fromX", int.MinValue), fy = J.Int(req, "fromY", int.MinValue);
+      int tx = J.Int(req, "toX", int.MinValue), ty = J.Int(req, "toY", int.MinValue);
+      if (fx == int.MinValue || tx == int.MinValue) { Err(id, "drag needs 'path' or fromX/fromY/toX/toY"); return; }
+      path.Add(new int[] { fx, fy });
+      path.Add(new int[] { tx, ty });
+    }
+    if (path.Count < 1) { Err(id, "empty path"); return; }
+    string button = J.Str(req, "button") ?? "left";
+    uint bdown = button == "right" ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_LEFTDOWN;
+    uint bup = button == "right" ? Native.MOUSEEVENTF_RIGHTUP : Native.MOUSEEVENTF_LEFTUP;
+
+    Native.RECT r; Native.GetWindowRect(h, out r);
+    Func<int, int, int[]> toScreen = (wx, wy) => new int[] { r.Left + wx, r.Top + wy };
+
+    // Position at the first point, press, move through the path with
+    // interpolated sub-steps (so the app samples a smooth motion), release.
+    var p0 = toScreen(path[0][0], path[0][1]);
+    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(30);
+    MouseBtn(bdown); Thread.Sleep(30);
+    int prevX = path[0][0], prevY = path[0][1];
+    for (int k = 1; k < path.Count; k++) {
+      int cx = path[k][0], cy = path[k][1];
+      int dx = cx - prevX, dy = cy - prevY;
+      int dist = (int)Math.Sqrt(dx * dx + dy * dy);
+      int steps = Math.Max(1, Math.Min(60, dist / 6)); // ~one sample per 6px
+      for (int s = 1; s <= steps; s++) {
+        int ix = prevX + dx * s / steps, iy = prevY + dy * s / steps;
+        var sp = toScreen(ix, iy);
+        MouseMoveAbs(sp[0], sp[1]);
+        Thread.Sleep(8);
+      }
+      prevX = cx; prevY = cy;
+    }
+    Thread.Sleep(30);
+    MouseBtn(bup);
+    Ok(id, "{\"via\":\"sendinput-drag\",\"points\":" + path.Count + "}");
+  }
+
+  // A REAL click via SendInput (for canvases where UIA invoke does nothing).
+  static void RealClick(IntPtr h, int x, int y, string button) {
+    Native.RECT r; Native.GetWindowRect(h, out r);
+    MouseMoveAbs(r.Left + x, r.Top + y); Thread.Sleep(20);
+    uint d = button == "right" ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_LEFTDOWN;
+    uint u = button == "right" ? Native.MOUSEEVENTF_RIGHTUP : Native.MOUSEEVENTF_LEFTUP;
+    MouseBtn(d); Thread.Sleep(20); MouseBtn(u);
+  }
+
   static void Screenshot(int id, string req) {
     IntPtr h = ResolveWindow(J.Str(req, "appId"), J.Str(req, "windowId"));
     if (h == IntPtr.Zero) { Err(id, "no window to capture"); return; }
@@ -280,13 +391,11 @@ class Helper {
         ((SelectionItemPattern)pat).Select(); Ok(id, "{\"via\":\"uia-select\"}"); return;
       }
     }
-    // Fall back to PostMessage at client coords.
-    IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-    uint down = button == "right" ? Native.WM_RBUTTONDOWN : Native.WM_LBUTTONDOWN;
-    uint up = button == "right" ? Native.WM_RBUTTONUP : Native.WM_LBUTTONUP;
-    Native.PostMessage(h, down, (IntPtr)1, lp);
-    Native.PostMessage(h, up, IntPtr.Zero, lp);
-    Ok(id, "{\"via\":\"postmessage\"}");
+    // Fall back to a REAL SendInput click (works on canvases / custom-drawn
+    // surfaces where neither UIA nor posted messages register). This lands on
+    // the hidden desktop, so the user's real cursor is untouched.
+    RealClick(h, x, y, button);
+    Ok(id, "{\"via\":\"sendinput-click\"}");
   }
 
   static void Type(int id, string req) {

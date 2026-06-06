@@ -84,6 +84,14 @@ export interface AutomationBackend {
   screenshot(appId: string, windowId?: string): Promise<AppScreenshotResult>;
   /** Click at window-relative coordinates. */
   click(appId: string, windowId: string, x: number, y: number, button?: 'left' | 'right'): Promise<void>;
+  /**
+   * Press-move-release drag through a path of window-relative points. The
+   * backend interpolates between points for a smooth motion, so a 2-point
+   * path is a straight drag (shape-tool bounds, slider, drag-and-drop) and a
+   * many-point path is a freehand stroke. Uses REAL mouse input on the
+   * isolated display, so it actually draws / drags (unlike a UIA invoke).
+   */
+  drag(appId: string, windowId: string, path: Array<{ x: number; y: number }>, button?: 'left' | 'right'): Promise<void>;
   /** Type a string into the focused control of the window. */
   type(appId: string, windowId: string, text: string): Promise<void>;
   /** Press a key / chord (e.g. "Enter", "ctrl+s"). */

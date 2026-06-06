@@ -210,6 +210,16 @@ export class WindowsBackend extends BaseBackend implements AutomationBackend {
     await session.rpc('click', { appId: helperAppId, windowId, x, y, button });
   }
 
+  async drag(
+    appId: string,
+    windowId: string,
+    path: Array<{ x: number; y: number }>,
+    button: 'left' | 'right' = 'left'
+  ): Promise<void> {
+    const { session, helperAppId } = this.helperFor(appId);
+    await session.rpc('drag', { appId: helperAppId, windowId, path, button });
+  }
+
   async type(appId: string, windowId: string, text: string): Promise<void> {
     const { session, helperAppId } = this.helperFor(appId);
     await session.rpc('type', { appId: helperAppId, windowId, text });

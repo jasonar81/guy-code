@@ -82,6 +82,7 @@ describe('App* tool schemas', () => {
       'AppListWindows',
       'AppScreenshot',
       'AppClick',
+      'AppDrag',
       'AppType',
       'AppPress',
       'AppClose',
@@ -95,5 +96,22 @@ describe('App* tool schemas', () => {
     expect((TOOLS['AppClick'].schema.input_schema as any).required).toEqual(
       expect.arrayContaining(['appId', 'windowId', 'x', 'y'])
     );
+    // AppDrag accepts a path of points (the freehand/draw primitive).
+    const dragProps = (TOOLS['AppDrag'].schema.input_schema as any).properties;
+    expect(dragProps.path).toBeTruthy();
+    expect(dragProps.path.type).toBe('array');
+  });
+
+  it('AppDrag rejects a call with neither path nor from/to coords', async () => {
+    const { TOOLS } = await import('../electron/tools');
+    // On macOS the backend is null and we get the "not supported" message;
+    // on win/linux with no path/coords we get the arg-validation message.
+    // Either way it must NOT throw and must return an error string.
+    const out = await TOOLS['AppDrag'].execute(
+      { appId: 'x', windowId: 'y' },
+      { sessionId: 's', cwd: '' } as any
+    );
+    expect(typeof out).toBe('string');
+    expect(out as string).toMatch(/path|not supported|macOS/i);
   });
 });

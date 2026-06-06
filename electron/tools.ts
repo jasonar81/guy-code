@@ -2258,6 +2258,63 @@ const APP_CLICK: ToolDef = {
   },
 };
 
+const APP_DRAG: ToolDef = {
+  schema: {
+    name: 'AppDrag',
+    description:
+      'Press-move-release drag with REAL mouse input — this is how you DRAW (freehand strokes), use shape tools (click-drag bounds), move sliders, or drag-and-drop. Unlike AppClick (a single discrete click), AppDrag holds the button down and moves through a path, which canvases and drawing apps actually register. Provide either a `path` of window-relative points (many points = a freehand curve) OR fromX/fromY/toX/toY for a straight drag. Coordinates are window-relative (from the latest AppScreenshot). Take a screenshot afterward to confirm the result.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        appId: { type: 'string' },
+        windowId: { type: 'string' },
+        path: {
+          type: 'array',
+          description:
+            'Ordered window-relative points to drag through, e.g. [{"x":100,"y":100},{"x":160,"y":140},...]. Two points = a straight drag; many = a freehand stroke. The backend interpolates between points for a smooth motion.',
+          items: {
+            type: 'object',
+            properties: { x: { type: 'integer' }, y: { type: 'integer' } },
+            required: ['x', 'y'],
+          },
+        },
+        fromX: { type: 'integer', description: 'Convenience straight drag: start X (use instead of path).' },
+        fromY: { type: 'integer' },
+        toX: { type: 'integer' },
+        toY: { type: 'integer' },
+        button: { type: 'string', enum: ['left', 'right'], description: 'Default left.' },
+      },
+      required: ['appId', 'windowId'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    let path: Array<{ x: number; y: number }> = [];
+    if (Array.isArray(input.path) && input.path.length > 0) {
+      path = input.path.map((p: any) => ({ x: Number(p.x), y: Number(p.y) }));
+    } else if (
+      typeof input.fromX === 'number' &&
+      typeof input.fromY === 'number' &&
+      typeof input.toX === 'number' &&
+      typeof input.toY === 'number'
+    ) {
+      path = [
+        { x: input.fromX, y: input.fromY },
+        { x: input.toX, y: input.toY },
+      ];
+    } else {
+      return 'error: AppDrag needs either a non-empty "path" array or all of fromX/fromY/toX/toY.';
+    }
+    await backend.drag(
+      String(input.appId),
+      String(input.windowId),
+      path,
+      input.button === 'right' ? 'right' : 'left'
+    );
+    return `Dragged through ${path.length} point(s) in window ${input.windowId}.`;
+  },
+};
+
 const APP_TYPE: ToolDef = {
   schema: {
     name: 'AppType',
@@ -2608,6 +2665,7 @@ export const TOOLS: Record<string, ToolDef> = {
   AppListWindows: APP_LIST_WINDOWS,
   AppScreenshot: APP_SCREENSHOT,
   AppClick: APP_CLICK,
+  AppDrag: APP_DRAG,
   AppType: APP_TYPE,
   AppPress: APP_PRESS,
   AppClose: APP_CLOSE,
