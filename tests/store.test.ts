@@ -261,3 +261,50 @@ describe('store: setForceContinue', () => {
     expect(sess?.force_continue).toBe(1);
   });
 });
+
+describe('store: subagent live activity streams into the conversation', () => {
+  const SID = 'subagent-stream-session';
+  function reset2() {
+    useApp.setState((s) => ({ chats: { ...s.chats, [SID]: undefined as any } }));
+  }
+  function fire2(e: any) { useApp.getState().applyAgentEvent(e); }
+  beforeEach(reset2);
+
+  it('builds a subagent block from start/text/tool/result/done events', () => {
+    fire2({ type: 'turn_start', sessionId: SID, userText: 'do it' });
+    fire2({ type: 'subagent_start', sessionId: SID, runId: 'r1', role: 'execute', description: 'make the change' });
+    fire2({ type: 'subagent_text', sessionId: SID, runId: 'r1', text: 'Reading the file.' });
+    fire2({ type: 'subagent_tool', sessionId: SID, runId: 'r1', toolId: 'tu1', name: 'Read', input: { file_path: '/x' } });
+    fire2({ type: 'subagent_tool_result', sessionId: SID, runId: 'r1', toolId: 'tu1', content: 'file contents', isError: false });
+    fire2({ type: 'subagent_done', sessionId: SID, runId: 'r1', ok: true });
+
+    const msgs = useApp.getState().chats[SID]!.messages;
+    const asst = msgs.find((m) => m.role === 'assistant')!;
+    const sa = (asst.content as any[]).find((b) => b.type === 'subagent');
+    expect(sa).toBeTruthy();
+    expect(sa.role).toBe('execute');
+    expect(sa.description).toBe('make the change');
+    expect(sa.done).toBe(true);
+    expect(sa.items).toEqual([
+      { kind: 'text', text: 'Reading the file.' },
+      { kind: 'tool', toolId: 'tu1', name: 'Read', input: { file_path: '/x' } },
+      { kind: 'tool_result', toolId: 'tu1', content: 'file contents', isError: false },
+    ]);
+  });
+
+  it('keeps two concurrent subagent runs separate by runId', () => {
+    fire2({ type: 'turn_start', sessionId: SID, userText: 'x' });
+    fire2({ type: 'subagent_start', sessionId: SID, runId: 'a', role: 'plan', description: 'plan it' });
+    fire2({ type: 'subagent_start', sessionId: SID, runId: 'b', role: 'review', description: 'review it' });
+    fire2({ type: 'subagent_text', sessionId: SID, runId: 'b', text: 'review note' });
+    fire2({ type: 'subagent_text', sessionId: SID, runId: 'a', text: 'plan note' });
+
+    const asst = useApp.getState().chats[SID]!.messages.find((m) => m.role === 'assistant')!;
+    const blocks = (asst.content as any[]).filter((b) => b.type === 'subagent');
+    expect(blocks.length).toBe(2);
+    const a = blocks.find((b) => b.runId === 'a');
+    const b = blocks.find((b) => b.runId === 'b');
+    expect(a.items).toEqual([{ kind: 'text', text: 'plan note' }]);
+    expect(b.items).toEqual([{ kind: 'text', text: 'review note' }]);
+  });
+});

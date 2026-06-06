@@ -1046,6 +1046,64 @@ export const useApp = create<AppState>((set, get) => ({
           next.retryNotice = null;
           break;
         }
+        // ---- Subagent live activity ----
+        // Stream a subagent's narration + tool calls into the conversation as
+        // a nested 'subagent' block on the current streaming assistant
+        // message, so the user watches it work instead of staring at a frozen
+        // window. The block is live-only; when the turn's persisted message
+        // replaces the streaming one, the normal Task tool card + result
+        // remain.
+        case 'subagent_start': {
+          const msgs = ensureStreamingAssistant(next.messages);
+          const last = msgs[msgs.length - 1];
+          last.content = [
+            ...last.content,
+            {
+              type: 'subagent',
+              runId: e.runId,
+              role: e.role,
+              description: e.description,
+              done: false,
+              items: [],
+            },
+          ];
+          next.messages = msgs;
+          break;
+        }
+        case 'subagent_text':
+        case 'subagent_tool':
+        case 'subagent_tool_result':
+        case 'subagent_done': {
+          const msgs = ensureStreamingAssistant(next.messages);
+          const last = msgs[msgs.length - 1];
+          if (last && last.role === 'assistant') {
+            last.content = last.content.map((b) => {
+              if (b.type !== 'subagent' || b.runId !== e.runId) return b;
+              if (e.type === 'subagent_text') {
+                return { ...b, items: [...b.items, { kind: 'text' as const, text: e.text }] };
+              }
+              if (e.type === 'subagent_tool') {
+                return {
+                  ...b,
+                  items: [...b.items, { kind: 'tool' as const, toolId: e.toolId, name: e.name, input: e.input }],
+                };
+              }
+              if (e.type === 'subagent_tool_result') {
+                return {
+                  ...b,
+                  items: [
+                    ...b.items,
+                    { kind: 'tool_result' as const, toolId: e.toolId, content: e.content, isError: e.isError },
+                  ],
+                };
+              }
+              // subagent_done
+              return { ...b, done: true };
+            });
+          }
+          next.messages = msgs;
+          break;
+        }
         case 'turn_done': {
           next.streaming = false;
           next.awaitingResponse = null;

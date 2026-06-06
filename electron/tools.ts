@@ -2448,6 +2448,8 @@ const TASK: ToolDef = {
   },
   async execute(input, ctx) {
     const { runSubagent } = await import('./subagent');
+    // Dynamic import of broadcast avoids a static cycle (agent -> tools).
+    const { broadcast } = await import('./agent');
     const role = (input.role || 'general') as
       | 'plan'
       | 'execute'
@@ -2461,6 +2463,7 @@ const TASK: ToolDef = {
         apiKeyId: ctx.apiKeyId ?? null,
         signal: ctx.signal,
         memory: ctx.memory,
+        emit: broadcast as (e: unknown) => void,
       },
       {
         role,
@@ -2497,6 +2500,8 @@ const PLAN: ToolDef = {
   },
   async execute(input, ctx) {
     const { runSubagent } = await import('./subagent');
+    // Dynamic import of broadcast avoids a static cycle (agent -> tools).
+    const { broadcast } = await import('./agent');
     return runSubagent(
       {
         sessionId: ctx.sessionId,
@@ -2505,6 +2510,7 @@ const PLAN: ToolDef = {
         apiKeyId: ctx.apiKeyId ?? null,
         signal: ctx.signal,
         memory: ctx.memory,
+        emit: broadcast as (e: unknown) => void,
       },
       {
         role: 'plan',
@@ -2541,6 +2547,8 @@ const EXECUTE: ToolDef = {
   },
   async execute(input, ctx) {
     const { runSubagent } = await import('./subagent');
+    // Dynamic import of broadcast avoids a static cycle (agent -> tools).
+    const { broadcast } = await import('./agent');
     return runSubagent(
       {
         sessionId: ctx.sessionId,
@@ -2549,6 +2557,7 @@ const EXECUTE: ToolDef = {
         apiKeyId: ctx.apiKeyId ?? null,
         signal: ctx.signal,
         memory: ctx.memory,
+        emit: broadcast as (e: unknown) => void,
       },
       {
         role: 'execute',
@@ -2585,6 +2594,8 @@ const REVIEW: ToolDef = {
   },
   async execute(input, ctx) {
     const { runSubagent } = await import('./subagent');
+    // Dynamic import of broadcast avoids a static cycle (agent -> tools).
+    const { broadcast } = await import('./agent');
     return runSubagent(
       {
         sessionId: ctx.sessionId,
@@ -2593,6 +2604,7 @@ const REVIEW: ToolDef = {
         apiKeyId: ctx.apiKeyId ?? null,
         signal: ctx.signal,
         memory: ctx.memory,
+        emit: broadcast as (e: unknown) => void,
       },
       {
         role: 'review',

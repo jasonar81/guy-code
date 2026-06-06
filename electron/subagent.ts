@@ -313,6 +313,15 @@ export interface SubagentParent {
   memory?: MemoryBundle;
   /** Model override; defaults to the parent's model (= DEFAULT_MODEL). */
   model?: string;
+  /**
+   * Optional sink for live subagent-activity events (broadcast to the
+   * conversation window). When provided, the child's per-round narration +
+   * tool calls stream to the UI as the subagent works, instead of the user
+   * seeing nothing until the final result. The tool layer passes `broadcast`
+   * from agent.ts here. Typed loosely to avoid a static import cycle
+   * (agent -> tools -> subagent -> agent).
+   */
+  emit?: (event: unknown) => void;
 }
 
 export interface SubagentInput {
@@ -362,6 +371,16 @@ export async function runSubagent(
     memory: parent.memory,
     signal: parent.signal,
   };
+
+  // Live-activity emit helper. No-op when the parent didn't wire a sink.
+  const emit = (event: Record<string, unknown>) => {
+    try {
+      parent.emit?.({ ...event, sessionId: parent.sessionId, runId: runId });
+    } catch {
+      /* never let a UI emit break the run */
+    }
+  };
+  emit({ type: 'subagent_start', role: input.role, description: input.description });
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -505,10 +524,15 @@ export async function runSubagent(
       .join('\n')
       .trim();
     if (roundText) lastAssistantText = roundText;
+    if (roundText) emit({ type: 'subagent_text', text: roundText });
 
     const toolUses = response.content.filter(
       (b: any) => b.type === 'tool_use'
     ) as Anthropic.ToolUseBlock[];
+    // Surface each tool the child is about to run.
+    for (const tu of toolUses) {
+      emit({ type: 'subagent_tool', toolId: tu.id, name: tu.name, input: tu.input });
+    }
 
     if (toolUses.length === 0) {
       // No tool calls → terminal turn. Concatenate text blocks for the
@@ -577,12 +601,24 @@ export async function runSubagent(
           content: summarized.content,
           is_error: summarized.isError,
         });
+        emit({
+          type: 'subagent_tool_result',
+          toolId: tu.id,
+          content: typeof summarized.content === 'string' ? summarized.content : '[non-text result]',
+          isError: !!summarized.isError,
+        });
       } else {
         toolResultBlocks.push({
           type: 'tool_result',
           tool_use_id: tu.id,
           content: r.content as any,
           is_error: r.isError,
+        });
+        emit({
+          type: 'subagent_tool_result',
+          toolId: tu.id,
+          content: '[image or structured result]',
+          isError: !!r.isError,
         });
       }
     }
@@ -603,8 +639,10 @@ export async function runSubagent(
     // Return the partial work product PLUS the note, so the parent gets
     // whatever the child accomplished instead of nothing. Fall back to the
     // note alone if the child never emitted any text.
+    emit({ type: 'subagent_done', ok: false });
     return lastAssistantText ? `${lastAssistantText}\n\n${note}` : note;
   }
+  emit({ type: 'subagent_done', ok: true });
   return finalText;
 }
 

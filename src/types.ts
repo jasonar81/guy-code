@@ -131,7 +131,26 @@ export type ContentBlock =
       };
       /** Local-only: optional original filename to show in the bubble. */
       name?: string;
+    }
+  | {
+      /**
+       * Local-only (live): a subagent's activity streamed into the
+       * conversation while it runs — its narration + tool calls, visually
+       * attributed to the subagent. Built up from subagent_* agent events and
+       * dropped when the turn's persisted message replaces the streaming one.
+       */
+      type: 'subagent';
+      runId: string;
+      role: string;
+      description: string;
+      done: boolean;
+      items: SubagentItem[];
     };
+
+export type SubagentItem =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; toolId: string; name: string; input: unknown }
+  | { kind: 'tool_result'; toolId: string; content: string; isError: boolean };
 
 /**
  * Attachment shape used by the composer/IPC. Distinct from `ContentBlock`
@@ -240,6 +259,31 @@ export type AgentEvent =
   | { type: 'usage'; sessionId: string; costUsdMicros: number; usage: any }
   | { type: 'wait_for_user'; sessionId: string; id: string; question: string }
   | { type: 'turn_done'; sessionId: string; stopReason: string | null }
+  | {
+      type: 'subagent_start';
+      sessionId: string;
+      runId: string;
+      role: string;
+      description: string;
+    }
+  | { type: 'subagent_text'; sessionId: string; runId: string; text: string }
+  | {
+      type: 'subagent_tool';
+      sessionId: string;
+      runId: string;
+      toolId: string;
+      name: string;
+      input: unknown;
+    }
+  | {
+      type: 'subagent_tool_result';
+      sessionId: string;
+      runId: string;
+      toolId: string;
+      content: string;
+      isError: boolean;
+    }
+  | { type: 'subagent_done'; sessionId: string; runId: string; ok: boolean }
   | { type: 'interrupt_picked_up'; sessionId: string; text: string }
   | { type: 'state_changed'; sessionId: string; state: ProjectState }
   | {

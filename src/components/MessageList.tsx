@@ -5,6 +5,7 @@ import { useApp } from '@/lib/store';
 import { ToolCallCard } from './ToolCallCard';
 import { RichText } from './RichText';
 import { InlineImage } from './InlineImage';
+import { SubagentActivity } from './SubagentActivity';
 import { LinkifyText } from './LinkifyText';
 import { absoluteTime } from '@/lib/format';
 import { decideScrollWatchdog } from '@/lib/scrollWatchdog';
@@ -1057,6 +1058,9 @@ function MessageBlockImpl({
               alt={b.name ?? 'image'}
             />
           );
+        }
+        if (b.type === 'subagent') {
+          return <SubagentActivity key={`sa-${b.runId}`} block={b} />;
         }
         if (b.type === 'tool_use') {
           // WaitForUser is the model's way of saying "I need an answer from

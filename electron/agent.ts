@@ -109,6 +109,36 @@ export type AgentEvent =
       question: string;
     }
   | { type: 'turn_done'; sessionId: string; stopReason: string | null }
+  // ---- Subagent live activity (Task / Plan / Execute / Review) ----
+  // While a subagent runs, the parent turn is blocked and the user would
+  // otherwise see nothing until the child returns. These stream the child's
+  // narration + tool calls into the SAME conversation window, visually
+  // attributed to the subagent, so you can watch it work in real time.
+  | {
+      type: 'subagent_start';
+      sessionId: string;
+      runId: string;
+      role: string;
+      description: string;
+    }
+  | { type: 'subagent_text'; sessionId: string; runId: string; text: string }
+  | {
+      type: 'subagent_tool';
+      sessionId: string;
+      runId: string;
+      toolId: string;
+      name: string;
+      input: unknown;
+    }
+  | {
+      type: 'subagent_tool_result';
+      sessionId: string;
+      runId: string;
+      toolId: string;
+      content: string;
+      isError: boolean;
+    }
+  | { type: 'subagent_done'; sessionId: string; runId: string; ok: boolean }
   | {
       /**
        * The agent loop drained a user-typed-while-running interrupt off the
@@ -789,7 +819,7 @@ function buildUserContent(
   return blocks;
 }
 
-function broadcast(e: AgentEvent) {
+export function broadcast(e: AgentEvent) {
   for (const w of BrowserWindow.getAllWindows()) {
     if (!w.isDestroyed()) w.webContents.send('agent:event', e);
   }
