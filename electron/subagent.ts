@@ -67,7 +67,11 @@ export type SubagentRole = 'plan' | 'execute' | 'review' | 'general';
  * for anyone who wants to tune it.
  */
 const DEFAULT_MAX_SUBAGENT_ROUNDS = 200;
-function getMaxSubagentRounds(): number {
+function getMaxSubagentRounds(override?: number): number {
+  // Per-call override wins when the caller knows the task is big.
+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+    return Math.floor(override);
+  }
   const n = Number(getSetting('subagent_max_rounds'));
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_SUBAGENT_ROUNDS;
 }
@@ -317,6 +321,13 @@ export interface SubagentInput {
   description: string;
   /** The actual task body the subagent receives as its sole user message. */
   prompt: string;
+  /**
+   * Optional per-call override for the round cap. The parent passes this when
+   * it KNOWS a task is large (a big multi-file refactor, an exhaustive
+   * review). Precedence: this override > the `subagent_max_rounds` setting >
+   * DEFAULT_MAX_SUBAGENT_ROUNDS. Ignored when <= 0.
+   */
+  maxRounds?: number;
 }
 
 /**
@@ -360,7 +371,11 @@ export async function runSubagent(
   ];
 
   let finalText = '';
-  const maxRounds = getMaxSubagentRounds();
+  // The most recent non-empty assistant text seen across rounds. If we hit
+  // the cap before a terminal turn, we return THIS (the partial work) rather
+  // than discarding everything — see the cap-hit handling after the loop.
+  let lastAssistantText = '';
+  const maxRounds = getMaxSubagentRounds(input.maxRounds);
   for (let round = 0; round < maxRounds; round++) {
     if (parent.signal?.aborted) {
       log.info(`[${tag}] aborted by parent before round ${round}`);
@@ -482,6 +497,15 @@ export async function runSubagent(
     // ----- Append assistant + tool dispatch ------------------------------
     messages.push({ role: 'assistant', content: response.content });
 
+    // Remember this round's text (the child often narrates progress alongside
+    // its tool calls). If we hit the cap, this is the partial work we return.
+    const roundText = response.content
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('\n')
+      .trim();
+    if (roundText) lastAssistantText = roundText;
+
     const toolUses = response.content.filter(
       (b: any) => b.type === 'tool_use'
     ) as Anthropic.ToolUseBlock[];
@@ -567,8 +591,19 @@ export async function runSubagent(
   }
 
   if (!finalText) {
-    log.warn(`[${tag}] hit subagent round cap (${maxRounds}) without a terminal turn`);
-    return `[subagent ${input.role} hit the ${maxRounds}-round cap without producing a final answer; partial work above may be useful but the run did not finish cleanly. If this role legitimately needs more rounds, raise the 'subagent_max_rounds' setting.]`;
+    log.warn(
+      `[${tag}] hit subagent round cap (${maxRounds}) without a terminal turn; ` +
+        `returning partial (${lastAssistantText.length}b of last assistant text)`
+    );
+    const note =
+      `[NOTE: this ${input.role} subagent hit its ${maxRounds}-round cap before finishing. ` +
+      `The text above (if any) is its PARTIAL output, not a final answer. ` +
+      `If it needs more rounds, re-run with a higher max_rounds (tool arg) or raise the ` +
+      `'subagent_max_rounds' setting.]`;
+    // Return the partial work product PLUS the note, so the parent gets
+    // whatever the child accomplished instead of nothing. Fall back to the
+    // note alone if the child never emitted any text.
+    return lastAssistantText ? `${lastAssistantText}\n\n${note}` : note;
   }
   return finalText;
 }

@@ -419,15 +419,17 @@ describe('runSubagent', () => {
     expect(_streamCallCount).toBe(0);
   });
 
-  it('caps run length at the configured round cap and returns a partial-work message', async () => {
-    // Configure a low cap so we don't have to script 200 rounds. This also
+  it('caps at the configured round cap and returns the PARTIAL work plus a note', async () => {
+    // Configure a low cap so we don't have to script 200 rounds. Also
     // exercises the `subagent_max_rounds` setting being honored.
     _settings['subagent_max_rounds'] = '5';
-    // Script more rounds than the cap where every response says "call a
-    // tool", forcing the loop to never reach end_turn.
+    // Script more rounds than the cap. Each response narrates progress
+    // (text) AND calls a tool, so the loop never reaches end_turn but DOES
+    // accumulate partial text — which the cap-hit path must return.
     for (let i = 0; i < 6; i++) {
       _responses.push({
         content: [
+          { type: 'text', text: `progress note round ${i}` },
           { type: 'tool_use', id: `tu_${i}`, name: 'Read', input: {} },
         ],
       });
@@ -437,7 +439,29 @@ describe('runSubagent', () => {
       description: 't',
       prompt: 'p',
     });
+    // Mentions the cap...
     expect(out).toMatch(/5-round cap/);
+    // ...AND returns the partial work (the last round's text), not nothing.
+    expect(out).toContain('progress note round 4'); // round index 4 = the 5th round (the cap)
+    expect(out).toMatch(/partial/i);
+    delete _settings['subagent_max_rounds'];
+  });
+
+  it('honors a per-call max_rounds override (over the setting)', async () => {
+    // Setting says 50, but the call overrides to 3 — the override wins.
+    _settings['subagent_max_rounds'] = '50';
+    for (let i = 0; i < 4; i++) {
+      _responses.push({
+        content: [{ type: 'tool_use', id: `o_${i}`, name: 'Read', input: {} }],
+      });
+    }
+    const out = await runSubagent(PARENT, {
+      role: 'execute',
+      description: 't',
+      prompt: 'p',
+      maxRounds: 3,
+    });
+    expect(out).toMatch(/3-round cap/);
     delete _settings['subagent_max_rounds'];
   });
 

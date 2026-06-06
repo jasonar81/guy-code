@@ -2159,6 +2159,11 @@ const TASK: ToolDef = {
           description:
             'Role hint that picks the subagent\'s system prompt + tool subset. Default: "general".',
         },
+        max_rounds: {
+          type: 'integer',
+          description:
+            'Optional override for the subagent\'s round cap (one round = one model turn + its tool calls). Default is 200. Raise it when you KNOW the task is large (e.g. a big multi-file refactor or exhaustive review). If the cap is hit, the subagent returns its partial work plus a note.',
+        },
       },
       required: ['description', 'prompt'],
     },
@@ -2183,6 +2188,8 @@ const TASK: ToolDef = {
         role,
         description: String(input.description ?? 'task'),
         prompt: String(input.prompt ?? ''),
+        maxRounds:
+          typeof input.max_rounds === 'number' ? input.max_rounds : undefined,
       }
     );
   },
@@ -2200,6 +2207,11 @@ const PLAN: ToolDef = {
           type: 'string',
           description:
             'What needs to be planned. Include constraints, target files (if you know them), and the success criteria.',
+        },
+        max_rounds: {
+          type: 'integer',
+          description:
+            'Optional override for the subagent round cap (default 200). Raise it for a large planning pass. On cap-hit the subagent returns its partial work plus a note.',
         },
       },
       required: ['task'],
@@ -2220,6 +2232,8 @@ const PLAN: ToolDef = {
         role: 'plan',
         description: 'plan',
         prompt: String(input.task ?? ''),
+        maxRounds:
+          typeof input.max_rounds === 'number' ? input.max_rounds : undefined,
       }
     );
   },
@@ -2237,6 +2251,11 @@ const EXECUTE: ToolDef = {
           type: 'string',
           description:
             'The plan to execute. Be specific: file paths, the exact change, and how to verify (commands to run, tests to look for). The subagent will not see your prior context.',
+        },
+        max_rounds: {
+          type: 'integer',
+          description:
+            'Optional override for the subagent round cap (default 200). Raise it for a large multi-file change. On cap-hit the subagent returns its partial work plus a note.',
         },
       },
       required: ['plan'],
@@ -2257,6 +2276,8 @@ const EXECUTE: ToolDef = {
         role: 'execute',
         description: 'execute',
         prompt: String(input.plan ?? ''),
+        maxRounds:
+          typeof input.max_rounds === 'number' ? input.max_rounds : undefined,
       }
     );
   },
@@ -2274,6 +2295,11 @@ const REVIEW: ToolDef = {
           type: 'string',
           description:
             'Describe what was done, where (file paths + line ranges), and what the reviewer should focus on (correctness, perf, security, style, test coverage). The subagent will read the files itself.',
+        },
+        max_rounds: {
+          type: 'integer',
+          description:
+            'Optional override for the subagent round cap (default 200). Raise it for an exhaustive review. On cap-hit the subagent returns its partial work plus a note.',
         },
       },
       required: ['work'],
@@ -2294,6 +2320,8 @@ const REVIEW: ToolDef = {
         role: 'review',
         description: 'review',
         prompt: String(input.work ?? ''),
+        maxRounds:
+          typeof input.max_rounds === 'number' ? input.max_rounds : undefined,
       }
     );
   },
