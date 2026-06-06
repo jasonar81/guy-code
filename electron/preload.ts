@@ -31,6 +31,11 @@ const api = {
     setForceContinue: (id: string, on: boolean) =>
       ipcRenderer.invoke('sessions:setForceContinue', id, on),
   },
+  image: {
+    copy: (src: string) => ipcRenderer.invoke('image:copy', src),
+    save: (src: string, suggestedName?: string) =>
+      ipcRenderer.invoke('image:save', src, suggestedName),
+  },
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),
     listSessions: (projectId: string) =>

@@ -4,6 +4,7 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useApp } from '@/lib/store';
 import { ToolCallCard } from './ToolCallCard';
 import { RichText } from './RichText';
+import { InlineImage } from './InlineImage';
 import { LinkifyText } from './LinkifyText';
 import { absoluteTime } from '@/lib/format';
 import { decideScrollWatchdog } from '@/lib/scrollWatchdog';
@@ -1044,6 +1045,17 @@ function MessageBlockImpl({
                 );
               })}
             </div>
+          );
+        }
+        if (b.type === 'image') {
+          // Assistant image content block (e.g. a tool-pushed screenshot or a
+          // generated picture). Render it inline + clickable (copy / save).
+          return (
+            <InlineImage
+              key={i}
+              src={`data:${b.source.media_type};base64,${b.source.data}`}
+              alt={b.name ?? 'image'}
+            />
           );
         }
         if (b.type === 'tool_use') {

@@ -402,6 +402,13 @@ declare global {
           on: boolean
         ) => Promise<{ ok: boolean; sessions?: SessionRow[] }>;
       };
+      image: {
+        copy: (src: string) => Promise<{ ok: boolean; error?: string }>;
+        save: (
+          src: string,
+          suggestedName?: string
+        ) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>;
+      };
       projects: {
         list: () => Promise<ProjectRow[]>;
         listSessions: (projectId: string) => Promise<SessionRow[]>;

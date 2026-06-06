@@ -1,4 +1,4 @@
-import { ipcMain, BrowserWindow, dialog, app } from 'electron';
+import { ipcMain, BrowserWindow, dialog, app, clipboard, nativeImage } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { existsSync, unlinkSync } from 'node:fs';
 import log from 'electron-log';
@@ -515,6 +515,67 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     });
     if (r.canceled || r.filePaths.length === 0) return null;
     return r.filePaths[0];
+  });
+
+  // ---- Inline images: copy to clipboard / save to disk ----
+  //
+  // Done in the main process so we get the OS clipboard + a native save dialog
+  // and can fetch remote URLs without CORS. `src` is a data:, file://, or
+  // http(s):// URL coming from an inline image the user clicked.
+  async function loadImageBytes(src: string): Promise<{ buf: Buffer; ext: string }> {
+    if (src.startsWith('data:')) {
+      const comma = src.indexOf(',');
+      const meta = src.slice(5, comma); // e.g. "image/png;base64"
+      const b64 = src.slice(comma + 1);
+      const mt = meta.split(';')[0] || 'image/png';
+      const ext = mt.split('/')[1] || 'png';
+      return { buf: Buffer.from(b64, 'base64'), ext };
+    }
+    if (src.startsWith('file://')) {
+      const { readFileSync } = await import('node:fs');
+      const { fileURLToPath } = await import('node:url');
+      const p = fileURLToPath(src);
+      const ext = (p.split('.').pop() || 'png').toLowerCase();
+      return { buf: readFileSync(p), ext };
+    }
+    // http(s): fetch in main (no CORS).
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`fetch ${res.status}`);
+    const ab = await res.arrayBuffer();
+    const ct = res.headers.get('content-type') || 'image/png';
+    const ext = (ct.split('/')[1] || 'png').split(';')[0];
+    return { buf: Buffer.from(ab), ext };
+  }
+
+  ipcMain.handle('image:copy', async (_e, src: string) => {
+    try {
+      const { buf } = await loadImageBytes(src);
+      const img = nativeImage.createFromBuffer(buf);
+      if (img.isEmpty()) return { ok: false, error: 'unsupported or empty image' };
+      clipboard.writeImage(img);
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
+    }
+  });
+
+  ipcMain.handle('image:save', async (_e, src: string, suggestedName?: string) => {
+    try {
+      const { buf, ext } = await loadImageBytes(src);
+      const w = getMainWindow();
+      const def =
+        suggestedName ||
+        `guycode-image-${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
+      const r = await dialog.showSaveDialog(w!, {
+        defaultPath: `${app.getPath('downloads')}/${def}`,
+      });
+      if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(r.filePath, buf);
+      return { ok: true, path: r.filePath };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
+    }
   });
 
   // ---- Agent ----
