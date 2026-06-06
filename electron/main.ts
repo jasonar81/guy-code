@@ -335,7 +335,24 @@ app.on('window-all-closed', () => {
   shutdownMcp().catch(() => {
     /* best effort */
   });
+  // Tear down any app-automation sessions (Xvfb processes / hidden desktops)
+  // so we never leak them. No-op if app automation was never used.
+  import('./appAutomation')
+    .then((m) => m.teardownAllAutomation())
+    .catch(() => {
+      /* best effort */
+    });
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Belt-and-suspenders: also tear down on before-quit (covers paths where
+// windows aren't all closed first, e.g. an explicit app.quit()).
+app.on('before-quit', () => {
+  import('./appAutomation')
+    .then((m) => m.teardownAllAutomation())
+    .catch(() => {
+      /* best effort */
+    });
 });
 
 process.on('uncaughtException', (e) => {

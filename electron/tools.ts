@@ -2099,6 +2099,227 @@ const BROWSER_EVAL: ToolDef = {
   },
 };
 
+// ---- App automation (launch + drive GUI apps in an isolated display) ----
+//
+// These mirror the Browser* tools but for arbitrary desktop applications.
+// Apps run on a hidden Win32 desktop (Windows) or a private Xvfb display
+// (Linux), so the user's real screen / mouse / keyboard are never disturbed.
+// macOS is unsupported (returns a clear message).
+
+async function appBackendOrThrow() {
+  const { getBackend } = await import('./appAutomation');
+  const backend = await getBackend();
+  if (!backend) {
+    throw new Error(
+      'App automation is not supported on this platform (macOS). It works on Windows and Linux.'
+    );
+  }
+  return backend;
+}
+
+const APP_LAUNCH: ToolDef = {
+  schema: {
+    name: 'AppLaunch',
+    description:
+      'Launch a GUI application in an ISOLATED display so it does NOT appear on the user\'s screen, steal focus, or move their mouse/keyboard — the user keeps working normally while you drive the app. Windows: the app runs on a hidden desktop. Linux: on a private virtual display (needs xvfb/openbox/xdotool/scrot installed; you\'ll get an apt-install hint if missing). NOT supported on macOS. Returns an appId you pass to the other App* tools, plus the app\'s initial windows. After launching, use AppScreenshot to see the app and AppListWindows to get window ids.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description:
+            'Executable to launch. Windows e.g. "notepad.exe" or a full path; Linux e.g. "gedit" or "/usr/bin/xterm". Classic Win32 apps work best; some Win11 Store apps (Notepad, Paint) run in a sandbox that can complicate window-finding.',
+        },
+        args: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional command-line arguments.',
+        },
+        width: { type: 'integer', description: 'Virtual display width (default 1280).' },
+        height: { type: 'integer', description: 'Virtual display height (default 800).' },
+      },
+      required: ['command'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    const pf = await backend.preflight();
+    if (!pf.ok) return `error: ${pf.reason}`;
+    const handle = await backend.launch({
+      command: String(input.command),
+      args: Array.isArray(input.args) ? input.args.map(String) : undefined,
+      width: typeof input.width === 'number' ? input.width : undefined,
+      height: typeof input.height === 'number' ? input.height : undefined,
+    });
+    // Give the app a beat to create its window, then list.
+    await new Promise((r) => setTimeout(r, 1200));
+    let windows: any[] = [];
+    try {
+      windows = await backend.listWindows(handle.appId);
+    } catch {
+      /* window may not be up yet */
+    }
+    const winLines = windows
+      .map((w) => `  [${w.windowId}] "${w.title}" ${w.width}x${w.height} @ ${w.x},${w.y}`)
+      .join('\n');
+    return (
+      `Launched "${handle.command}" (appId=${handle.appId}, pid=${handle.pid}) on an isolated display.\n` +
+      (windows.length
+        ? `Windows:\n${winLines}\n\nUse AppScreenshot(appId="${handle.appId}") to see it.`
+        : `No window detected yet — call AppScreenshot or AppListWindows in a moment (the app may still be starting).`)
+    );
+  },
+};
+
+const APP_LIST_WINDOWS: ToolDef = {
+  schema: {
+    name: 'AppListWindows',
+    description:
+      'List the top-level windows of an app launched with AppLaunch. Returns each window\'s id, title, and geometry. Use the window ids with AppScreenshot / AppClick / AppType / AppPress.',
+    input_schema: {
+      type: 'object',
+      properties: { appId: { type: 'string' } },
+      required: ['appId'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    const windows = await backend.listWindows(String(input.appId));
+    if (windows.length === 0) return 'No windows (the app may have closed or not opened a window yet).';
+    return windows
+      .map((w) => `[${w.windowId}] "${w.title}" ${w.width}x${w.height} @ ${w.x},${w.y}`)
+      .join('\n');
+  },
+};
+
+const APP_SCREENSHOT: ToolDef = {
+  schema: {
+    name: 'AppScreenshot',
+    description:
+      'Capture a PNG screenshot of an app\'s window (rendered off-screen — the user never sees it). Omit windowId to capture the app\'s primary window. Use this to see what the app looks like before clicking/typing, and again afterward to confirm the result. Coordinates for AppClick are relative to the captured window\'s top-left.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        appId: { type: 'string' },
+        windowId: { type: 'string', description: 'Optional; defaults to the primary window.' },
+      },
+      required: ['appId'],
+    },
+  },
+  async execute(input): Promise<StructuredToolResult> {
+    const backend = await appBackendOrThrow();
+    const shot = await backend.screenshot(
+      String(input.appId),
+      input.windowId ? String(input.windowId) : undefined
+    );
+    return {
+      modelContent: [
+        {
+          type: 'text',
+          text: `Screenshot of app ${input.appId}${input.windowId ? ` window ${input.windowId}` : ''} (${shot.width}x${shot.height}):`,
+        },
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: shot.pngBase64 },
+        },
+      ],
+      uiSummary: `AppScreenshot ${input.appId} (${shot.width}x${shot.height})`,
+    };
+  },
+};
+
+const APP_CLICK: ToolDef = {
+  schema: {
+    name: 'AppClick',
+    description:
+      'Click at window-relative coordinates (x,y from the window\'s top-left, as seen in the latest AppScreenshot). On Windows this prefers UI-Automation invoke of the control under the point (robust), falling back to a posted mouse click. Use AppScreenshot first to find the coordinates.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        appId: { type: 'string' },
+        windowId: { type: 'string' },
+        x: { type: 'integer' },
+        y: { type: 'integer' },
+        button: { type: 'string', enum: ['left', 'right'], description: 'Default left.' },
+      },
+      required: ['appId', 'windowId', 'x', 'y'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    await backend.click(
+      String(input.appId),
+      String(input.windowId),
+      Number(input.x),
+      Number(input.y),
+      input.button === 'right' ? 'right' : 'left'
+    );
+    return `Clicked (${input.x},${input.y}) in window ${input.windowId}.`;
+  },
+};
+
+const APP_TYPE: ToolDef = {
+  schema: {
+    name: 'AppType',
+    description:
+      'Type a string into the focused control of the app window. Click into the target field first (AppClick) if needed. On Windows this uses UI-Automation value-setting when available, else posts characters to the focused control.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        appId: { type: 'string' },
+        windowId: { type: 'string' },
+        text: { type: 'string' },
+      },
+      required: ['appId', 'windowId', 'text'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    await backend.type(String(input.appId), String(input.windowId), String(input.text));
+    return `Typed ${JSON.stringify(String(input.text)).slice(0, 60)} into window ${input.windowId}.`;
+  },
+};
+
+const APP_PRESS: ToolDef = {
+  schema: {
+    name: 'AppPress',
+    description:
+      'Press a key or chord in the app window. Examples: "Enter", "Tab", "Escape", "ctrl+s", "F5", "Down". Use for submitting, navigating, and shortcuts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        appId: { type: 'string' },
+        windowId: { type: 'string' },
+        key: { type: 'string', description: 'Key or chord, e.g. "Enter" or "ctrl+s".' },
+      },
+      required: ['appId', 'windowId', 'key'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    await backend.key(String(input.appId), String(input.windowId), String(input.key));
+    return `Pressed ${input.key} in window ${input.windowId}.`;
+  },
+};
+
+const APP_CLOSE: ToolDef = {
+  schema: {
+    name: 'AppClose',
+    description:
+      'Close an app launched with AppLaunch and tear down its isolated display/desktop. Always call this when done with an app so it doesn\'t linger.',
+    input_schema: {
+      type: 'object',
+      properties: { appId: { type: 'string' } },
+      required: ['appId'],
+    },
+  },
+  async execute(input) {
+    const backend = await appBackendOrThrow();
+    await backend.close(String(input.appId));
+    return `Closed app ${input.appId} and tore down its isolated display.`;
+  },
+};
+
 // ---- WaitForUser (special: ends turn, surfaces to UI) ----
 
 const WAIT_FOR_USER: ToolDef = {
@@ -2383,6 +2604,13 @@ export const TOOLS: Record<string, ToolDef> = {
   BrowserPress: BROWSER_PRESS,
   BrowserScroll: BROWSER_SCROLL,
   BrowserEval: BROWSER_EVAL,
+  AppLaunch: APP_LAUNCH,
+  AppListWindows: APP_LIST_WINDOWS,
+  AppScreenshot: APP_SCREENSHOT,
+  AppClick: APP_CLICK,
+  AppType: APP_TYPE,
+  AppPress: APP_PRESS,
+  AppClose: APP_CLOSE,
   WaitForUser: WAIT_FOR_USER,
   Task: TASK,
   Plan: PLAN,

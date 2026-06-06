@@ -24,3 +24,5 @@ coverage/
 # Local diagnostic / scratch files
 .tmp-procs.txt
 progress.txt
+_appauto_proto/
+build/helper/*.exe
