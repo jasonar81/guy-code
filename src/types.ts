@@ -111,6 +111,8 @@ export type ContentBlock =
       is_error?: boolean;
       /** Local-only: ms taken to execute. */
       ms?: number;
+      /** Local-only: image blocks from an image-bearing result, shown inline. */
+      images?: Array<{ media_type: string; data: string }>;
     }
   | {
       type: 'image';
@@ -255,6 +257,7 @@ export type AgentEvent =
       content: string;
       isError: boolean;
       ms: number;
+      images?: Array<{ media_type: string; data: string }>;
     }
   | { type: 'usage'; sessionId: string; costUsdMicros: number; usage: any }
   | { type: 'wait_for_user'; sessionId: string; id: string; question: string }

@@ -7,6 +7,7 @@
 import clsx from 'clsx';
 import { useMemo } from 'react';
 import type { ContentBlock } from '@/types';
+import { InlineImage } from './InlineImage';
 
 interface Props {
   toolUse: Extract<ContentBlock, { type: 'tool_use' }>;
@@ -23,8 +24,40 @@ function stripAnsi(s: string): string {
 export function ToolResultBody({ toolUse, result }: Props) {
   const name = toolUse.name;
   const input = (toolUse.input ?? {}) as Record<string, unknown>;
-  const content = result.content;
+  const rawContent = result.content as unknown;
   const isError = !!result.is_error;
+
+  // Image-bearing results (ShowImage / AppScreenshot / BrowserScreenshot) have
+  // a content ARRAY with image blocks (this is what reaches the renderer after
+  // a reload from JSONL, where the live-only `images` field is absent). Render
+  // the image(s) + any text so the user sees the picture, not "[object]".
+  if (Array.isArray(rawContent)) {
+    return (
+      <div className="space-y-1.5">
+        {(rawContent as any[]).map((b, i) => {
+          if (b?.type === 'image' && b.source?.type === 'base64') {
+            return (
+              <InlineImage
+                key={i}
+                src={`data:${b.source.media_type};base64,${b.source.data}`}
+                alt={name}
+              />
+            );
+          }
+          if (b?.type === 'text') {
+            return (
+              <pre key={i} className="text-[11px] whitespace-pre-wrap break-all text-text-muted">
+                {b.text}
+              </pre>
+            );
+          }
+          return null;
+        })}
+      </div>
+    );
+  }
+
+  const content = rawContent as string;
 
   if (name === 'Edit') return <EditBody input={input} content={content} isError={isError} />;
   if (name === 'Write') return <WriteBody input={input} content={content} isError={isError} />;

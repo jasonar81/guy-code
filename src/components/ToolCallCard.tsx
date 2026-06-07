@@ -4,6 +4,7 @@ import { ChevronRight, ChevronDown, Wrench, AlertCircle, Check, Loader2 } from '
 import type { ContentBlock } from '@/types';
 import { truncate } from '@/lib/format';
 import { ToolResultBody } from './ToolResultBody';
+import { InlineImage } from './InlineImage';
 
 interface Props {
   toolUse: Extract<ContentBlock, { type: 'tool_use' }>;
@@ -71,6 +72,21 @@ export function ToolCallCard({ toolUse, result, streaming }: Props) {
           <span className="text-text-dim shrink-0 text-[10px]">{result.ms}ms</span>
         )}
       </button>
+      {/* Image-bearing results (ShowImage, AppScreenshot, BrowserScreenshot)
+          render the picture inline ALWAYS — not hidden behind the collapsible
+          card — so the user actually sees what the tool produced. The card
+          body (text/details) stays behind the expand toggle. */}
+      {result?.images && result.images.length > 0 && (
+        <div className="px-3 pb-2 space-y-1">
+          {result.images.map((img, idx) => (
+            <InlineImage
+              key={idx}
+              src={`data:${img.media_type};base64,${img.data}`}
+              alt={toolUse.name}
+            />
+          ))}
+        </div>
+      )}
       {open && (
         <div className="px-3 pb-2 space-y-2">
           {result ? (

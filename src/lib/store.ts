@@ -963,6 +963,7 @@ export const useApp = create<AppState>((set, get) => ({
             content: e.content,
             is_error: e.isError,
             ms: e.ms,
+            ...(e.images ? { images: e.images } : {}),
           };
           next.messages = [
             ...next.messages,

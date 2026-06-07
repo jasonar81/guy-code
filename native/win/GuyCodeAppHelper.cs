@@ -30,6 +30,23 @@ using System.Threading;
 using System.Windows.Automation;
 
 static class Native {
+  // Per-monitor-v2 DPI awareness. Without this, the hidden-desktop compositor
+  // applies a DPI scale factor when a window activates, which (a) RESIZES the
+  // window on focus (e.g. 1106 -> 1383 wide) and (b) makes screenshot pixels
+  // and SendInput screen coords disagree - so coordinates from one screenshot
+  // are stale for the next click/drag, and strokes land in the wrong place or
+  // not at all. Declaring the helper per-monitor-v2 aware keeps everything in
+  // real device pixels and stops the on-focus rescale.
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+  public static readonly IntPtr DPI_PER_MONITOR_V2 = new IntPtr(-4);
+  // Fallbacks for older Windows where the above isn't available.
+  [DllImport("shcore.dll", SetLastError = true)]
+  public static extern int SetProcessDpiAwareness(int value); // 2 = PROCESS_PER_MONITOR_DPI_AWARE
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool SetProcessDPIAware();
+
   [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern IntPtr CreateDesktop(string name, IntPtr dev, IntPtr dm, int flags, uint access, IntPtr sa);
   [DllImport("user32.dll", SetLastError = true)]
@@ -138,7 +155,17 @@ class Helper {
   static readonly Dictionary<string, int> appPids = new Dictionary<string, int>();
   static int appSeq = 0;
 
+  static void MakeDpiAware() {
+    // Try the modern per-monitor-v2 API first; fall back for older Windows.
+    try { if (Native.SetProcessDpiAwarenessContext(Native.DPI_PER_MONITOR_V2)) return; } catch { }
+    try { if (Native.SetProcessDpiAwareness(2) == 0) return; } catch { }
+    try { Native.SetProcessDPIAware(); } catch { }
+  }
+
   static int Main() {
+    // MUST run before any window / desktop / SendInput work so the process is
+    // DPI-aware from the start (prevents on-focus rescale + coord drift).
+    MakeDpiAware();
     deskName = "GuyCodeApp_" + System.Diagnostics.Process.GetCurrentProcess().Id;
     hDesk = Native.CreateDesktop(deskName, IntPtr.Zero, IntPtr.Zero, 0, Native.DESKTOP_ALL, IntPtr.Zero);
     if (hDesk == IntPtr.Zero) {
@@ -325,9 +352,16 @@ class Helper {
 
     // Position at the first point, press, move through the path with
     // interpolated sub-steps (so the app samples a smooth motion), release.
+    // Send the start move TWICE with a settle so the app registers the cursor
+    // sitting at the first point before the button goes down (canvases anchor
+    // their first stroke point on mousedown).
     var p0 = toScreen(path[0][0], path[0][1]);
-    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(30);
-    MouseBtn(bdown); Thread.Sleep(30);
+    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(25);
+    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(25);
+    MouseBtn(bdown); Thread.Sleep(40);
+    // A tiny move right after the press helps apps that only start drawing on
+    // the first MOUSEMOVE after a down.
+    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(15);
     int prevX = path[0][0], prevY = path[0][1];
     for (int k = 1; k < path.Count; k++) {
       int cx = path[k][0], cy = path[k][1];

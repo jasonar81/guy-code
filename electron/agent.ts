@@ -100,6 +100,8 @@ export type AgentEvent =
       content: string;
       isError: boolean;
       ms: number;
+      /** Image blocks from an image-bearing result, for inline display. */
+      images?: Array<{ media_type: string; data: string }>;
     }
   | { type: 'usage'; sessionId: string; costUsdMicros: number; usage: any }
   | {
@@ -1987,6 +1989,17 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           setSessionState(sessionId, 'running');
           broadcastStateChanged(sessionId, 'running');
         }
+        // If the result carries image blocks (ShowImage, AppScreenshot,
+        // BrowserScreenshot, etc.), forward them to the renderer so the USER
+        // sees the picture too - not just the model. uiSummary stays a short
+        // string for the card header / audit; the images render below it.
+        let images: Array<{ media_type: string; data: string }> | undefined;
+        if (Array.isArray(content)) {
+          const imgs = (content as any[])
+            .filter((b) => b && b.type === 'image' && b.source?.type === 'base64')
+            .map((b) => ({ media_type: b.source.media_type as string, data: b.source.data as string }));
+          if (imgs.length > 0) images = imgs;
+        }
         onEv({
           type: 'tool_result',
           sessionId,
@@ -1994,6 +2007,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           content: uiSummary,
           isError,
           ms,
+          ...(images ? { images } : {}),
         });
         const block: any = {
           type: 'tool_result',

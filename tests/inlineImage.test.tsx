@@ -99,3 +99,38 @@ describe('ShowImage tool', () => {
     expect(txt).toMatch(/could not load image/i);
   });
 });
+
+describe('tool-result images render for the user (ShowImage/AppScreenshot)', () => {
+  it('ToolResultBody renders image blocks from an array content (post-reload path)', async () => {
+    const { ToolResultBody } = await import('../src/components/ToolResultBody');
+    const toolUse: any = { type: 'tool_use', id: 't1', name: 'ShowImage', input: { path: '/x.png' } };
+    const result: any = {
+      type: 'tool_result',
+      tool_use_id: 't1',
+      content: [
+        { type: 'text', text: 'Image shown inline.' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+      ],
+    };
+    const { container } = render(<ToolResultBody toolUse={toolUse} result={result} />);
+    const img = container.querySelector('img');
+    expect(img).toBeTruthy();
+    expect(img!.getAttribute('src')).toBe('data:image/png;base64,AAAA');
+  });
+
+  it('ToolCallCard renders result.images inline (live path) without expanding', async () => {
+    const { ToolCallCard } = await import('../src/components/ToolCallCard');
+    const toolUse: any = { type: 'tool_use', id: 't2', name: 'ShowImage', input: {} };
+    const result: any = {
+      type: 'tool_result',
+      tool_use_id: 't2',
+      content: 'Image shown inline.',
+      images: [{ media_type: 'image/png', data: 'BBBB' }],
+    };
+    const { container } = render(<ToolCallCard toolUse={toolUse} result={result} />);
+    // The image renders WITHOUT clicking to expand the card.
+    const img = container.querySelector('img');
+    expect(img).toBeTruthy();
+    expect(img!.getAttribute('src')).toBe('data:image/png;base64,BBBB');
+  });
+});
