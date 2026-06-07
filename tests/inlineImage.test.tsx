@@ -62,3 +62,40 @@ describe('InlineImage copy/save wiring', () => {
     expect(save).toHaveBeenCalledWith('https://example.com/c.png');
   });
 });
+
+describe('ShowImage tool', () => {
+  it('reads a local file and returns an inline image block (no base64 from the model)', async () => {
+    const { TOOLS } = await import('../electron/tools');
+    const { writeFileSync, mkdtempSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    // a 1x1 png
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64'
+    );
+    const dir = mkdtempSync(join(tmpdir(), 'showimg-'));
+    const p = join(dir, 'pic.png');
+    writeFileSync(p, png);
+    const out: any = await TOOLS['ShowImage'].execute({ path: p, alt: 'a dot' }, { sessionId: 's', cwd: '' } as any);
+    expect(out.modelContent).toBeTruthy();
+    const imgBlock = out.modelContent.find((b: any) => b.type === 'image');
+    expect(imgBlock).toBeTruthy();
+    expect(imgBlock.source.media_type).toBe('image/png');
+    expect(imgBlock.source.data).toBe(png.toString('base64'));
+  });
+
+  it('errors cleanly with no source', async () => {
+    const { TOOLS } = await import('../electron/tools');
+    const out: any = await TOOLS['ShowImage'].execute({}, { sessionId: 's', cwd: '' } as any);
+    const txt = out.modelContent.map((b: any) => b.text || '').join(' ');
+    expect(txt).toMatch(/needs a path or url/i);
+  });
+
+  it('errors cleanly on a missing file', async () => {
+    const { TOOLS } = await import('../electron/tools');
+    const out: any = await TOOLS['ShowImage'].execute({ path: '/no/such/file.png' }, { sessionId: 's', cwd: '' } as any);
+    const txt = out.modelContent.map((b: any) => b.text || '').join(' ');
+    expect(txt).toMatch(/could not load image/i);
+  });
+});

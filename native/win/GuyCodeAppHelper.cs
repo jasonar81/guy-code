@@ -60,6 +60,7 @@ static class Native {
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
 
   // SendInput: injects real mouse/keyboard events into the desktop the
@@ -250,6 +251,17 @@ class Helper {
 
   // ---- Real mouse input via SendInput (lands on the hidden desktop) ----
 
+  // Bring the target window to the foreground ON THE HIDDEN DESKTOP before a
+  // gesture. Many classic Win32 apps ignore mouse input unless they're the
+  // foreground/active window. (This affects only the hidden desktop, so the
+  // user's real foreground window is untouched.) Note: modern WinUI3 / Store
+  // apps route input through an InputSiteWindowClass that doesn't accept
+  // injected input on a non-active desktop, so this won't make those drawable
+  // - but it makes classic apps reliable.
+  static void FocusWindow(IntPtr h) {
+    try { Native.SetForegroundWindow(h); Native.BringWindowToTop(h); } catch { }
+  }
+
   static void MouseMoveAbs(int screenX, int screenY) {
     int sw = Native.GetSystemMetrics(Native.SM_CXSCREEN);
     int sh = Native.GetSystemMetrics(Native.SM_CYSCREEN);
@@ -306,6 +318,8 @@ class Helper {
     uint bdown = button == "right" ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_LEFTDOWN;
     uint bup = button == "right" ? Native.MOUSEEVENTF_RIGHTUP : Native.MOUSEEVENTF_LEFTUP;
 
+    FocusWindow(h);
+    Thread.Sleep(40);
     Native.RECT r; Native.GetWindowRect(h, out r);
     Func<int, int, int[]> toScreen = (wx, wy) => new int[] { r.Left + wx, r.Top + wy };
 
@@ -335,6 +349,7 @@ class Helper {
 
   // A REAL click via SendInput (for canvases where UIA invoke does nothing).
   static void RealClick(IntPtr h, int x, int y, string button) {
+    FocusWindow(h);
     Native.RECT r; Native.GetWindowRect(h, out r);
     MouseMoveAbs(r.Left + x, r.Top + y); Thread.Sleep(20);
     uint d = button == "right" ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_LEFTDOWN;

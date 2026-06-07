@@ -2117,11 +2117,62 @@ async function appBackendOrThrow() {
   return backend;
 }
 
+const SHOW_IMAGE: ToolDef = {
+  schema: {
+    name: 'ShowImage',
+    description:
+      'Display an image INLINE in the conversation (the user sees it and can click to copy or save it). Give a local file PATH or an http(s) URL — the bytes are read by Guy Code and shown directly, so you do NOT put any base64 in your message. Use this whenever you want to show the user a picture: a file on disk, an image you downloaded/generated and saved, etc. DO NOT paste large base64 data: URLs into your text — they exceed your output limit and render corrupt; ShowImage (or a markdown ![](http/file URL)) is the correct way.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to a local image file (png/jpg/gif/webp).' },
+        url: { type: 'string', description: 'http(s) URL of an image (fetched by Guy Code, no CORS issues).' },
+        alt: { type: 'string', description: 'Optional caption/description.' },
+      },
+    },
+  },
+  async execute(input): Promise<StructuredToolResult> {
+    const path = input.path ? String(input.path) : '';
+    const url = input.url ? String(input.url) : '';
+    if (!path && !url) return { modelContent: [{ type: 'text', text: 'error: ShowImage needs a path or url.' }], uiSummary: 'ShowImage (no source)' } as any;
+    let buf: Buffer;
+    let mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' = 'image/png';
+    try {
+      if (path) {
+        const { readFileSync } = await import('node:fs');
+        buf = readFileSync(path);
+        const ext = path.split('.').pop()?.toLowerCase();
+        mediaType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png';
+      } else {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`fetch ${res.status}`);
+        buf = Buffer.from(await res.arrayBuffer());
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        mediaType = ct.includes('jpeg') || ct.includes('jpg') ? 'image/jpeg' : ct.includes('gif') ? 'image/gif' : ct.includes('webp') ? 'image/webp' : 'image/png';
+      }
+    } catch (e: any) {
+      return { modelContent: [{ type: 'text', text: `error: could not load image: ${e?.message ?? e}` }], uiSummary: 'ShowImage failed' } as any;
+    }
+    // Guard against absurdly large inline images (the model sees the block too;
+    // keep it sane). ~8MB of raw bytes is plenty for any screenshot/photo.
+    if (buf.length > 8 * 1024 * 1024) {
+      return { modelContent: [{ type: 'text', text: `error: image too large (${Math.round(buf.length / 1024)}KB). Resize it first.` }], uiSummary: 'ShowImage too large' } as any;
+    }
+    return {
+      modelContent: [
+        { type: 'text', text: input.alt ? `Image: ${String(input.alt)}` : 'Image shown inline.' },
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: buf.toString('base64') } },
+      ],
+      uiSummary: `ShowImage ${path || url}`,
+    };
+  },
+};
+
 const APP_LAUNCH: ToolDef = {
   schema: {
     name: 'AppLaunch',
     description:
-      'Launch a GUI application in an ISOLATED display so it does NOT appear on the user\'s screen, steal focus, or move their mouse/keyboard — the user keeps working normally while you drive the app. Windows: the app runs on a hidden desktop. Linux: on a private virtual display (needs xvfb/openbox/xdotool/scrot installed; you\'ll get an apt-install hint if missing). NOT supported on macOS. Returns an appId you pass to the other App* tools, plus the app\'s initial windows. After launching, use AppScreenshot to see the app and AppListWindows to get window ids.',
+      'Launch a GUI application in an ISOLATED display so it does NOT appear on the user\'s screen, steal focus, or move their mouse/keyboard — the user keeps working normally while you drive the app. Windows: the app runs on a hidden desktop. Linux: on a private virtual display (needs xvfb/openbox/xdotool/scrot installed; you\'ll get an apt-install hint if missing). NOT supported on macOS. Returns an appId you pass to the other App* tools, plus the app\'s initial windows. After launching, use AppScreenshot to see the app and AppListWindows to get window ids.\n\nIMPORTANT (Windows): CLASSIC Win32 apps automate fully — screenshots, clicks, AND drag-drawing all work. But modern Windows Store / WinUI3 apps — including the BUILT-IN Win11 Paint, Notepad, and Calculator — route input through a pipeline that does NOT accept simulated input on an isolated/background desktop, so you can screenshot them but clicks/drags/typing won\'t register. For drawing or any input automation on Windows, prefer a classic Win32 app (e.g. a classic editor/drawing tool), not the modern Store Paint/Notepad. Linux apps (gedit, GIMP, xterm, etc.) all work.',
     input_schema: {
       type: 'object',
       properties: {
@@ -2673,6 +2724,7 @@ export const TOOLS: Record<string, ToolDef> = {
   BrowserPress: BROWSER_PRESS,
   BrowserScroll: BROWSER_SCROLL,
   BrowserEval: BROWSER_EVAL,
+  ShowImage: SHOW_IMAGE,
   AppLaunch: APP_LAUNCH,
   AppListWindows: APP_LIST_WINDOWS,
   AppScreenshot: APP_SCREENSHOT,
