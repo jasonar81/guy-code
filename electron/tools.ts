@@ -2313,7 +2313,7 @@ const APP_DRAG: ToolDef = {
   schema: {
     name: 'AppDrag',
     description:
-      'Press-move-release drag with REAL mouse input — this is how you DRAW (freehand strokes), use shape tools (click-drag bounds), move sliders, or drag-and-drop. Unlike AppClick (a single discrete click), AppDrag holds the button down and moves through a path, which canvases and drawing apps actually register. Provide either a `path` of window-relative points (many points = a freehand curve) OR fromX/fromY/toX/toY for a straight drag. Coordinates are window-relative (from the latest AppScreenshot). Take a screenshot afterward to confirm the result.',
+      'Press-move-release drag — this is how you DRAW (freehand strokes), use shape tools (click-drag bounds), move sliders, or drag-and-drop. Unlike AppClick (a single click), AppDrag holds the button down and moves through a path, which canvases and drawing apps register as a real drag. Provide either a `path` of window-relative points (many points = a freehand curve) OR fromX/fromY/toX/toY for a straight drag. Coordinates are window-relative (from the latest AppScreenshot — the (0,0) origin is the window top-left). Take a screenshot afterward to confirm the result.',
     input_schema: {
       type: 'object',
       properties: {

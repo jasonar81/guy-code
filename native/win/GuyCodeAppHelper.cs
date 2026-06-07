@@ -73,9 +73,20 @@ static class Native {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+  // Window mouse messages: these go straight to the target window's message
+  // queue and work REGARDLESS of input desktop. SendInput / SetCursorPos do
+  // NOT work on a hidden (non-input) desktop - the cursor is frozen at 0,0 -
+  // so a canvas receives zero mouse events. PostMessage is how we drive a
+  // window on the hidden desktop. wParam MK_LBUTTON during WM_MOUSEMOVE tells
+  // the app the button is held (so a canvas draws while dragging).
+  public const uint WM_MOUSEMOVE = 0x0200;
+  public const int MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002;
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
@@ -346,49 +357,69 @@ class Helper {
     uint bup = button == "right" ? Native.MOUSEEVENTF_RIGHTUP : Native.MOUSEEVENTF_LEFTUP;
 
     FocusWindow(h);
-    Thread.Sleep(40);
-    Native.RECT r; Native.GetWindowRect(h, out r);
-    Func<int, int, int[]> toScreen = (wx, wy) => new int[] { r.Left + wx, r.Top + wy };
+    Thread.Sleep(20);
 
-    // Position at the first point, press, move through the path with
-    // interpolated sub-steps (so the app samples a smooth motion), release.
-    // Send the start move TWICE with a settle so the app registers the cursor
-    // sitting at the first point before the button goes down (canvases anchor
-    // their first stroke point on mousedown).
-    var p0 = toScreen(path[0][0], path[0][1]);
-    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(25);
-    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(25);
-    MouseBtn(bdown); Thread.Sleep(40);
-    // A tiny move right after the press helps apps that only start drawing on
-    // the first MOUSEMOVE after a down.
-    MouseMoveAbs(p0[0], p0[1]); Thread.Sleep(15);
+    // Drive the window with PostMessage mouse messages in CLIENT coordinates.
+    // SendInput does NOT work on a hidden desktop (no input desktop -> cursor
+    // frozen -> zero events), but window messages reach the message queue
+    // directly. We convert the window-relative coords the model sends (from
+    // the PrintWindow screenshot, which includes the title bar/border) into
+    // client coords.
+    int offX, offY;
+    ClientOffset(h, out offX, out offY);
+    int mkButton = button == "right" ? Native.MK_RBUTTON : Native.MK_LBUTTON;
+    uint wmDown = button == "right" ? Native.WM_RBUTTONDOWN : Native.WM_LBUTTONDOWN;
+    uint wmUp = button == "right" ? Native.WM_RBUTTONUP : Native.WM_LBUTTONUP;
+    Func<int, int, IntPtr> lp = (wx, wy) => MakeLParam(wx - offX, wy - offY);
+
+    // Move to the first point, press (button held), drag through interpolated
+    // points with MK_LBUTTON in wParam so the canvas knows the button is down,
+    // then release.
+    Native.PostMessage(h, Native.WM_MOUSEMOVE, IntPtr.Zero, lp(path[0][0], path[0][1])); Thread.Sleep(15);
+    Native.PostMessage(h, wmDown, (IntPtr)mkButton, lp(path[0][0], path[0][1])); Thread.Sleep(20);
     int prevX = path[0][0], prevY = path[0][1];
     for (int k = 1; k < path.Count; k++) {
       int cx = path[k][0], cy = path[k][1];
       int dx = cx - prevX, dy = cy - prevY;
       int dist = (int)Math.Sqrt(dx * dx + dy * dy);
-      int steps = Math.Max(1, Math.Min(60, dist / 6)); // ~one sample per 6px
+      int steps = Math.Max(1, Math.Min(80, dist / 5)); // ~one sample per 5px
       for (int s = 1; s <= steps; s++) {
         int ix = prevX + dx * s / steps, iy = prevY + dy * s / steps;
-        var sp = toScreen(ix, iy);
-        MouseMoveAbs(sp[0], sp[1]);
-        Thread.Sleep(8);
+        Native.PostMessage(h, Native.WM_MOUSEMOVE, (IntPtr)mkButton, lp(ix, iy));
+        Thread.Sleep(5);
       }
       prevX = cx; prevY = cy;
     }
-    Thread.Sleep(30);
-    MouseBtn(bup);
-    Ok(id, "{\"via\":\"sendinput-drag\",\"points\":" + path.Count + "}");
+    Thread.Sleep(15);
+    Native.PostMessage(h, wmUp, IntPtr.Zero, lp(prevX, prevY));
+    Ok(id, "{\"via\":\"postmessage-drag\",\"points\":" + path.Count + "}");
   }
 
-  // A REAL click via SendInput (for canvases where UIA invoke does nothing).
+  // Client-area origin offset within the window (window-relative -> client).
+  static void ClientOffset(IntPtr h, out int offX, out int offY) {
+    Native.RECT wr; Native.GetWindowRect(h, out wr);
+    var origin = new Native.POINT { X = 0, Y = 0 };
+    Native.ClientToScreen(h, ref origin);
+    offX = origin.X - wr.Left;
+    offY = origin.Y - wr.Top;
+  }
+
+  static IntPtr MakeLParam(int x, int y) {
+    return (IntPtr)((y << 16) | (x & 0xFFFF));
+  }
+
+  // A click via PostMessage window messages (works on the hidden desktop where
+  // SendInput cannot). Coords are window-relative; converted to client coords.
   static void RealClick(IntPtr h, int x, int y, string button) {
     FocusWindow(h);
-    Native.RECT r; Native.GetWindowRect(h, out r);
-    MouseMoveAbs(r.Left + x, r.Top + y); Thread.Sleep(20);
-    uint d = button == "right" ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_LEFTDOWN;
-    uint u = button == "right" ? Native.MOUSEEVENTF_RIGHTUP : Native.MOUSEEVENTF_LEFTUP;
-    MouseBtn(d); Thread.Sleep(20); MouseBtn(u);
+    int offX, offY; ClientOffset(h, out offX, out offY);
+    int mk = button == "right" ? Native.MK_RBUTTON : Native.MK_LBUTTON;
+    uint d = button == "right" ? Native.WM_RBUTTONDOWN : Native.WM_LBUTTONDOWN;
+    uint u = button == "right" ? Native.WM_RBUTTONUP : Native.WM_LBUTTONUP;
+    IntPtr lp = MakeLParam(x - offX, y - offY);
+    Native.PostMessage(h, Native.WM_MOUSEMOVE, IntPtr.Zero, lp); Thread.Sleep(10);
+    Native.PostMessage(h, d, (IntPtr)mk, lp); Thread.Sleep(15);
+    Native.PostMessage(h, u, IntPtr.Zero, lp);
   }
 
   static void Screenshot(int id, string req) {
