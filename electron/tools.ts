@@ -329,19 +329,23 @@ const EDIT: ToolDef = {
 const SHELL: ToolDef = {
   schema: {
     name: isWin ? 'PowerShell' : 'Bash',
-    description: `Run a ${isWin ? 'PowerShell' : 'Bash'} command. Returns combined stdout+stderr. Default timeout 120s, max 600s.`,
+    description: `Run a ${isWin ? 'PowerShell' : 'Bash'} command. Returns combined stdout+stderr. Default timeout 120s; set timeout_ms higher (up to 1 hour) for long-running commands like builds, renders, or data jobs so they don't get killed mid-run. For VERY long jobs prefer running in the background (e.g. start the job, then poll with WaitForFile / WaitForProcess) so you don't block the turn on a single call.`,
     input_schema: {
       type: 'object',
       properties: {
         command: { type: 'string' },
-        timeout_ms: { type: 'integer', description: 'Default 120000.' },
+        timeout_ms: {
+          type: 'integer',
+          description:
+            'Milliseconds before the command is killed. Default 120000 (2 min). Max 3600000 (1 hour). RAISE THIS for anything that legitimately takes a while (builds, Blender/ffmpeg renders, test suites, large downloads) instead of letting it time out.',
+        },
         cwd: { type: 'string', description: 'Override session cwd.' },
       },
       required: ['command'],
     },
   },
   async execute(input, ctx) {
-    const timeout = Math.min(600_000, Math.max(1000, input.timeout_ms ?? 120_000));
+    const timeout = Math.min(3_600_000, Math.max(1000, input.timeout_ms ?? 120_000));
     const cwd = input.cwd ? resolveCwd(input.cwd, ctx.cwd) : defaultLaunchCwd(ctx.cwd);
     return await new Promise<string>((resolve) => {
       const cmd = isWin ? 'powershell.exe' : 'bash';
@@ -426,7 +430,7 @@ const WSL: ToolDef = {
   schema: {
     name: 'WSL',
     description:
-      "Run a bash command inside WSL (Windows Subsystem for Linux). Returns combined stdout+stderr in UTF-8. Default timeout 120s, max 600s.\n\n" +
+      "Run a bash command inside WSL (Windows Subsystem for Linux). Returns combined stdout+stderr in UTF-8. Default timeout 120s; set timeout_ms higher (up to 1 hour) for long-running commands (builds, renders, data jobs). For VERY long jobs prefer backgrounding + WaitForFile/WaitForProcess so you don't block the turn.\n\n" +
       "When to use this vs PowerShell:\n" +
       "  • WSL: Unix tools (jq, sed -E, grep -P, awk, find -exec), pipelines that depend on Unix utility flags, anything that needs a real Linux environment (Docker-in-WSL, snap, apt). Output is clean UTF-8 — non-ASCII characters survive intact.\n" +
       "  • PowerShell: Windows-native cmdlets (Get-Process, Get-ChildItem, Active Directory, Windows registry), .NET, COM, anything that touches Windows paths with backslashes that bash would mangle.\n\n" +
@@ -436,7 +440,11 @@ const WSL: ToolDef = {
       type: 'object',
       properties: {
         command: { type: 'string' },
-        timeout_ms: { type: 'integer', description: 'Default 120000.' },
+        timeout_ms: {
+          type: 'integer',
+          description:
+            'Milliseconds before the command is killed. Default 120000 (2 min). Max 3600000 (1 hour). RAISE THIS for long jobs (builds, renders, test suites) instead of letting them time out.',
+        },
         cwd: {
           type: 'string',
           description:
@@ -447,7 +455,7 @@ const WSL: ToolDef = {
     },
   },
   async execute(input, ctx) {
-    const timeout = Math.min(600_000, Math.max(1000, input.timeout_ms ?? 120_000));
+    const timeout = Math.min(3_600_000, Math.max(1000, input.timeout_ms ?? 120_000));
     const cwd = input.cwd ? resolveCwd(input.cwd, ctx.cwd) : defaultLaunchCwd(ctx.cwd);
     return await new Promise<string>((resolve) => {
       // `wsl.exe -- bash -lc <cmd>`:
