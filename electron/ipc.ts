@@ -578,6 +578,77 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     }
   });
 
+  // ---- Linux app automation (WSL) setup ----
+  //
+  // Status, installing WSL, installing the Linux deps/apps, and remembering the
+  // WSL sudo password (encrypted, opt-in). The sudo password is only needed at
+  // SETUP time (apt install + the one-time wsl.conf boot hook); after that,
+  // launching apps needs no sudo.
+  ipcMain.handle('wsl:status', async () => {
+    if (process.platform !== 'win32') {
+      return { installed: false, depsInstalled: false, reason: 'WSL is Windows-only.', platform: process.platform };
+    }
+    const { getWslStatus } = await import('./wslProvision');
+    const { hasSecret } = await import('./secret');
+    const st = getWslStatus();
+    return { ...st, sudoStored: hasSecret('wsl.sudo'), platform: 'win32' };
+  });
+
+  ipcMain.handle('wsl:installWsl', async () => {
+    if (process.platform !== 'win32') return { ok: false, message: 'Windows only.' };
+    const { installWsl } = await import('./wslProvision');
+    return installWsl();
+  });
+
+  // Install deps using a provided password OR the stored one. If `remember` is
+  // true and the password works, store it encrypted.
+  ipcMain.handle('wsl:installDeps', async (_e, password?: string, remember?: boolean) => {
+    if (process.platform !== 'win32') return { ok: false, message: 'Windows only.' };
+    const { installDeps } = await import('./wslProvision');
+    const { getSecret, setSecret } = await import('./secret');
+    const pw = password || getSecret('wsl.sudo') || '';
+    if (!pw) return { ok: false, message: 'A WSL sudo password is required to install the Linux tools.' };
+    const r = installDeps(pw);
+    if (r.ok && remember && password) setSecret('wsl.sudo', password);
+    return r;
+  });
+
+  ipcMain.handle('wsl:setSudoPassword', async (_e, password: string, remember: boolean) => {
+    if (process.platform !== 'win32') return { ok: false, message: 'Windows only.' };
+    const { verifySudoPassword } = await import('./wslProvision');
+    const { setSecret, clearSecret } = await import('./secret');
+    if (!verifySudoPassword(password)) {
+      return { ok: false, message: 'That WSL sudo password was not accepted.' };
+    }
+    if (remember) {
+      const stored = setSecret('wsl.sudo', password);
+      return { ok: true, message: stored ? 'Password verified and saved.' : 'Password verified (could not save - encryption unavailable).' };
+    }
+    clearSecret('wsl.sudo');
+    return { ok: true, message: 'Password verified (not saved).' };
+  });
+
+  ipcMain.handle('wsl:clearSudoPassword', async () => {
+    const { clearSecret } = await import('./secret');
+    clearSecret('wsl.sudo');
+    return { ok: true };
+  });
+
+  // ---- Linux app automation (macOS / QEMU guest) ----
+  ipcMain.handle('macvm:status', async () => {
+    if (process.platform !== 'darwin') {
+      return { ready: false, qemu: false, image: false, reason: 'macOS only.', platform: process.platform };
+    }
+    const { getMacVmStatus } = await import('./macVmProvision');
+    return { ...getMacVmStatus(), platform: 'darwin' };
+  });
+
+  ipcMain.handle('macvm:setup', async () => {
+    if (process.platform !== 'darwin') return { ok: false, message: 'macOS only.' };
+    const { setupMacGuest } = await import('./macVmProvision');
+    return setupMacGuest();
+  });
+
   // ---- Agent ----
   ipcMain.handle('agent:loadMessages', (_e, sessionId: string, opts?: { fallbackPath?: string }) => {
     const ours = ourJsonlPath(sessionId);

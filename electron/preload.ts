@@ -36,6 +36,19 @@ const api = {
     save: (src: string, suggestedName?: string) =>
       ipcRenderer.invoke('image:save', src, suggestedName),
   },
+  wsl: {
+    status: () => ipcRenderer.invoke('wsl:status'),
+    installWsl: () => ipcRenderer.invoke('wsl:installWsl'),
+    installDeps: (password?: string, remember?: boolean) =>
+      ipcRenderer.invoke('wsl:installDeps', password, remember),
+    setSudoPassword: (password: string, remember: boolean) =>
+      ipcRenderer.invoke('wsl:setSudoPassword', password, remember),
+    clearSudoPassword: () => ipcRenderer.invoke('wsl:clearSudoPassword'),
+  },
+  macvm: {
+    status: () => ipcRenderer.invoke('macvm:status'),
+    setup: () => ipcRenderer.invoke('macvm:setup'),
+  },
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),
     listSessions: (projectId: string) =>

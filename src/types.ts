@@ -456,6 +456,36 @@ declare global {
           suggestedName?: string
         ) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>;
       };
+      wsl: {
+        status: () => Promise<{
+          installed: boolean;
+          depsInstalled: boolean;
+          defaultDistro?: string | null;
+          reason?: string;
+          sudoStored?: boolean;
+          platform: string;
+        }>;
+        installWsl: () => Promise<{ ok: boolean; message: string }>;
+        installDeps: (
+          password?: string,
+          remember?: boolean
+        ) => Promise<{ ok: boolean; message: string }>;
+        setSudoPassword: (
+          password: string,
+          remember: boolean
+        ) => Promise<{ ok: boolean; message: string }>;
+        clearSudoPassword: () => Promise<{ ok: boolean }>;
+      };
+      macvm: {
+        status: () => Promise<{
+          ready: boolean;
+          qemu: boolean;
+          image: boolean;
+          reason: string;
+          platform: string;
+        }>;
+        setup: () => Promise<{ ok: boolean; message: string }>;
+      };
       projects: {
         list: () => Promise<ProjectRow[]>;
         listSessions: (projectId: string) => Promise<SessionRow[]>;

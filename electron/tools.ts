@@ -2114,15 +2114,28 @@ const BROWSER_EVAL: ToolDef = {
 // (Linux), so the user's real screen / mouse / keyboard are never disturbed.
 // macOS is unsupported (returns a clear message).
 
-async function appBackendOrThrow() {
+// Remember which mode each launched app used, so follow-up ops route to the
+// same backend (native vs linux-vm). Cleared on AppClose.
+const _appModes = new Map<string, 'native' | 'linux-vm'>();
+
+async function appBackendForMode(mode: 'native' | 'linux-vm') {
   const { getBackend } = await import('./appAutomation');
-  const backend = await getBackend();
+  const backend = await getBackend(mode);
   if (!backend) {
-    throw new Error(
-      'App automation is not supported on this platform (macOS). It works on Windows and Linux.'
-    );
+    if (mode === 'native') {
+      throw new Error(
+        'Native app automation is not available on this platform (macOS has no native path). Use mode "linux-vm" to run Linux apps in an isolated guest.'
+      );
+    }
+    throw new Error('Linux-VM app automation is not available on this platform.');
   }
   return backend;
+}
+
+/** Resolve the backend for an already-launched app by its remembered mode. */
+async function appBackendFor(appId: string) {
+  const mode = _appModes.get(appId) ?? 'native';
+  return appBackendForMode(mode);
 }
 
 const SHOW_IMAGE: ToolDef = {
@@ -2180,14 +2193,20 @@ const APP_LAUNCH: ToolDef = {
   schema: {
     name: 'AppLaunch',
     description:
-      'Launch a GUI application in an ISOLATED display so it does NOT appear on the user\'s screen, steal focus, or move their mouse/keyboard — the user keeps working normally while you drive the app. Windows: the app runs on a hidden desktop. Linux: on a private virtual display (needs xvfb/openbox/xdotool/scrot installed; you\'ll get an apt-install hint if missing). NOT supported on macOS. Returns an appId you pass to the other App* tools, plus the app\'s initial windows. After launching, use AppScreenshot to see the app and AppListWindows to get window ids.\n\nIMPORTANT (Windows): CLASSIC Win32 apps automate fully — screenshots, clicks, AND drag-drawing all work. But modern Windows Store / WinUI3 apps — including the BUILT-IN Win11 Paint, Notepad, and Calculator — route input through a pipeline that does NOT accept simulated input on an isolated/background desktop, so you can screenshot them but clicks/drags/typing won\'t register. For drawing or any input automation on Windows, prefer a classic Win32 app (e.g. a classic editor/drawing tool), not the modern Store Paint/Notepad. Linux apps (gedit, GIMP, xterm, etc.) all work.',
+      'Launch a GUI application in an ISOLATED display so it does NOT appear on the user\'s screen, steal focus, or move their mouse/keyboard — the user keeps working normally while you drive the app. Returns an appId you pass to the other App* tools. After launching, use AppScreenshot to see it and AppListWindows to get window ids.\n\nTWO MODES (pick with the `mode` arg):\n• mode "native" (default on Windows/Linux): drives a HOST GUI app. On Windows it works for CLASSIC Win32 apps — screenshots, clicks, drag-drawing, typing all work — but NOT modern Windows Store / WinUI3 apps (the built-in Win11 Paint, Notepad, Calculator) and NOT games/emulators: those use a real-OS-input pipeline that ignores the simulated input on the hidden desktop, so you can screenshot them but input won\'t register. On Linux, native uses a private Xvfb display and drives everything.\n• mode "linux-vm": runs a LINUX version of the app inside an isolated Linux guest (WSL2 on Windows; a VM on macOS) on a real virtual X display, where REAL input works for EVERYTHING — games/emulators (e.g. an NES game via fceux), drawing that needs real strokes, and any device-state app. Use this for games, emulators, real drawing, or anything the native Windows path can\'t drive. On macOS this is the ONLY mode (macOS has no native isolated path).\n\nSo: normal Windows app -> native. NES game / emulator / real drawing / macOS -> linux-vm (launch the LINUX build of the app). If WSL/the guest isn\'t set up, you\'ll get a clear message about enabling it in Settings.',
     input_schema: {
       type: 'object',
       properties: {
         command: {
           type: 'string',
           description:
-            'Executable to launch. Windows e.g. "notepad.exe" or a full path; Linux e.g. "gedit" or "/usr/bin/xterm". Classic Win32 apps work best; some Win11 Store apps (Notepad, Paint) run in a sandbox that can complicate window-finding.',
+            'Executable to launch. For mode "native" on Windows: a Windows .exe (e.g. "notepad.exe"). For mode "linux-vm": a LINUX command (e.g. "fceux /path/rom.nes", "mtpaint", "gedit").',
+        },
+        mode: {
+          type: 'string',
+          enum: ['native', 'linux-vm'],
+          description:
+            'Which automation path. "native" (default on Windows/Linux) drives a host GUI app: on Windows it works for CLASSIC Win32 apps only (NOT modern Store/WinUI3 apps like the built-in Paint/Notepad, and NOT games/emulators - those ignore the input). "linux-vm" runs a LINUX version of the app inside an isolated Linux guest (WSL2 on Windows, a VM on macOS) where real input works - use this for GAMES/EMULATORS (NES via fceux, etc.), DRAWING that needs real strokes, any device-state app, OR whenever on macOS. Defaults to native on Windows/Linux and linux-vm on macOS.',
         },
         args: {
           type: 'array',
@@ -2201,7 +2220,10 @@ const APP_LAUNCH: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const { defaultMode } = await import('./appAutomation');
+    const mode: 'native' | 'linux-vm' =
+      input.mode === 'linux-vm' || input.mode === 'native' ? input.mode : defaultMode();
+    const backend = await appBackendForMode(mode);
     const pf = await backend.preflight();
     if (!pf.ok) return `error: ${pf.reason}`;
     const handle = await backend.launch({
@@ -2210,6 +2232,7 @@ const APP_LAUNCH: ToolDef = {
       width: typeof input.width === 'number' ? input.width : undefined,
       height: typeof input.height === 'number' ? input.height : undefined,
     });
+    _appModes.set(handle.appId, mode);
     // Give the app a beat to create its window, then list.
     await new Promise((r) => setTimeout(r, 1200));
     let windows: any[] = [];
@@ -2242,7 +2265,7 @@ const APP_LIST_WINDOWS: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     const windows = await backend.listWindows(String(input.appId));
     if (windows.length === 0) return 'No windows (the app may have closed or not opened a window yet).';
     return windows
@@ -2266,7 +2289,7 @@ const APP_SCREENSHOT: ToolDef = {
     },
   },
   async execute(input): Promise<StructuredToolResult> {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     const shot = await backend.screenshot(
       String(input.appId),
       input.windowId ? String(input.windowId) : undefined
@@ -2305,7 +2328,7 @@ const APP_CLICK: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     await backend.click(
       String(input.appId),
       String(input.windowId),
@@ -2347,7 +2370,7 @@ const APP_DRAG: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     let path: Array<{ x: number; y: number }> = [];
     if (Array.isArray(input.path) && input.path.length > 0) {
       path = input.path.map((p: any) => ({ x: Number(p.x), y: Number(p.y) }));
@@ -2390,7 +2413,7 @@ const APP_TYPE: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     await backend.type(String(input.appId), String(input.windowId), String(input.text));
     return `Typed ${JSON.stringify(String(input.text)).slice(0, 60)} into window ${input.windowId}.`;
   },
@@ -2412,7 +2435,7 @@ const APP_PRESS: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     await backend.key(String(input.appId), String(input.windowId), String(input.key));
     return `Pressed ${input.key} in window ${input.windowId}.`;
   },
@@ -2430,8 +2453,9 @@ const APP_CLOSE: ToolDef = {
     },
   },
   async execute(input) {
-    const backend = await appBackendOrThrow();
+    const backend = await appBackendFor(String(input.appId));
     await backend.close(String(input.appId));
+    _appModes.delete(String(input.appId));
     return `Closed app ${input.appId} and tore down its isolated display.`;
   },
 };

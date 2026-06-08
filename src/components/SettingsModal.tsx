@@ -17,6 +17,7 @@ import {
   Globe,
   Copy,
   Check,
+  Terminal,
 } from 'lucide-react';
 import clsx from 'clsx';
 import type { McpServerStatus, ApiKey } from '@/types';
@@ -217,6 +218,8 @@ export function SettingsModal({ open, onClose }: Props) {
 
           <ChromeConnectorSection open={open} />
 
+          <LinuxAutomationSection open={open} />
+
           {mcpMsg && (
             <div className="pt-2 border-t border-border">
               <p className="text-[11px] text-text-dim leading-snug">{mcpMsg}</p>
@@ -344,6 +347,264 @@ function McpServersSection({
               onSignOut={() => onSignOut(s.name)}
             />
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Linux app automation (WSL on Windows) setup.
+ *
+ * Lets the agent run Linux apps - games/emulators, drawing apps, anything that
+ * needs real input - inside an isolated Linux VM (WSL2), where the native
+ * Windows hidden-desktop path can't reach. One-time setup: ensure WSL is
+ * installed, install the Linux tools + apps, and (optionally) remember the WSL
+ * sudo password used during that setup (it isn't needed afterwards).
+ */
+function LinuxAutomationSection({ open }: { open: boolean }) {
+  const [status, setStatus] = useState<{
+    installed: boolean;
+    depsInstalled: boolean;
+    defaultDistro?: string | null;
+    reason?: string;
+    sudoStored?: boolean;
+    platform: string;
+  } | null>(null);
+  const [pw, setPw] = useState('');
+  const [remember, setRemember] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const s = await window.api.wsl.status();
+      setStatus(s);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    refresh();
+  }, [open]);
+
+  // On Linux the host automates natively (no setup here). On macOS we show the
+  // QEMU-guest setup instead of the WSL flow.
+  if (status && status.platform === 'linux') return null;
+  if (status && status.platform === 'darwin') return <MacAutomationSection />;
+
+  const installWsl = async () => {
+    setBusy('wsl');
+    setMsg(null);
+    try {
+      const r = await window.api.wsl.installWsl();
+      setMsg(r.message);
+    } finally {
+      setBusy(null);
+      refresh();
+    }
+  };
+
+  const installDeps = async () => {
+    setBusy('deps');
+    setMsg('Installing Linux tools + apps (this can take a couple minutes)...');
+    try {
+      const r = await window.api.wsl.installDeps(pw || undefined, remember);
+      setMsg(r.message);
+      if (r.ok) setPw('');
+    } finally {
+      setBusy(null);
+      refresh();
+    }
+  };
+
+  const savePw = async () => {
+    setBusy('pw');
+    setMsg(null);
+    try {
+      const r = await window.api.wsl.setSudoPassword(pw, remember);
+      setMsg(r.message);
+      if (r.ok && remember) setPw('');
+    } finally {
+      setBusy(null);
+      refresh();
+    }
+  };
+
+  const ready = status?.installed && status?.depsInstalled;
+
+  return (
+    <div className="pt-2 border-t border-border">
+      <div className="flex items-center gap-1.5 text-[12px] font-medium text-text mb-1.5">
+        <Terminal size={14} className="text-text-dim" />
+        Linux app automation (WSL)
+        {ready && <span className="text-[10px] text-state-success ml-1">ready</span>}
+      </div>
+      <p className="text-[11px] text-text-dim leading-snug mb-2">
+        Lets the agent run Linux apps — games/emulators (e.g. an NES game),
+        drawing apps, anything needing real input — inside an isolated Linux VM,
+        without touching your screen. Needed for app automation the native
+        Windows path can't do (modern Store apps, games). One-time setup.
+      </p>
+
+      {!status ? (
+        <p className="text-[11px] text-text-dim">Checking…</p>
+      ) : !status.installed ? (
+        <div className="space-y-2">
+          <p className="text-[11px] text-text-dim leading-snug">{status.reason}</p>
+          <button
+            onClick={installWsl}
+            disabled={busy !== null}
+            className="px-3 py-1.5 text-[12px] rounded border border-border bg-bg-elevated text-text hover:border-border-strong disabled:opacity-50"
+          >
+            {busy === 'wsl' ? 'Starting…' : 'Install WSL for me'}
+          </button>
+          <p className="text-[10px] text-text-muted leading-snug">
+            This needs admin rights and a one-time reboot. After it finishes,
+            reopen Settings to install the Linux tools.
+          </p>
+        </div>
+      ) : !status.depsInstalled ? (
+        <div className="space-y-2">
+          <p className="text-[11px] text-text-dim leading-snug">
+            WSL is installed ({status.defaultDistro}). Now install the Linux
+            tools + apps. This needs your WSL sudo password (only for setup —
+            not afterwards).
+          </p>
+          <input
+            type="password"
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            placeholder="WSL sudo password"
+            className="w-full px-2 py-1 text-[12px] rounded border border-border bg-bg text-text"
+          />
+          <label className="flex items-center gap-1.5 text-[11px] text-text-dim">
+            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+            Remember it (encrypted) so I'm not asked again
+          </label>
+          <button
+            onClick={installDeps}
+            disabled={busy !== null || !pw}
+            className="px-3 py-1.5 text-[12px] rounded border border-border bg-bg-elevated text-text hover:border-border-strong disabled:opacity-50"
+          >
+            {busy === 'deps' ? 'Installing…' : 'Install Linux tools + apps'}
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          <p className="text-[11px] text-state-success leading-snug">
+            Ready ({status.defaultDistro}). The agent can run Linux apps with
+            mode "linux-vm".
+          </p>
+          {!status.sudoStored && (
+            <div className="space-y-1.5">
+              <p className="text-[10px] text-text-muted leading-snug">
+                Optionally save your WSL sudo password (encrypted) for future
+                maintenance so you aren't asked again:
+              </p>
+              <div className="flex gap-1.5">
+                <input
+                  type="password"
+                  value={pw}
+                  onChange={(e) => setPw(e.target.value)}
+                  placeholder="WSL sudo password"
+                  className="flex-1 px-2 py-1 text-[12px] rounded border border-border bg-bg text-text"
+                />
+                <button
+                  onClick={savePw}
+                  disabled={busy !== null || !pw}
+                  className="px-2 py-1 text-[11px] rounded border border-border text-text-dim hover:text-text disabled:opacity-50"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          )}
+          {status.sudoStored && (
+            <button
+              onClick={async () => {
+                await window.api.wsl.clearSudoPassword();
+                refresh();
+              }}
+              className="text-[10px] text-text-muted hover:text-text underline"
+            >
+              Forget saved sudo password
+            </button>
+          )}
+        </div>
+      )}
+      {msg && (
+        <div className="mt-2 text-[10px] text-text-dim leading-snug bg-bg-elevated border border-border rounded px-2 py-1">
+          {msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** macOS Linux-guest (QEMU) setup. */
+function MacAutomationSection() {
+  const [status, setStatus] = useState<{
+    ready: boolean;
+    qemu: boolean;
+    image: boolean;
+    reason: string;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      setStatus(await window.api.macvm.status());
+    } catch {
+      /* ignore */
+    }
+  };
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  const setup = async () => {
+    setBusy(true);
+    setMsg('Setting up the Linux guest...');
+    try {
+      const r = await window.api.macvm.setup();
+      setMsg(r.message);
+    } finally {
+      setBusy(false);
+      refresh();
+    }
+  };
+
+  return (
+    <div className="pt-2 border-t border-border">
+      <div className="flex items-center gap-1.5 text-[12px] font-medium text-text mb-1.5">
+        <Terminal size={14} className="text-text-dim" />
+        Linux app automation (VM)
+        {status?.ready && <span className="text-[10px] text-state-success ml-1">ready</span>}
+      </div>
+      <p className="text-[11px] text-text-dim leading-snug mb-2">
+        On macOS, app automation runs Linux apps inside a lightweight VM (the
+        only way to drive apps without taking over your screen). Needs QEMU
+        (`brew install qemu`) and a one-time Linux guest image.
+      </p>
+      {status && (
+        <p className="text-[11px] text-text-dim leading-snug mb-2">{status.reason}</p>
+      )}
+      {status && !status.ready && (
+        <button
+          onClick={setup}
+          disabled={busy || !status.qemu}
+          className="px-3 py-1.5 text-[12px] rounded border border-border bg-bg-elevated text-text hover:border-border-strong disabled:opacity-50"
+        >
+          {busy ? 'Setting up…' : 'Set up Linux guest'}
+        </button>
+      )}
+      {msg && (
+        <div className="mt-2 text-[10px] text-text-dim leading-snug bg-bg-elevated border border-border rounded px-2 py-1">
+          {msg}
         </div>
       )}
     </div>

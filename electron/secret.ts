@@ -71,6 +71,37 @@ function decryptCipher(cipher: string): string | null {
   }
 }
 
+// ---- Generic encrypted secrets (settings-backed) --------------------------
+//
+// For small secrets like the WSL sudo password. Stored as an encrypted
+// setting via the same safeStorage path as API keys. Returns null when
+// encryption isn't available (the caller should then prompt each time).
+
+/** Store a secret encrypted under a settings key. Returns false if it couldn't. */
+export function setSecret(name: string, plain: string): boolean {
+  const cipher = encryptPlain(plain);
+  if (cipher == null) return false;
+  setSetting(`secret.${name}.cipher`, cipher);
+  return true;
+}
+
+/** Retrieve + decrypt a secret, or null if absent/undecryptable. */
+export function getSecret(name: string): string | null {
+  const cipher = getSetting(`secret.${name}.cipher`);
+  if (!cipher) return null;
+  return decryptCipher(cipher);
+}
+
+/** Forget a stored secret. */
+export function clearSecret(name: string): void {
+  setSetting(`secret.${name}.cipher`, '');
+}
+
+/** True if a secret is stored (without decrypting it). */
+export function hasSecret(name: string): boolean {
+  return !!getSetting(`secret.${name}.cipher`);
+}
+
 // ---- Multi-key API --------------------------------------------------------
 
 export interface ApiKeyPublic {
