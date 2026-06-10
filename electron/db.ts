@@ -436,6 +436,19 @@ function migrateSettings() {
     setSetting('model', 'claude-fable-5[1m]');
     setSetting('migrated.fable5_default', '1');
   }
+
+  // Revert Fable 5 users back to Opus 4.8. Fable 5's safety classifier refuses
+  // any turn whose conversation/system context contains security or
+  // systems-code content (buffer overflow, use-after-free, exploits) - which
+  // is common here - so it refuses nearly every turn and is a poor default.
+  // Opus 4.8 doesn't refuse this work. Runs once; users can re-select Fable 5.
+  if (!getSetting('migrated.revert_fable5')) {
+    const cur = (getSetting('model') as string) || '';
+    if (cur.includes('fable')) {
+      setSetting('model', 'claude-opus-4-8[1m]');
+    }
+    setSetting('migrated.revert_fable5', '1');
+  }
 }
 
 // ---- Schema migrations ----
