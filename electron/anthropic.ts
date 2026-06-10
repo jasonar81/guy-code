@@ -145,6 +145,12 @@ export function buildSystemBlocks(args: {
   /** Concatenated CLAUDE.md / MEMORY.md context loaded at session start. */
   memoryText?: string;
   /**
+   * Relevance-retrieved non-pinned memory for THIS turn (selected by the
+   * cheap-model gate from the user's message). Goes in an uncached per-turn
+   * block after the stable pinned core.
+   */
+  retrievedMemoryText?: string;
+  /**
    * Pre-rendered "Available skills" block from `electron/skills.ts`.
    * Empty string = no skills loaded; we just skip the slot. Sits in
    * slot 3.5 between memory and currentTask, cached with 1h TTL like
@@ -173,7 +179,7 @@ export function buildSystemBlocks(args: {
    */
   currentTask?: string | null;
 }) {
-  const { sessionId, cwd, date, platform, memoryText, skillsBlock, activePlanBlock, currentTask } = args;
+  const { sessionId, cwd, date, platform, memoryText, retrievedMemoryText, skillsBlock, activePlanBlock, currentTask } = args;
   const isoDate = date.toISOString().slice(0, 10);
   const isWin = platform === 'win32';
   const shellName = isWin ? 'PowerShell' : 'Bash';
@@ -307,6 +313,19 @@ export function buildSystemBlocks(args: {
             type: 'text' as const,
             text: memoryText,
             cache_control: CACHE_1H,
+          },
+        ]
+      : []),
+    // Slot 3b: relevance-RETRIEVED memory for this turn (selected by the
+    // cheap-model gate from the non-pinned leaves, based on the user's
+    // message). Intentionally has NO cache_control: it changes per turn, so
+    // caching it would waste a breakpoint and never hit. Placed after the
+    // stable pinned core so the cached prefix stays valid.
+    ...(retrievedMemoryText && retrievedMemoryText.trim()
+      ? [
+          {
+            type: 'text' as const,
+            text: `Additional saved notes selected as relevant to your current task:\n\n${retrievedMemoryText}`,
           },
         ]
       : []),

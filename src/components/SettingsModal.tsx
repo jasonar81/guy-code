@@ -35,6 +35,7 @@ const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
 
 export function SettingsModal({ open, onClose }: Props) {
   const [model, setModel] = useState<string>(DEFAULT_MODEL);
+  const [memoryRetrieval, setMemoryRetrieval] = useState<boolean>(true);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // `mcpMsg` reuses the previous reset-banner area to surface MCP
@@ -69,6 +70,9 @@ export function SettingsModal({ open, onClose }: Props) {
       const m = await window.api.settings.get('model');
       if (cancelled) return;
       setModel(m && m.trim() ? m : DEFAULT_MODEL);
+      const mr = await window.api.settings.get('memory_retrieval');
+      if (cancelled) return;
+      setMemoryRetrieval(mr !== 'off'); // default on
       setSavedAt(null);
       setMcpMsg(null);
       // Make sure the keys list is fresh whenever the user opens
@@ -212,6 +216,24 @@ export function SettingsModal({ open, onClose }: Props) {
               className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
               placeholder={DEFAULT_MODEL}
             />
+          </Field>
+
+          <Field
+            icon={<Cpu size={14} />}
+            label="Smart memory retrieval"
+            hint="Instead of loading your entire saved-memory tree into every prompt, a cheap model picks the notes relevant to each message and loads only those (plus a small always-on core). Cuts cost, sharpens focus, and avoids unrelated content (e.g. security notes) triggering refusals on safety-stricter models. Recommended on."
+          >
+            <label className="flex items-center gap-2 text-[13px] text-text cursor-pointer">
+              <input
+                type="checkbox"
+                checked={memoryRetrieval}
+                onChange={async (e) => {
+                  setMemoryRetrieval(e.target.checked);
+                  await window.api.settings.set('memory_retrieval', e.target.checked ? 'on' : 'off');
+                }}
+              />
+              {memoryRetrieval ? 'On (relevance-filtered memory)' : 'Off (load all memory every turn)'}
+            </label>
           </Field>
 
           <ApiKeysSection keys={apiKeys} />

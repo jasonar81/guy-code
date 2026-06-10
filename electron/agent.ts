@@ -48,6 +48,7 @@ import {
 import { getDefaultApiKeyId } from './secret';
 import { computeCostMicros } from './pricing';
 import { loadMemory } from './memory';
+import { loadRelevantMemory } from './memoryRetrieval';
 import { precheckCall } from './budget';
 import {
   looksLikeContextBail,
@@ -1033,6 +1034,33 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         `[agent] loaded memory: ${memory.sources.length} files, ${memory.text.length}b (truncated ${memory.truncatedBytes}b)`
       );
     }
+    // Smart memory retrieval: instead of dumping the whole memory tree into the
+    // system prompt every turn (costly, dilutes attention, and triggers Fable
+    // 5 refusals when security notes are present), load only the pinned core +
+    // the notes a cheap model judges relevant to THIS turn's message. Computed
+    // ONCE per turn and reused across tool-result rounds. Falls back to the
+    // full load on any failure or when disabled. `memory` (the full bundle) is
+    // still used for subagents.
+    let memText = memory.text;
+    let retrievedMemoryText: string | undefined;
+    const memRetrieval = getSetting('memory_retrieval');
+    if (memRetrieval !== 'off' && userText && userText.trim()) {
+      try {
+        const rm = await loadRelevantMemory({
+          cwd,
+          projectId,
+          userMessage: userText,
+          apiKeyId: resolvedApiKeyId,
+        });
+        memText = rm.pinnedText;
+        retrievedMemoryText = rm.retrievedText;
+        log.info(
+          `[agent] memory retrieval via=${rm.via} selected=${rm.selectedNames.length} (${rm.selectedNames.join(', ').slice(0, 200)})`
+        );
+      } catch (e) {
+        log.warn(`[agent] memory retrieval failed, using full load: ${(e as Error).message}`);
+      }
+    }
     // Skills loaded from ~/.guycode/skills, <cwd>/.guycode/skills, and
     // imported from ~/.claude/skills + <cwd>/.claude/skills. The
     // resulting block enumerates name + description so the model can
@@ -1049,7 +1077,8 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       cwd,
       date: new Date(),
       platform: platformShortName(),
-      memoryText: memory.text,
+      memoryText: memText,
+      retrievedMemoryText,
       skillsBlock: renderSkillsBlock(skillRegistry),
       // Anchor the user's prompt as a system-level "current task" reminder
       // so the model never loses track of what it's working on, even after
@@ -1268,7 +1297,8 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         cwd,
         date: new Date(),
         platform: platformShortName(),
-        memoryText: memory.text,
+        memoryText: memText,
+        retrievedMemoryText,
         skillsBlock: renderSkillsBlock(skillRegistry),
         activePlanBlock: renderActivePlanBlock(sessionId),
         currentTask: userText,

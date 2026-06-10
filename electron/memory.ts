@@ -942,7 +942,7 @@ function walkSkills(
   }
 }
 
-function parseMdFrontmatter(path: string): { name: string | null; description: string | null } {
+export function parseMdFrontmatter(path: string): { name: string | null; description: string | null } {
   try {
     const text = readFileSync(path, 'utf8');
     if (!text.startsWith('---')) {
