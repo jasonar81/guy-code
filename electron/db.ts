@@ -449,6 +449,18 @@ function migrateSettings() {
     }
     setSetting('migrated.revert_fable5', '1');
   }
+
+  // Re-enable Claude Fable 5 as the default. The earlier refusal problem is now
+  // mitigated by smart memory retrieval (keeps security notes out of benign
+  // prompts), smart routing (simple turns go to a cheaper model), and the
+  // refusal->Opus 4.8 fallback. Move anyone still on the Opus 4.8 default back
+  // to Fable 5 once; users who prefer Opus can re-select it in Settings.
+  if (!getSetting('migrated.fable5_reenable')) {
+    if (getSetting('model') === 'claude-opus-4-8[1m]') {
+      setSetting('model', 'claude-fable-5[1m]');
+    }
+    setSetting('migrated.fable5_reenable', '1');
+  }
 }
 
 // ---- Schema migrations ----

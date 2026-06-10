@@ -76,15 +76,16 @@ void getApiKey;
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-// Claude Opus 4.8 is the default. Claude Fable 5 (the heavily-safeguarded
-// public Mythos-class model) was briefly the default, but its safety
-// classifier refuses ANY turn - even a benign one - when the conversation or
-// system prompt contains security/systems-code content (buffer overflow,
-// use-after-free, exploits, etc.). Since this app's memory + work is often
-// security-heavy, Fable 5 ends up refusing nearly every turn, so it's a poor
-// default here. It stays selectable in Settings, with the refusal fallback
-// below as a safety net.
-export const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
+// Claude Fable 5 (the top-capability public Mythos-class model) is the default.
+// Its safety classifier can refuse a turn when the conversation or system
+// prompt contains security/systems-code content - but that's now mitigated by
+// THREE layers: (1) smart memory retrieval (0.5.0) keeps security notes out of
+// the system prompt unless the task is actually about security, so benign
+// turns no longer trip it; (2) smart routing (0.6.0) sends simple turns to a
+// cheaper model entirely; and (3) if Fable 5 still refuses, the agent
+// transparently retries on the fallback model below. Users can switch models
+// in Settings.
+export const DEFAULT_MODEL = 'claude-fable-5[1m]';
 
 // When Fable 5 returns stop_reason 'refusal' (an empty response from its safety
 // classifier), the agent transparently retries that turn on this fallback
