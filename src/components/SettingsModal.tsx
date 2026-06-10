@@ -36,6 +36,9 @@ const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
 export function SettingsModal({ open, onClose }: Props) {
   const [model, setModel] = useState<string>(DEFAULT_MODEL);
   const [memoryRetrieval, setMemoryRetrieval] = useState<boolean>(true);
+  const [routing, setRouting] = useState<boolean>(false);
+  const [cheapModel, setCheapModel] = useState<string>('claude-sonnet-4-6');
+  const [routingFloor, setRoutingFloor] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // `mcpMsg` reuses the previous reset-banner area to surface MCP
@@ -73,6 +76,15 @@ export function SettingsModal({ open, onClose }: Props) {
       const mr = await window.api.settings.get('memory_retrieval');
       if (cancelled) return;
       setMemoryRetrieval(mr !== 'off'); // default on
+      const rt = await window.api.settings.get('routing');
+      if (cancelled) return;
+      setRouting(rt === 'on'); // default off (opt-in)
+      const cm = await window.api.settings.get('routing.cheapModel');
+      if (cancelled) return;
+      setCheapModel(cm && cm.trim() ? cm : 'claude-sonnet-4-6');
+      const rf = await window.api.settings.get('routing.floor');
+      if (cancelled) return;
+      setRoutingFloor(rf || '');
       setSavedAt(null);
       setMcpMsg(null);
       // Make sure the keys list is fresh whenever the user opens
@@ -234,6 +246,54 @@ export function SettingsModal({ open, onClose }: Props) {
               />
               {memoryRetrieval ? 'On (relevance-filtered memory)' : 'Off (load all memory every turn)'}
             </label>
+          </Field>
+
+          <Field
+            icon={<Cpu size={14} />}
+            label="Smart model routing"
+            hint="When on, a cheap model first classifies each turn and routes clearly-simple turns (lookups, small edits, questions) to a cheaper model, keeping the strong model for complex/agentic/correctness-critical work. Biased to the strong model when uncertain, and a refusal/empty result still escalates back to the strong model. Off by default."
+          >
+            <label className="flex items-center gap-2 text-[13px] text-text cursor-pointer">
+              <input
+                type="checkbox"
+                checked={routing}
+                onChange={async (e) => {
+                  setRouting(e.target.checked);
+                  await window.api.settings.set('routing', e.target.checked ? 'on' : 'off');
+                }}
+              />
+              {routing ? 'On (route simple turns to a cheaper model)' : 'Off (always use your selected model)'}
+            </label>
+            {routing && (
+              <div className="mt-2 space-y-2">
+                <div>
+                  <div className="text-[11px] text-text-dim mb-1">Cheap model (for simple turns)</div>
+                  <input
+                    type="text"
+                    value={cheapModel}
+                    onChange={(e) => setCheapModel(e.target.value)}
+                    onBlur={async () =>
+                      await window.api.settings.set('routing.cheapModel', cheapModel.trim() || 'claude-sonnet-4-6')
+                    }
+                    className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
+                    placeholder="claude-sonnet-4-6"
+                  />
+                </div>
+                <div>
+                  <div className="text-[11px] text-text-dim mb-1">
+                    Minimum model floor (optional - routing never goes below this)
+                  </div>
+                  <input
+                    type="text"
+                    value={routingFloor}
+                    onChange={(e) => setRoutingFloor(e.target.value)}
+                    onBlur={async () => await window.api.settings.set('routing.floor', routingFloor.trim())}
+                    className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
+                    placeholder="(none)"
+                  />
+                </div>
+              </div>
+            )}
           </Field>
 
           <ApiKeysSection keys={apiKeys} />

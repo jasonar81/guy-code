@@ -1022,7 +1022,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       );
     }
 
-    const model = (getSetting('model') as string) || DEFAULT_MODEL;
+    let model = (getSetting('model') as string) || DEFAULT_MODEL;
     // Effort level for the model (output_config.effort). Defaults to xhigh
     // (DEFAULT_EFFORT). A user who sets effort to '' (or pins a model that
     // doesn't accept output_config) gets it omitted.
@@ -1059,6 +1059,28 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         );
       } catch (e) {
         log.warn(`[agent] memory retrieval failed, using full load: ${(e as Error).message}`);
+      }
+    }
+    // Smart model routing: route clearly-simple turns to a cheaper model to
+    // save cost. Biased to the strong model whenever uncertain; the
+    // refusal/empty fallback below still escalates if a cheap turn goes wrong.
+    // Default off (opt-in) so it never surprises with a weaker model.
+    if (getSetting('routing') === 'on' && userText && userText.trim()) {
+      try {
+        const { classifyTurn, DEFAULT_CHEAP_MODEL } = await import('./modelRouter');
+        const decision = await classifyTurn({
+          userText,
+          strongModel: model,
+          cheapModel: (getSetting('routing.cheapModel') as string) || DEFAULT_CHEAP_MODEL,
+          floorModel: (getSetting('routing.floor') as string) || '',
+          apiKeyId: resolvedApiKeyId,
+        });
+        if (decision.model !== model) {
+          log.info(`[agent] routing ${decision.tier} -> ${decision.model} (${decision.via}: ${decision.reason})`);
+        }
+        model = decision.model;
+      } catch (e) {
+        log.warn(`[agent] routing failed, keeping strong model: ${(e as Error).message}`);
       }
     }
     // Skills loaded from ~/.guycode/skills, <cwd>/.guycode/skills, and
