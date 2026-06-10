@@ -34,6 +34,13 @@ function pricing(input: number, output: number): ModelPricing {
 // kept that pricing. Earlier Opus 4 / Claude 3 Opus retain the legacy
 // $15/$75 rate.
 const TABLE: Record<string, ModelPricing> = {
+  // Claude Fable 5 (released 2026-06-09): $10 input / $50 output per MTok.
+  // Cache rates ($1 read, $12.50 5m-write, $20 1h-write) follow the standard
+  // 0.1x/1.25x/2x multipliers, so the derived pricing() values are exact.
+  // Required as an explicit entry: "fable" matches no family fallback, so
+  // without this the cost report would wrongly use the $5/$25 Opus default.
+  'claude-fable-5': pricing(10, 50),
+  'claude-mythos-5': pricing(10, 50),
   'claude-opus-4-8': pricing(5, 25),
   'claude-opus-4-8-1m': pricing(5, 25),
   'claude-opus-4-7': pricing(5, 25),

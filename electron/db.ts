@@ -195,6 +195,7 @@ export async function initDb(): Promise<void> {
 
   _db.exec('PRAGMA foreign_keys = ON');
   migrate(_db);
+  migrateSettings();
   flush(); // ensure freshly migrated DB hits disk
 
   _flushTimer = setInterval(() => flush(), 5000);
@@ -415,6 +416,24 @@ export function db(): DbWrapper {
     },
   };
   return _wrapper;
+}
+
+// ---- One-time settings migrations (data, not schema) ----
+//
+// These run once each (guarded by a marker setting) to update user data on
+// upgrade. Unlike schema migrations they can change values the user is allowed
+// to edit afterward - the marker only prevents re-applying on every launch.
+
+function migrateSettings() {
+  // Switch the default model to Claude Fable 5 (1M context). Released
+  // 2026-06-09; it's the new recommended default for agentic work. We
+  // intentionally OVERWRITE any existing `model` setting once so everyone
+  // moves to it; users can change it back in Settings afterward (the marker
+  // below stops us from re-overwriting their choice on later launches).
+  if (!getSetting('migrated.fable5_default')) {
+    setSetting('model', 'claude-fable-5[1m]');
+    setSetting('migrated.fable5_default', '1');
+  }
 }
 
 // ---- Schema migrations ----

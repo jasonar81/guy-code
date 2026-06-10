@@ -12,6 +12,7 @@ import {
   streamMessage,
   withConversationCacheBreakpoint,
   DEFAULT_MODEL,
+  DEFAULT_EFFORT,
 } from './anthropic';
 import {
   appendJsonlEvent,
@@ -1020,6 +1021,11 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     }
 
     const model = (getSetting('model') as string) || DEFAULT_MODEL;
+    // Effort level for the model (output_config.effort). Defaults to xhigh
+    // (DEFAULT_EFFORT). A user who sets effort to '' (or pins a model that
+    // doesn't accept output_config) gets it omitted.
+    const effortSetting = getSetting('effort');
+    const effort = effortSetting === undefined ? DEFAULT_EFFORT : (effortSetting as string);
     const memory = loadMemory({ cwd, projectId });
     if (memory.sources.length > 0) {
       log.info(
@@ -1291,6 +1297,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         try {
           response = await streamMessage({
             model,
+            effort,
             system: refreshedSystemBlocks,
             tools,
             messages: messagesToSend,

@@ -39,7 +39,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import log from 'electron-log';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { getClient, DEFAULT_MODEL, parseExtendedContext } from './anthropic';
+import { getClient, DEFAULT_MODEL, DEFAULT_EFFORT, parseExtendedContext } from './anthropic';
 import { TOOLS, executeTool, type ToolContext } from './tools';
 import { maybeSummarize } from './toolSummarizer';
 import { getMcpToolSchemas } from './mcp';
@@ -359,6 +359,8 @@ export async function runSubagent(
   const system = buildRoleSystemPrompt(input.role, parent.cwd);
   const tools = buildToolSchemas(input.role);
   const model = parent.model || DEFAULT_MODEL;
+  const effortSetting = getSetting('effort');
+  const effort = effortSetting === undefined ? DEFAULT_EFFORT : (effortSetting as string);
 
   // The child inherits the parent's tool context EXCEPT the projectId
   // filter — recall_memory should still see the project's memory. The
@@ -431,7 +433,10 @@ export async function runSubagent(
       const stream = client.messages.stream(
         {
           model: bareModel,
-          max_tokens: 16384,
+          max_tokens: 32000,
+          // Effort control (output_config.effort), same default as the main
+          // agent. Omitted when the setting is explicitly cleared.
+          ...(effort ? { output_config: { effort } } : {}),
           system,
           tools,
           messages,

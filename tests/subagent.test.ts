@@ -75,6 +75,7 @@ function buildStream(resp: { content: any[]; usage?: any; model?: string; id?: s
 
 vi.mock('../electron/anthropic', () => ({
   DEFAULT_MODEL: 'claude-opus-4-7[1m]',
+  DEFAULT_EFFORT: 'xhigh',
   parseExtendedContext: (model: string) => ({
     id: model.replace(/\[1m\]$/, ''),
     want1m: model.includes('[1m]'),

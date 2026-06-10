@@ -76,7 +76,14 @@ void getApiKey;
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-export const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
+export const DEFAULT_MODEL = 'claude-fable-5[1m]';
+
+// The default `effort` level for the model. Fable 5 (and Opus 4.7/4.8) take an
+// `effort` parameter (sent as output_config.effort) that trades thoroughness
+// for token efficiency. xhigh is Anthropic's recommended starting point for
+// coding + agentic work (repeated tool calls, search, long-horizon tasks) -
+// exactly this app's workload. Users can override via the `effort` setting.
+export const DEFAULT_EFFORT = 'xhigh';
 
 /**
  * Detect the `[1m]` suffix on a model string and return the bare model ID
@@ -387,6 +394,12 @@ export function withConversationCacheBreakpoint(
 
 export interface StreamArgs {
   model?: string;
+  /**
+   * Effort level (output_config.effort): low | medium | high | xhigh | max.
+   * Controls how many tokens the model spends (thinking + text + tool calls).
+   * Defaults to DEFAULT_EFFORT (xhigh). Pass '' to omit it entirely.
+   */
+  effort?: string;
   system: ReturnType<typeof buildSystemBlocks>;
   tools: Anthropic.Tool[];
   messages: Anthropic.MessageParam[];
@@ -415,7 +428,16 @@ export interface StreamArgs {
  * results plus placeholders for cleared older ones.
  */
 export async function streamMessage(args: StreamArgs): Promise<Anthropic.Message> {
-  const { model = DEFAULT_MODEL, system, tools, messages, signal, onEvent, apiKeyId } = args;
+  const {
+    model = DEFAULT_MODEL,
+    effort = DEFAULT_EFFORT,
+    system,
+    tools,
+    messages,
+    signal,
+    onEvent,
+    apiKeyId,
+  } = args;
   const client = getClient(apiKeyId);
 
   // The user-facing model setting may carry a `[1m]` (or `-1m`) suffix to
@@ -482,12 +504,24 @@ export async function streamMessage(args: StreamArgs): Promise<Anthropic.Message
   // to fight the runtime.
   const requestBody: any = {
     model: bareModel,
-    max_tokens: 16384,
+    // Larger max_tokens for xhigh/high effort: it's a hard cap on TOTAL output
+    // (adaptive thinking + text + tool calls), so the model needs room to
+    // think and act across a turn. Anthropic recommends 64k+ at xhigh; we use
+    // 32k as a balance (well under Fable 5's 128k max output). 
+    max_tokens: 32000,
     system,
     tools,
     messages,
     context_management: contextManagement,
   };
+  // Effort (output_config.effort) controls token spend on supported models
+  // (Fable 5, Mythos 5, Opus 4.5-4.8, Sonnet 4.6). Send it when set; an empty
+  // string omits it (for models that don't accept output_config). Sending an
+  // unsupported value would 400, but the default model supports it and users
+  // changing models can clear the effort setting.
+  if (effort) {
+    requestBody.output_config = { effort };
+  }
   const stream = client.messages.stream(requestBody, {
     signal,
     headers: { 'anthropic-beta': betas.join(',') },

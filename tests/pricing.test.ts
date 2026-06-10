@@ -194,3 +194,32 @@ describe('computeCostMicros', () => {
     expect(cost).toBe(5);
   });
 });
+
+describe('Claude Fable 5 pricing + default', () => {
+  it('prices claude-fable-5 at $10 input / $50 output with standard cache multipliers', () => {
+    const p = getPricing('claude-fable-5');
+    expect(p.inputUsdPerMillion).toBe(10 * 1_000_000);
+    expect(p.outputUsdPerMillion).toBe(50 * 1_000_000);
+    // cache read 0.1x ($1), 5m write 1.25x ($12.50), 1h write 2x ($20)
+    expect(p.cacheReadUsdPerMillion).toBe(1 * 1_000_000);
+    expect(p.cacheWrite5mUsdPerMillion).toBe(12.5 * 1_000_000);
+    expect(p.cacheWrite1hUsdPerMillion).toBe(20 * 1_000_000);
+  });
+
+  it('prices claude-fable-5[1m] the same (strips the context tag)', () => {
+    const a = getPricing('claude-fable-5');
+    const b = getPricing('claude-fable-5[1m]');
+    expect(b).toEqual(a);
+  });
+
+  it('does NOT fall back to the $5/$25 opus default for fable (explicit entry required)', () => {
+    const p = getPricing('claude-fable-5');
+    expect(p.inputUsdPerMillion).not.toBe(5 * 1_000_000);
+  });
+
+  it('DEFAULT_MODEL is claude-fable-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
+    const { DEFAULT_MODEL, DEFAULT_EFFORT } = await import('../electron/anthropic');
+    expect(DEFAULT_MODEL).toBe('claude-fable-5[1m]');
+    expect(DEFAULT_EFFORT).toBe('xhigh');
+  });
+});
