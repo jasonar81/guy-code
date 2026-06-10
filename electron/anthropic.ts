@@ -78,6 +78,13 @@ void getApiKey;
 // turn quickly hits the limit and forces aggressive compaction).
 export const DEFAULT_MODEL = 'claude-fable-5[1m]';
 
+// When Fable 5 (the heavily-safeguarded public Mythos-class model) returns
+// stop_reason 'refusal' (an empty response from its safety classifier) on a
+// turn, we transparently retry that turn on this fallback model, which has a
+// lighter refusal posture for legitimate coding work. The fallback is marked
+// visibly so the user knows it happened.
+export const REFUSAL_FALLBACK_MODEL = 'claude-opus-4-8[1m]';
+
 // The default `effort` level for the model. Fable 5 (and Opus 4.7/4.8) take an
 // `effort` parameter (sent as output_config.effort) that trades thoroughness
 // for token efficiency. xhigh is Anthropic's recommended starting point for

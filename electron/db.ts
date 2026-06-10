@@ -426,10 +426,12 @@ export function db(): DbWrapper {
 
 function migrateSettings() {
   // Switch the default model to Claude Fable 5 (1M context). Released
-  // 2026-06-09; it's the new recommended default for agentic work. We
-  // intentionally OVERWRITE any existing `model` setting once so everyone
-  // moves to it; users can change it back in Settings afterward (the marker
-  // below stops us from re-overwriting their choice on later launches).
+  // 2026-06-09; the recommended default. We intentionally OVERWRITE any
+  // existing `model` setting once so everyone moves to it; users can change it
+  // back in Settings afterward (the marker stops re-overwriting). Fable 5's
+  // stricter safeguards occasionally refuse a turn; the agent transparently
+  // retries those on Opus 4.8 (see REFUSAL_FALLBACK_MODEL), so the default is
+  // safe.
   if (!getSetting('migrated.fable5_default')) {
     setSetting('model', 'claude-fable-5[1m]');
     setSetting('migrated.fable5_default', '1');

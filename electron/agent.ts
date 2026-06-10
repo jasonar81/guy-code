@@ -13,6 +13,7 @@ import {
   withConversationCacheBreakpoint,
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
+  REFUSAL_FALLBACK_MODEL,
 } from './anthropic';
 import {
   appendJsonlEvent,
@@ -1508,6 +1509,97 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       );
 
       stopReason = response.stop_reason;
+
+      // ---- Refusal fallback ----
+      // Fable 5 (the heavily-safeguarded public Mythos-class model) can end a
+      // turn with stop_reason 'refusal' and EMPTY content - its safety
+      // classifier declined to generate on this particular content. It's
+      // content-dependent (most turns are fine). Rather than leave a silent
+      // blank "needs you" turn, transparently RETRY the same request on a
+      // fallback model (Opus 4.8) with a lighter refusal posture, and mark the
+      // fallback visibly so the user knows it happened.
+      //
+      // 'refusal' is a real runtime stop_reason but isn't in our pinned SDK's
+      // union type yet, so compare as a string.
+      const isRefusal = (response.stop_reason as string) === 'refusal';
+      const hasAnyContent = Array.isArray(response.content)
+        ? response.content.some(
+            (b: any) =>
+              (b.type === 'text' && (b.text || '').trim()) || b.type === 'tool_use'
+          )
+        : false;
+      if ((isRefusal || !hasAnyContent) && model !== REFUSAL_FALLBACK_MODEL) {
+        const note =
+          `_(Claude Fable 5 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
+          `retrying on Claude Opus 4.8.)_\n\n`;
+        onEv({ type: 'text_delta', sessionId, text: note });
+        log.warn(
+          `[agent] ${isRefusal ? 'refusal' : 'empty'} from ${model} sessionId=${sessionId} - falling back to ${REFUSAL_FALLBACK_MODEL}`
+        );
+        try {
+          const fallbackResponse = await streamMessage({
+            model: REFUSAL_FALLBACK_MODEL,
+            effort,
+            system: refreshedSystemBlocks,
+            tools,
+            messages: messagesToSend,
+            signal: ctrl.signal,
+            apiKeyId: resolvedApiKeyId,
+            onEvent: (sev) => {
+              // Stream the fallback's events through the same handler the main
+              // request used (text/tool deltas reach the UI live).
+              if (sev.type === 'content_block_delta') {
+                if (sev.delta.type === 'text_delta') {
+                  pendingText += sev.delta.text;
+                  onEv({ type: 'text_delta', sessionId, text: sev.delta.text });
+                } else if (sev.delta.type === 'input_json_delta') {
+                  const p = partials.get(sev.index);
+                  if (p) {
+                    p.input += sev.delta.partial_json;
+                    onEv({ type: 'tool_use_input_delta', sessionId, id: p.id, partial: sev.delta.partial_json });
+                  }
+                }
+              } else if (sev.type === 'content_block_start') {
+                const block = sev.content_block;
+                if (block.type === 'tool_use') {
+                  partials.set(sev.index, { id: block.id, name: block.name, input: '' });
+                  onEv({ type: 'tool_use_start', sessionId, id: block.id, name: block.name });
+                }
+              } else if (sev.type === 'content_block_stop') {
+                const p = partials.get(sev.index);
+                if (p) {
+                  let parsed: unknown = {};
+                  try {
+                    parsed = p.input ? JSON.parse(p.input) : {};
+                  } catch {
+                    parsed = {};
+                  }
+                  onEv({ type: 'tool_use_done', sessionId, id: p.id, name: p.name, input: parsed });
+                }
+              }
+            },
+          });
+          // Prepend the visible fallback note to the fallback's content so it
+          // persists too, and adopt the fallback response for the rest of the
+          // round (tool dispatch, persistence, cost accounting).
+          (fallbackResponse.content as any) = [
+            { type: 'text', text: note },
+            ...(Array.isArray(fallbackResponse.content) ? fallbackResponse.content : []),
+          ];
+          response = fallbackResponse;
+          stopReason = fallbackResponse.stop_reason;
+        } catch (fallbackErr) {
+          log.error(`[agent] refusal fallback also failed: ${(fallbackErr as Error).message}`);
+          const failText =
+            'Claude Fable 5 declined this turn and the automatic retry on Claude Opus 4.8 also failed. ' +
+            'Try rephrasing, or switch the model in Settings.';
+          (response.content as any) = [
+            ...(Array.isArray(response.content) ? response.content : []),
+            { type: 'text', text: failText },
+          ];
+          onEv({ type: 'text_delta', sessionId, text: failText });
+        }
+      }
 
       // Strip any thinking / redacted_thinking blocks from the model's
       // content BEFORE we persist it or push it back into the running

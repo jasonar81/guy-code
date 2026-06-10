@@ -203,7 +203,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <Field
             icon={<Cpu size={14} />}
             label="Model"
-            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-fable-5[1m]) - strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless. Default is Claude Fable 5 at xhigh effort."
+            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-fable-5[1m]) - strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless. Default is Claude Fable 5 at xhigh effort; on the rare turn Fable 5 refuses, the agent retries it on Opus 4.8 automatically."
           >
             <input
               type="text"
