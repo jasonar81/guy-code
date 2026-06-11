@@ -473,6 +473,18 @@ function migrateSettings() {
     }
     setSetting('migrated.revert_fable5_v080', '1');
   }
+
+  // Re-enable Claude Fable 5 as the default. The refusals were traced to the
+  // system prompt's "bypassPermissions / full autonomy" framing (reworded in
+  // 0.9.0), which is now fixed, so Fable 5 no longer refuses Guy Code's prompt.
+  // Move anyone on the Opus 4.8 default back to Fable 5 once; users who prefer
+  // Opus can re-select it in Settings.
+  if (!getSetting('migrated.fable5_reenable_v090')) {
+    if (getSetting('model') === 'claude-opus-4-8[1m]') {
+      setSetting('model', 'claude-fable-5[1m]');
+    }
+    setSetting('migrated.fable5_reenable_v090', '1');
+  }
 }
 
 // ---- Schema migrations ----

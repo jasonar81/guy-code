@@ -452,6 +452,22 @@ export function Composer({ sessionId, visible }: Props) {
     });
   };
 
+  // Whether the composer should NOT grab focus right now: another text input
+  // owns focus (rename box, settings field), or a menu/dialog is open. Used by
+  // the auto-focus effects so they never steal focus from where the user is
+  // actually typing or interacting.
+  const shouldSkipAutoFocus = (): boolean => {
+    const ae = document.activeElement as HTMLElement | null;
+    if (ae && ae !== taRef.current) {
+      const tag = ae.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable === true) return true;
+      // Focus is inside an open menu / dialog (e.g. the session-rename popover
+      // or settings modal) - don't yank it back to the composer.
+      if (ae.closest('[role="menu"], [role="dialog"], [data-context-menu]')) return true;
+    }
+    return false;
+  };
+
   // Auto-grow textarea
   useEffect(() => {
     const ta = taRef.current;
@@ -470,29 +486,21 @@ export function Composer({ sessionId, visible }: Props) {
   // Defers one frame so the `hidden` attribute has actually been
   // removed (a hidden textarea can't take focus reliably across
   // browsers).
+  const prevSessionRef = useRef<string | null>(null);
   useEffect(() => {
     if (!visible) return;
-    // Skip focus stealing if the user is currently typing somewhere
-    // else (e.g. a settings modal opened on top of us). Checking
-    // activeElement is a body or HTML element means nothing else
-    // currently owns focus, so taking it is safe.
+    // Only auto-focus the composer on an ACTUAL session change (or first
+    // mount of this pane), NOT on every re-render while the same session is
+    // visible. Stealing focus on unrelated re-renders is what broke typing in
+    // the session-rename box and the intermittent compose-box focus loss: an
+    // unrelated re-render would yank focus away from whatever input the user
+    // was actually in.
+    const changed = prevSessionRef.current !== sessionId;
+    prevSessionRef.current = sessionId;
+    if (!changed) return;
     const id = requestAnimationFrame(() => {
-      const ae = document.activeElement as HTMLElement | null;
-      // Block focus theft only when something that genuinely accepts
-      // typed input owns focus — input/textarea/contentEditable in a
-      // settings modal or similar. Buttons (incl. the "New session"
-      // button the user just clicked) and links don't accept text, so
-      // grabbing focus from them is exactly what the user expects.
-      const tag = ae?.tagName;
-      const isTextHost =
-        ae != null &&
-        (tag === 'INPUT' ||
-          tag === 'TEXTAREA' ||
-          ae.isContentEditable === true) &&
-        ae !== taRef.current;
-      if (!isTextHost) {
-        taRef.current?.focus({ preventScroll: true });
-      }
+      if (shouldSkipAutoFocus()) return;
+      taRef.current?.focus({ preventScroll: true });
     });
     return () => cancelAnimationFrame(id);
   }, [visible, sessionId]);
@@ -504,14 +512,13 @@ export function Composer({ sessionId, visible }: Props) {
   // restoring it. Skips if the user is typing in another text host.
   useEffect(() => {
     if (!visible || streaming || archived) return;
-    const ae = document.activeElement as HTMLElement | null;
-    const tag = ae?.tagName;
-    const isTextHost =
-      ae != null &&
-      (tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable === true) &&
-      ae !== taRef.current;
-    if (isTextHost) return;
-    const id = requestAnimationFrame(() => taRef.current?.focus({ preventScroll: true }));
+    if (shouldSkipAutoFocus()) return;
+    const id = requestAnimationFrame(() => {
+      // Re-check inside the frame: focus may have moved (into a rename box,
+      // a menu, a modal) between scheduling and running.
+      if (shouldSkipAutoFocus()) return;
+      taRef.current?.focus({ preventScroll: true });
+    });
     return () => cancelAnimationFrame(id);
   }, [streaming, visible, archived]);
 
