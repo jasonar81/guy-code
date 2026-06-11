@@ -90,6 +90,14 @@ import {
   estimateTokens,
 } from './compaction';
 
+// Sessions where the selected model (Fable 5) refused a turn. Once a session
+// has refused, we stop calling that model for the rest of the session and use
+// the refusal-fallback model directly - avoiding a wasted call + a refusal
+// notice on every single turn. _sessionRefusedNotified tracks which sessions
+// have already shown the one-time "switched to Opus" notice.
+const _sessionRefused = new Set<string>();
+const _sessionRefusedNotified = new Set<string>();
+
 export type AgentEvent =
   | { type: 'turn_start'; sessionId: string; userText: string }
   | { type: 'text_delta'; sessionId: string; text: string }
@@ -1083,6 +1091,25 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         log.warn(`[agent] routing failed, keeping strong model: ${(e as Error).message}`);
       }
     }
+    // If the selected model (Fable 5) already refused in this session, stop
+    // calling it - use the fallback model directly so we don't waste a call and
+    // show a refusal notice every turn. Tell the user about the switch once.
+    if (
+      _sessionRefused.has(sessionId) &&
+      model !== REFUSAL_FALLBACK_MODEL &&
+      /fable|mythos/i.test(model)
+    ) {
+      model = REFUSAL_FALLBACK_MODEL;
+      if (!_sessionRefusedNotified.has(sessionId)) {
+        _sessionRefusedNotified.add(sessionId);
+        onEv({
+          type: 'text_delta',
+          sessionId,
+          text: '_(Claude Fable 5 kept refusing in this session; using Claude Opus 4.8 for the rest of it. Switch models in Settings.)_\n\n',
+        });
+      }
+      log.info(`[agent] session ${sessionId} had a Fable refusal; using ${REFUSAL_FALLBACK_MODEL} directly`);
+    }
     // Skills loaded from ~/.guycode/skills, <cwd>/.guycode/skills, and
     // imported from ~/.claude/skills + <cwd>/.claude/skills. The
     // resulting block enumerates name + description so the model can
@@ -1581,6 +1608,10 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           )
         : false;
       if ((isRefusal || !hasAnyContent) && model !== REFUSAL_FALLBACK_MODEL) {
+        // Remember that this session's model refused, so subsequent turns use
+        // the fallback model directly instead of wasting a call + showing this
+        // notice every turn.
+        _sessionRefused.add(sessionId);
         const note =
           `_(Claude Fable 5 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
           `retrying on Claude Opus 4.8.)_\n\n`;

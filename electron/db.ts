@@ -461,6 +461,18 @@ function migrateSettings() {
     }
     setSetting('migrated.fable5_reenable', '1');
   }
+
+  // Revert Fable-5-default users back to Opus 4.8. Fable 5 still refuses too
+  // many turns on real systems/benchmark work (its classifier reads the whole
+  // conversation, which retrieval cannot filter), so Opus 4.8 is the reliable
+  // default. Fable 5 stays selectable, with per-session auto-disable on
+  // refusal. Runs once; users can re-select Fable 5 in Settings.
+  if (!getSetting('migrated.revert_fable5_v080')) {
+    if (getSetting('model') === 'claude-fable-5[1m]') {
+      setSetting('model', 'claude-opus-4-8[1m]');
+    }
+    setSetting('migrated.revert_fable5_v080', '1');
+  }
 }
 
 // ---- Schema migrations ----
