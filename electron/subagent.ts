@@ -40,6 +40,7 @@ import log from 'electron-log';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { getClient, DEFAULT_MODEL, DEFAULT_EFFORT, parseExtendedContext } from './anthropic';
+import { stripThinkingBlocks } from './sessionRuntime';
 import { TOOLS, executeTool, type ToolContext } from './tools';
 import { maybeSummarize } from './toolSummarizer';
 import { getMcpToolSchemas } from './mcp';
@@ -519,7 +520,16 @@ export async function runSubagent(
     });
 
     // ----- Append assistant + tool dispatch ------------------------------
-    messages.push({ role: 'assistant', content: response.content });
+    // Strip thinking / redacted_thinking blocks before replaying the assistant
+    // turn. Models with always-on adaptive thinking (e.g. Claude Fable 5)
+    // return a thinking block, and the API rejects a replayed thinking block
+    // that lacks a valid signature ("each thinking block must contain
+    // thinking"). The main agent loop already strips these; the subagent loop
+    // must too, or every multi-round subagent task 400s on round 1.
+    messages.push({
+      role: 'assistant',
+      content: stripThinkingBlocks(response.content) as Anthropic.ContentBlock[],
+    });
 
     // Remember this round's text (the child often narrates progress alongside
     // its tool calls). If we hit the cap, this is the partial work we return.
