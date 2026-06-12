@@ -44,6 +44,7 @@ import {
   listWaitingOnSystemSessions,
   upsertSession,
   getSetting,
+  setSetting,
 } from './db';
 import { getDefaultApiKeyId } from './secret';
 import { computeCostMicros } from './pricing';
@@ -89,14 +90,6 @@ import {
   isPromptTooLongError,
   estimateTokens,
 } from './compaction';
-
-// Sessions where the selected model (Fable 5) refused a turn. Once a session
-// has refused, we stop calling that model for the rest of the session and use
-// the refusal-fallback model directly - avoiding a wasted call + a refusal
-// notice on every single turn. _sessionRefusedNotified tracks which sessions
-// have already shown the one-time "switched to Opus" notice.
-const _sessionRefused = new Set<string>();
-const _sessionRefusedNotified = new Set<string>();
 
 export type AgentEvent =
   | { type: 'turn_start'; sessionId: string; userText: string }
@@ -1095,13 +1088,13 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // calling it - use the fallback model directly so we don't waste a call and
     // show a refusal notice every turn. Tell the user about the switch once.
     if (
-      _sessionRefused.has(sessionId) &&
+      getSetting(`session_refused_${sessionId}`) === '1' &&
       model !== REFUSAL_FALLBACK_MODEL &&
       /fable|mythos/i.test(model)
     ) {
       model = REFUSAL_FALLBACK_MODEL;
-      if (!_sessionRefusedNotified.has(sessionId)) {
-        _sessionRefusedNotified.add(sessionId);
+      if (getSetting(`session_refused_notified_${sessionId}`) !== '1') {
+        setSetting(`session_refused_notified_${sessionId}`, '1');
         onEv({
           type: 'text_delta',
           sessionId,
@@ -1610,8 +1603,10 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       if ((isRefusal || !hasAnyContent) && model !== REFUSAL_FALLBACK_MODEL) {
         // Remember that this session's model refused, so subsequent turns use
         // the fallback model directly instead of wasting a call + showing this
-        // notice every turn.
-        _sessionRefused.add(sessionId);
+        // notice every turn. Persisted in the DB (single source of truth that
+        // survives restarts and avoids any module-instance ambiguity that a
+        // module-level Set could have).
+        setSetting(`session_refused_${sessionId}`, '1');
         const note =
           `_(Claude Fable 5 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
           `retrying on Claude Opus 4.8.)_\n\n`;

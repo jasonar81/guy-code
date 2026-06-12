@@ -17,6 +17,13 @@ npm run dev
 The first launch will scan `~/.claude/projects/` and backfill cost data into
 `%USERPROFILE%\.guycode\guycode.db`. Subsequent launches incrementally update.
 
+## Phase status
+
+- **Phase 1** (in progress): scaffold + project import + cost pills + fast switch
+- **Phase 2**: Anthropic API + tool loop
+- **Phase 3**: state machine + watchers + budget governor
+- **Phase 4**: memory + audit trail
+- **Phase 5**: Monaco + xterm + MCP + computer-use
 
 ## Layout
 
