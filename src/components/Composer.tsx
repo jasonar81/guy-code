@@ -128,6 +128,61 @@ function pickImageMediaType(mime: string, ext: string): ImageMediaType | null {
   return null;
 }
 
+// The Anthropic API rejects images larger than 2000px in either dimension on
+// many-image requests (and a single oversized image wedges the whole session,
+// because it then rides along on every subsequent turn). So we proactively
+// downscale any image whose longest side exceeds this, at attach time, so the
+// stored + sent image is always within limits. We target a bit under 2000 to
+// leave headroom.
+const MAX_IMAGE_DIMENSION = 1900;
+
+/**
+ * If the image exceeds MAX_IMAGE_DIMENSION on its longest side, re-render it
+ * smaller via a canvas and return the new bytes + media type. Otherwise returns
+ * the original bytes unchanged. Falls back to the original on any failure (we
+ * never want resizing to block an attachment).
+ */
+async function downscaleImageIfNeeded(
+  buf: ArrayBuffer,
+  mediaType: ImageMediaType
+): Promise<{ bytes: ArrayBuffer; mediaType: ImageMediaType }> {
+  // GIFs can be animated; a canvas re-render would flatten them. Skip resizing
+  // and let the (rare) oversized GIF be handled by the byte-size cap instead.
+  if (mediaType === 'image/gif') return { bytes: buf, mediaType };
+  try {
+    const blob = new Blob([buf], { type: mediaType });
+    const bitmap = await createImageBitmap(blob);
+    const { width, height } = bitmap;
+    if (width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION) {
+      bitmap.close();
+      return { bytes: buf, mediaType };
+    }
+    const scale = MAX_IMAGE_DIMENSION / Math.max(width, height);
+    const w = Math.max(1, Math.round(width * scale));
+    const h = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      bitmap.close();
+      return { bytes: buf, mediaType };
+    }
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    // Re-encode as PNG (lossless, universally accepted). webp/png stay png;
+    // jpeg stays jpeg to keep it small.
+    const outType: ImageMediaType = mediaType === 'image/jpeg' ? 'image/jpeg' : 'image/png';
+    const outBlob: Blob | null = await new Promise((resolve) =>
+      canvas.toBlob((b) => resolve(b), outType, outType === 'image/jpeg' ? 0.9 : undefined)
+    );
+    if (!outBlob) return { bytes: buf, mediaType };
+    return { bytes: await outBlob.arrayBuffer(), mediaType: outType };
+  } catch {
+    return { bytes: buf, mediaType };
+  }
+}
+
 async function fileToAttachment(file: File): Promise<Attachment | { error: string }> {
   const ext = extOf(file.name);
   const mime = file.type || '';
@@ -140,13 +195,16 @@ async function fileToAttachment(file: File): Promise<Attachment | { error: strin
     }
     const mediaType = pickImageMediaType(mime, ext);
     if (!mediaType) return { error: `Unsupported image format: ${mime || ext}` };
-    const buf = await file.arrayBuffer();
+    const rawBuf = await file.arrayBuffer();
+    // Downscale if the image exceeds the API's per-dimension limit, so an
+    // oversized paste/drop can never wedge the session.
+    const { bytes, mediaType: outMedia } = await downscaleImageIfNeeded(rawBuf, mediaType);
     return {
       kind: 'image',
       name: file.name || 'image',
-      mediaType,
-      dataBase64: bytesToBase64(buf),
-      sizeBytes,
+      mediaType: outMedia,
+      dataBase64: bytesToBase64(bytes),
+      sizeBytes: bytes.byteLength,
     };
   }
 

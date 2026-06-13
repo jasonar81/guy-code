@@ -169,6 +169,67 @@ function readAllUtf8(path: string): string {
  *
  * The transformation is idempotent and never removes plain text content.
  */
+/** The API's per-dimension image cap for many-image requests. */
+const MAX_IMAGE_DIMENSION_PX = 2000;
+
+/**
+ * Read an image's pixel dimensions from its header bytes (no decode / no
+ * library) and report whether either side exceeds the limit. Supports PNG,
+ * GIF, and JPEG. Unknown formats return false (we don't block what we can't
+ * measure). Base64 is only partially decoded (headers are tiny).
+ */
+function imageExceedsLimit(mediaType: string | undefined, dataB64: string): boolean {
+  try {
+    // The dimensions live in the first ~few hundred bytes for these formats;
+    // decode a small prefix only.
+    const head = Buffer.from(dataB64.slice(0, 4096), 'base64');
+    if (head.length < 12) return false;
+    const hex8 = head.slice(0, 8).toString('hex');
+    // PNG: 8-byte sig, then IHDR length(4)+type(4)+width(4)+height(4).
+    if (hex8 === '89504e470d0a1a0a') {
+      const w = head.readUInt32BE(16);
+      const h = head.readUInt32BE(20);
+      return w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX;
+    }
+    // GIF: "GIF87a"/"GIF89a", then width(2 LE) + height(2 LE).
+    if (head.slice(0, 3).toString('ascii') === 'GIF') {
+      const w = head.readUInt16LE(6);
+      const h = head.readUInt16LE(8);
+      return w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX;
+    }
+    // JPEG: scan SOFn markers for dimensions (need more bytes; decode more).
+    if (head[0] === 0xff && head[1] === 0xd8) {
+      const buf = Buffer.from(dataB64, 'base64');
+      let i = 2;
+      while (i < buf.length - 9) {
+        if (buf[i] !== 0xff) {
+          i++;
+          continue;
+        }
+        const marker = buf[i + 1];
+        // SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15 carry dimensions.
+        if (
+          (marker >= 0xc0 && marker <= 0xc3) ||
+          (marker >= 0xc5 && marker <= 0xc7) ||
+          (marker >= 0xc9 && marker <= 0xcb) ||
+          (marker >= 0xcd && marker <= 0xcf)
+        ) {
+          const h = buf.readUInt16BE(i + 5);
+          const w = buf.readUInt16BE(i + 7);
+          return w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX;
+        }
+        const segLen = buf.readUInt16BE(i + 2);
+        i += 2 + segLen;
+      }
+      return false;
+    }
+    void mediaType;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function sanitizeMessages(
   messages: Anthropic.MessageParam[],
   knownToolNames?: Set<string>
@@ -223,6 +284,48 @@ export function sanitizeMessages(
       });
       log.warn('[sessionRuntime] stripped thinking/redacted_thinking block(s) from outbound history');
       if (messages.length === 0) return messages;
+    }
+  }
+
+  // -- Pass -0.5: neutralize images that exceed the API's per-dimension limit -
+  // The API rejects images larger than 2000px in either dimension on
+  // many-image requests:
+  //
+  //   400 invalid_request_error
+  //   "messages.66.content.1.image.source.base64.data: At least one of the
+  //    image dimensions exceed max allowed size for many-image requests:
+  //    2000 pixels"
+  //
+  // and because the offending image lives in the history, EVERY subsequent
+  // turn re-sends it and fails - wedging the session. The composer downscales
+  // images at attach time, but this is the last-line defense for anything that
+  // slipped through (imports, older sessions, a future code path). We can't
+  // re-encode here without an image library, so we drop the oversized image
+  // and leave a short text marker in its place.
+  {
+    let droppedAny = false;
+    messages = messages.map((m) => {
+      if (typeof m.content === 'string' || !Array.isArray(m.content)) return m;
+      let touched = false;
+      const out: any[] = [];
+      for (const b of m.content as any[]) {
+        if (
+          b?.type === 'image' &&
+          b.source?.type === 'base64' &&
+          typeof b.source.data === 'string' &&
+          imageExceedsLimit(b.source.media_type, b.source.data)
+        ) {
+          touched = true;
+          droppedAny = true;
+          out.push({ type: 'text', text: '[image removed: exceeded the 2000px size limit]' });
+        } else {
+          out.push(b);
+        }
+      }
+      return touched ? { ...m, content: out as any } : m;
+    });
+    if (droppedAny) {
+      log.warn('[sessionRuntime] dropped oversized image(s) (>2000px) from outbound history');
     }
   }
 
