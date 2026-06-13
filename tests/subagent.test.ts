@@ -329,6 +329,22 @@ describe('runSubagent', () => {
     expect(_toolCalls).toHaveLength(0);
   });
 
+  it('runs on the PARENT model when one is provided (not DEFAULT_MODEL)', async () => {
+    _responses.push({ content: [{ type: 'text', text: 'done' }] });
+    await runSubagent(
+      { ...PARENT, model: 'claude-sonnet-4-6' },
+      { role: 'general', description: 't', prompt: 'p' }
+    );
+    // parseExtendedContext strips [1m]; the bare model is what's sent.
+    expect(_lastStreamArgs.model).toBe('claude-sonnet-4-6');
+  });
+
+  it('falls back to DEFAULT_MODEL only when the parent has no model', async () => {
+    _responses.push({ content: [{ type: 'text', text: 'done' }] });
+    await runSubagent(PARENT, { role: 'general', description: 't', prompt: 'p' });
+    expect(_lastStreamArgs.model).toBe('claude-opus-4-7');
+  });
+
   it('dispatches tool_use blocks then continues to end_turn', async () => {
     _responses.push({
       content: [

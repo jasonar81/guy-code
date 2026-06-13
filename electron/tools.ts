@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import type Anthropic from '@anthropic-ai/sdk';
 import log from 'electron-log';
-import { setSessionState, setSessionWakeAt } from './db';
+import { setSessionState, setSessionWakeAt, getSetting } from './db';
 import {
   listClaudeSkills,
   recallFromDisk,
@@ -2547,6 +2547,10 @@ const TASK: ToolDef = {
         signal: ctx.signal,
         memory: ctx.memory,
         emit: broadcast as (e: unknown) => void,
+        // Run the subagent on the SESSION's configured model, not the
+        // compile-time DEFAULT_MODEL. Without this the child always fell back
+        // to DEFAULT_MODEL regardless of the user's model setting.
+        model: (getSetting('model') as string) || undefined,
       },
       {
         role,
@@ -2594,6 +2598,10 @@ const PLAN: ToolDef = {
         signal: ctx.signal,
         memory: ctx.memory,
         emit: broadcast as (e: unknown) => void,
+        // Run the subagent on the SESSION's configured model, not the
+        // compile-time DEFAULT_MODEL. Without this the child always fell back
+        // to DEFAULT_MODEL regardless of the user's model setting.
+        model: (getSetting('model') as string) || undefined,
       },
       {
         role: 'plan',
@@ -2641,6 +2649,10 @@ const EXECUTE: ToolDef = {
         signal: ctx.signal,
         memory: ctx.memory,
         emit: broadcast as (e: unknown) => void,
+        // Run the subagent on the SESSION's configured model, not the
+        // compile-time DEFAULT_MODEL. Without this the child always fell back
+        // to DEFAULT_MODEL regardless of the user's model setting.
+        model: (getSetting('model') as string) || undefined,
       },
       {
         role: 'execute',
@@ -2688,6 +2700,10 @@ const REVIEW: ToolDef = {
         signal: ctx.signal,
         memory: ctx.memory,
         emit: broadcast as (e: unknown) => void,
+        // Run the subagent on the SESSION's configured model, not the
+        // compile-time DEFAULT_MODEL. Without this the child always fell back
+        // to DEFAULT_MODEL regardless of the user's model setting.
+        model: (getSetting('model') as string) || undefined,
       },
       {
         role: 'review',
