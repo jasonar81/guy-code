@@ -1868,8 +1868,42 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
             continue;
           }
         }
-        // No more tools — turn is done. We deliberately go to
-        // `waiting-on-user` here (NOT idle) so the session keeps
+        // No more tools — turn is done. BUT first check whether the user
+        // typed a follow-up while this turn was running: if there are queued
+        // interrupts, we must NOT drop into "needs you" with their message
+        // sitting unread. Pick the queued message(s) up as a new user turn and
+        // continue the loop, so the next streamMessage answers them. (Without
+        // this, a session ends in "needs you" with the user's already-typed
+        // message stranded, forcing them to type AGAIN to make it pick up.)
+        if (peekInterrupts(sessionId) > 0) {
+          const queued = drainInterrupts(sessionId);
+          const noteText =
+            queued.length === 1
+              ? queued[0]
+              : queued.map((t, i) => `(${i + 1}) ${t}`).join('\n\n');
+          for (const t of queued) {
+            onEv({ type: 'interrupt_picked_up', sessionId, text: t });
+          }
+          const queuedUserMsg: Anthropic.MessageParam = {
+            role: 'user',
+            content: noteText,
+          };
+          messages.push(queuedUserMsg);
+          appendJsonlEvent(ourPath, {
+            type: 'user',
+            uuid: randomUUID(),
+            sessionId,
+            cwd,
+            message: { role: 'user', content: noteText },
+          });
+          log.info(
+            `[agent] turn-end picked up ${queued.length} queued message(s) for ${sessionId}; continuing`
+          );
+          continue;
+        }
+
+        // No queued input either — the turn is genuinely done. We deliberately
+        // go to `waiting-on-user` here (NOT idle) so the session keeps
         // surfacing in the user's "needs you" group. Policy: only the
         // user transitions a session to idle, by explicitly archiving
         // it from the UI. This prevents the failure mode where the
