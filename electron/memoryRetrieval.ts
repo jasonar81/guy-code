@@ -1,79 +1,89 @@
-// Memory relevance retrieval.
+// Memory relevance retrieval (v2).
 //
-// Instead of dumping the ENTIRE memory tree (~64K tokens) into every prompt's
-// system block - which is costly, dilutes attention, and (with Claude Fable 5)
-// triggers safety refusals when security/systems-code notes are present - we:
-//   1. ALWAYS load the small pinned core (a handful of truly-universal rules).
-//   2. For everything else, ask a CHEAP model (Haiku) which notes are relevant
-//      to the current user message, and load ONLY those.
+// v1 gated EVERYTHING non-pinned through a per-message relevance check, which
+// made the agent forgetful: your live task-state notes ("what I've done / what
+// I'm doing", which are `normal` tier, not pinned) got dropped whenever the
+// current message didn't happen to mention them - and a terse message like
+// "continue" matched nothing. The gate also re-ran every turn nondeterministi-
+// cally, so notes flickered in and out.
 //
-// This keeps the per-turn system prompt small + on-topic, cuts cost, and means
-// e.g. security notes only load when the task is actually about security.
+// v2 fixes that with four changes:
+//   1. ALWAYS-LOAD recent/active state. The N most-recently-modified `normal`
+//      leaves (your live task state) load every turn regardless of the gate.
+//   2. GATE ONLY THE TAIL. Older `normal` leaves + `archived` leaves are the
+//      only gate candidates, so trimming the bloat never costs you recent work.
+//   3. GATE ON CONTEXT. The gate sees recent conversation + the active plan,
+//      not just the new message, so terse follow-ups still retrieve the right
+//      notes.
+//   4. STICKY SELECTION. Once a tail leaf is selected in a session it stays
+//      selected for the rest of the session (persisted per session), so notes
+//      don't flicker in and out turn to turn.
 //
-// Graceful degradation: any failure in the gate (parse error, timeout, no key)
-// falls back to a recency-bounded subset, so retrieval never breaks a turn.
+// The pinned core always loads (unchanged). Graceful degradation: any gate
+// failure just means the tail isn't added that turn; recent/active state is
+// always present, so a failure can never make the agent forgetful.
 
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import log from 'electron-log';
 import {
   listGuyMemory,
   listClaudeMemory,
-  getEffectiveTier,
   readExplicitTier,
   parseMdFrontmatter,
 } from './memory';
 import { getClient } from './anthropic';
+import { getSetting, setSetting } from './db';
 
 /** Cheap model used for the relevance gate. */
 const GATE_MODEL = 'claude-haiku-4-5';
 
-/** Caps for the retrieved (non-pinned) memory block. */
-const RETRIEVED_TOTAL_CAP = 48 * 1024; // ~12K tokens of selected memory
-const PER_LEAF_CAP = 16 * 1024;
-/** Below this many candidates, skip the gate and just include them all. */
+/** Always load this many most-recently-modified normal leaves (task state). */
+const ALWAYS_RECENT_NORMAL = 12;
+/** Total byte budget for the always-loaded recent normal leaves. */
+const RECENT_TOTAL_CAP = 96 * 1024;
+/** Total byte budget for the gate-selected tail block. */
+const TAIL_TOTAL_CAP = 48 * 1024;
+const PER_LEAF_CAP = 24 * 1024;
+/** If the tail is this small, skip the gate and just include it all. */
 const GATE_MIN_CANDIDATES = 6;
-/** Fallback: when the gate fails, include the N newest candidates under cap. */
-const FALLBACK_NEWEST = 8;
 
 export interface LeafMeta {
   path: string;
   name: string;
   description: string;
   pinned: boolean;
+  tier: 'pinned' | 'normal' | 'archived';
   bytes: number;
   mtime: number;
 }
 
 /**
- * Enumerate every memory leaf (Guy-owned + read-only Claude imports) with its
- * name/description/tier. Pinned leaves are flagged (they're always loaded, so
- * they're not candidates for the gate).
+ * Enumerate every memory leaf with its name/description/tier/mtime. Pinned
+ * leaves are flagged (always loaded). Claude root CLAUDE.md is treated as
+ * pinned (small + universal); other Claude imports are `normal`.
  */
 export function gatherLeafMeta(args: { cwd: string; projectId?: string }): LeafMeta[] {
   const { cwd } = args;
   const projectId = args.projectId ?? '';
   const out: LeafMeta[] = [];
 
-  // Guy-owned leaves (these carry an explicit tier).
   for (const row of listGuyMemory({ scope: 'all', projectId })) {
     const fm = parseMdFrontmatter(row.path);
-    const pinned = readExplicitTier(row.path) === 'pinned';
+    const explicit = readExplicitTier(row.path);
+    const tier: LeafMeta['tier'] =
+      explicit === 'pinned' ? 'pinned' : explicit === 'archived' ? 'archived' : 'normal';
     out.push({
       path: row.path,
       name: fm.name || basename(row.path).replace(/\.md$/i, ''),
       description: fm.description || firstLine(row.path),
-      pinned,
+      pinned: tier === 'pinned',
+      tier,
       bytes: row.bytes,
       mtime: row.mtime,
     });
   }
 
-  // Read-only Claude imports (can't be re-tiered by us; never pinned by us,
-  // but the loader does always include CLAUDE.md-style ones - we treat them as
-  // gate candidates so security content only loads when relevant). The session
-  // CLAUDE.md (global) is small + universal; keep it always-on by flagging it
-  // pinned here so it isn't gated out.
   for (const c of listClaudeMemory({ cwd, projectId })) {
     const isRootClaudeMd = /(^|[\\/])CLAUDE\.md$/i.test(c.path);
     out.push({
@@ -81,12 +91,12 @@ export function gatherLeafMeta(args: { cwd: string; projectId?: string }): LeafM
       name: c.name || basename(c.path).replace(/\.md$/i, ''),
       description: c.description || firstLine(c.path),
       pinned: isRootClaudeMd,
+      tier: isRootClaudeMd ? 'pinned' : 'normal',
       bytes: c.bytes,
       mtime: c.mtime,
     });
   }
 
-  // De-dup by path (a leaf could be discovered twice).
   const seen = new Set<string>();
   return out.filter((m) => (seen.has(m.path) ? false : (seen.add(m.path), true)));
 }
@@ -98,67 +108,6 @@ function firstLine(path: string): string {
     return (line || '').trim().slice(0, 140);
   } catch {
     return '';
-  }
-}
-
-/**
- * Ask the cheap model which candidate leaves are relevant to the user message.
- * Returns the subset of candidates to load. Never throws - on any failure it
- * falls back to the newest candidates under a byte budget.
- */
-export async function selectRelevant(
-  userMessage: string,
-  candidates: LeafMeta[],
-  apiKeyId?: string | null
-): Promise<{ selected: LeafMeta[]; via: 'gate' | 'all' | 'fallback' }> {
-  if (candidates.length === 0) return { selected: [], via: 'all' };
-  if (candidates.length <= GATE_MIN_CANDIDATES) {
-    return { selected: candidates, via: 'all' };
-  }
-  try {
-    const list = candidates
-      .map((c) => `- ${c.name}: ${truncate(c.description, 200)}`)
-      .join('\n');
-    const client = getClient(apiKeyId);
-    const resp = await client.messages.create({
-      model: GATE_MODEL,
-      max_tokens: 1024,
-      system:
-        'You select which of the user\'s saved notes are relevant to their current message. ' +
-        'Return ONLY a JSON array of the exact `name` values of the relevant notes. ' +
-        'Include a note if there is any reasonable chance it applies; always include safety, ' +
-        'security, workflow, and style/convention rules when the work could touch them. ' +
-        'Return [] if none are relevant. Output nothing but the JSON array.',
-      messages: [
-        {
-          role: 'user',
-          content: `Saved notes (name: description):\n${list}\n\nMy current message:\n${truncate(
-            userMessage,
-            4000
-          )}`,
-        },
-      ],
-    });
-    const text = (resp.content || [])
-      .filter((b: any) => b.type === 'text')
-      .map((b: any) => b.text)
-      .join('');
-    const names = parseNameArray(text);
-    if (names === null) throw new Error('gate returned no parseable JSON array');
-    const wanted = new Set(names.map((n) => n.toLowerCase().trim()));
-    const selected = candidates.filter((c) => wanted.has(c.name.toLowerCase().trim()));
-    return { selected, via: 'gate' };
-  } catch (e) {
-    log.warn(`[memoryRetrieval] relevance gate failed (${(e as Error).message}); using recency fallback`);
-    const byNew = [...candidates].sort((a, b) => b.mtime - a.mtime);
-    const out: LeafMeta[] = [];
-    let total = 0;
-    for (const c of byNew) {
-      if (out.length >= FALLBACK_NEWEST || total + c.bytes > RETRIEVED_TOTAL_CAP) break;
-      out.push(c);
-      total += c.bytes;
-    }
-    return { selected: out, via: 'fallback' };
   }
 }
 
@@ -180,16 +129,62 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) : s;
 }
 
-/** Concatenate selected leaf bodies under the caps. */
-function concatBodies(metas: LeafMeta[]): string {
+/**
+ * Ask the cheap model which TAIL leaves are relevant, given the recent
+ * conversation context (not just the latest message). Returns the matched
+ * leaf names. Never throws.
+ */
+export async function gateTail(
+  contextText: string,
+  tail: LeafMeta[],
+  apiKeyId?: string | null
+): Promise<string[]> {
+  if (tail.length === 0) return [];
+  if (tail.length <= GATE_MIN_CANDIDATES) return tail.map((t) => t.name);
+  try {
+    const list = tail.map((c) => `- ${c.name}: ${truncate(c.description, 200)}`).join('\n');
+    const client = getClient(apiKeyId);
+    const resp = await client.messages.create({
+      model: GATE_MODEL,
+      max_tokens: 1024,
+      system:
+        'You select which of the user\'s older saved notes are relevant to what they are CURRENTLY working on. ' +
+        'You are given recent conversation context (and possibly an active plan) plus a list of note names+descriptions. ' +
+        'Return ONLY a JSON array of the exact `name` values worth loading. Prefer to INCLUDE a note if there is any reasonable chance it applies to the current work (recall matters more than precision here); always include relevant safety, workflow, and convention rules. ' +
+        'Return [] if none apply. Output nothing but the JSON array.',
+      messages: [
+        {
+          role: 'user',
+          content: `Older saved notes (name: description):\n${list}\n\nWhat I'm currently working on:\n${truncate(
+            contextText,
+            8000
+          )}`,
+        },
+      ],
+    });
+    const text = (resp.content || [])
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('');
+    const names = parseNameArray(text);
+    if (names === null) throw new Error('gate returned no parseable JSON array');
+    return names;
+  } catch (e) {
+    log.warn(`[memoryRetrieval] tail gate failed (${(e as Error).message}); tail not added this turn`);
+    return [];
+  }
+}
+
+/** Concatenate leaf bodies under a total + per-leaf cap. */
+function concatBodies(metas: LeafMeta[], totalCap: number): string {
   const parts: string[] = [];
   let total = 0;
   for (const m of metas) {
-    if (total >= RETRIEVED_TOTAL_CAP) break;
+    if (total >= totalCap) break;
     try {
       let body = readFileSync(m.path, 'utf8');
       if (body.length > PER_LEAF_CAP) body = body.slice(0, PER_LEAF_CAP);
-      const remaining = RETRIEVED_TOTAL_CAP - total;
+      const remaining = totalCap - total;
       if (body.length > remaining) body = body.slice(0, remaining);
       parts.push(`<<< ${m.path} >>>\n${body}`);
       total += body.length;
@@ -198,12 +193,6 @@ function concatBodies(metas: LeafMeta[]): string {
     }
   }
   return parts.join('\n\n');
-}
-
-/** Load the pinned-core leaf bodies (always included). */
-function loadPinnedBodies(metas: LeafMeta[]): string {
-  const pinned = metas.filter((m) => m.pinned);
-  return concatBodiesUncapped(pinned);
 }
 
 function concatBodiesUncapped(metas: LeafMeta[]): string {
@@ -218,33 +207,81 @@ function concatBodiesUncapped(metas: LeafMeta[]): string {
   return parts.join('\n\n');
 }
 
+// ---- Sticky per-session selection (persisted in settings) -----------------
+function stickyKey(sessionId: string): string {
+  return `mem_retrieval_sticky_${sessionId}`;
+}
+function loadSticky(sessionId: string): Set<string> {
+  try {
+    const raw = getSetting(stickyKey(sessionId));
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? new Set(arr.filter((x) => typeof x === 'string')) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+function saveSticky(sessionId: string, names: Set<string>): void {
+  try {
+    setSetting(stickyKey(sessionId), JSON.stringify([...names]));
+  } catch {
+    /* best-effort */
+  }
+}
+
 export interface RelevantMemory {
   /** Always-on pinned core (goes in the cached system prefix). */
   pinnedText: string;
-  /** Relevance-selected non-pinned memory (per-turn system block). */
+  /**
+   * Recent/active task state (most-recent normal leaves) + gate-selected tail.
+   * Goes in a per-turn block after the pinned core.
+   */
   retrievedText: string;
-  /** Names of the selected leaves, for logging/transparency. */
+  /** Names of every non-pinned leaf included this turn (recent + tail). */
   selectedNames: string[];
-  via: 'gate' | 'all' | 'fallback';
+  via: 'recent+gate' | 'recent-only';
 }
 
 /**
- * The main entry point: returns the pinned core + the relevance-selected
- * memory for a given user message.
+ * Build the per-turn memory: pinned core (always) + the N most-recent normal
+ * leaves (always, = task state) + a sticky, context-gated tail of older/archived
+ * leaves.
  */
 export async function loadRelevantMemory(args: {
   cwd: string;
   projectId?: string;
-  userMessage: string;
+  /** Recent conversation context + active plan (what the gate matches on). */
+  contextText: string;
+  sessionId?: string;
   apiKeyId?: string | null;
 }): Promise<RelevantMemory> {
   const metas = gatherLeafMeta({ cwd: args.cwd, projectId: args.projectId });
-  const candidates = metas.filter((m) => !m.pinned);
-  const { selected, via } = await selectRelevant(args.userMessage, candidates, args.apiKeyId);
+  const pinned = metas.filter((m) => m.pinned);
+  const nonPinned = metas.filter((m) => !m.pinned);
+
+  // Split non-pinned into "recent normal" (always loaded = task state) and the
+  // "tail" (older normal + archived = gate candidates), newest-first.
+  const normal = nonPinned.filter((m) => m.tier === 'normal').sort((a, b) => b.mtime - a.mtime);
+  const archived = nonPinned.filter((m) => m.tier === 'archived').sort((a, b) => b.mtime - a.mtime);
+  const recent = normal.slice(0, ALWAYS_RECENT_NORMAL);
+  const tail = [...normal.slice(ALWAYS_RECENT_NORMAL), ...archived];
+
+  // Gate the tail on conversation context, with sticky accumulation per session.
+  const sticky = args.sessionId ? loadSticky(args.sessionId) : new Set<string>();
+  const matched = await gateTail(args.contextText, tail, args.apiKeyId);
+  for (const n of matched) sticky.add(n.toLowerCase().trim());
+  if (args.sessionId) saveSticky(args.sessionId, sticky);
+  const tailSelected = tail.filter((t) => sticky.has(t.name.toLowerCase().trim()));
+
+  // Order: recent task state first (most important), then selected tail.
+  const recentText = concatBodies(recent, RECENT_TOTAL_CAP);
+  const tailText = concatBodies(tailSelected, TAIL_TOTAL_CAP);
+  const retrievedText = [recentText, tailText].filter(Boolean).join('\n\n');
+
   return {
-    pinnedText: loadPinnedBodies(metas),
-    retrievedText: concatBodies(selected),
-    selectedNames: selected.map((s) => s.name),
-    via,
+    pinnedText: concatBodiesUncapped(pinned),
+    retrievedText,
+    selectedNames: [...recent.map((r) => r.name), ...tailSelected.map((t) => t.name)],
+    via: tailSelected.length > 0 || tail.length > 0 ? 'recent+gate' : 'recent-only',
   };
 }

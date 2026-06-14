@@ -1049,10 +1049,40 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     const memRetrieval = getSetting('memory_retrieval');
     if (memRetrieval === 'on' && userText && userText.trim()) {
       try {
+        // Gate on RECENT CONVERSATION CONTEXT (last few turns) + the active
+        // plan + the new message - not just the message - so terse follow-ups
+        // ("continue", "now do X") still retrieve the right state. Recent
+        // task-state notes are always loaded regardless (see loadRelevantMemory).
+        const recentTurns = messages
+          .slice(-6)
+          .map((m: Anthropic.MessageParam) => {
+            const c = m.content;
+            const text =
+              typeof c === 'string'
+                ? c
+                : Array.isArray(c)
+                  ? c
+                      .map((b: any) => (b?.type === 'text' ? b.text : b?.type === 'tool_use' ? `[tool:${b.name}]` : ''))
+                      .filter(Boolean)
+                      .join(' ')
+                  : '';
+            return text ? `${m.role}: ${text.slice(0, 800)}` : '';
+          })
+          .filter(Boolean)
+          .join('\n');
+        const planBlock = renderActivePlanBlock(sessionId) || '';
+        const contextText = [
+          planBlock ? `Active plan:\n${planBlock}` : '',
+          recentTurns ? `Recent conversation:\n${recentTurns}` : '',
+          `Latest message:\n${userText}`,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
         const rm = await loadRelevantMemory({
           cwd,
           projectId,
-          userMessage: userText,
+          contextText,
+          sessionId,
           apiKeyId: resolvedApiKeyId,
         });
         memText = rm.pinnedText;
