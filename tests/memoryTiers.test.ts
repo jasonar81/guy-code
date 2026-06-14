@@ -169,7 +169,9 @@ describe('tiered loadMemory + save/set + recall (temp HOME)', () => {
     const bundle = loadMemory({ cwd: '', projectId });
     expect(bundle.text).toContain('zzz-critical-rule');
     expect(bundle.text).toContain('use worktrees');
-  });
+    // This test writes ~31 files synchronously; the default 5s timeout is tight
+    // on slow CI runners (Windows), so give it room.
+  }, 30_000);
 
   it('archived leaves load after normal and are deprioritized under budget', () => {
     saveMemory({ scope: 'global', key: 'pinned-rule', content: '# pinned rule', priority: 'pinned' });
@@ -184,7 +186,7 @@ describe('tiered loadMemory + save/set + recall (temp HOME)', () => {
     // With 20 * 15KB of normal ahead of it, the archived leaf is squeezed out
     // of the always-loaded budget.
     expect(bundle.text).not.toContain('ARCHIVED CONTENT marker');
-  });
+  }, 30_000);
 
   it('recallFromDisk finds content in an archived leaf even though it did not load', () => {
     saveMemory({ scope: 'global', key: 'pinned-rule', content: '# pinned', priority: 'pinned' });
