@@ -1044,8 +1044,10 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // still used for subagents.
     let memText = memory.text;
     let retrievedMemoryText: string | undefined;
+    // Smart memory retrieval is OFF by default (it has produced noticeably worse
+    // results); only run it when the user has explicitly turned it on.
     const memRetrieval = getSetting('memory_retrieval');
-    if (memRetrieval !== 'off' && userText && userText.trim()) {
+    if (memRetrieval === 'on' && userText && userText.trim()) {
       try {
         const rm = await loadRelevantMemory({
           cwd,

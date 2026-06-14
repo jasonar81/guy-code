@@ -76,16 +76,12 @@ void getApiKey;
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-// Claude Fable 5 is the default. The earlier refusals (0.7.0) were traced to a
-// real, fixable cause: the system prompt's "Operating mode: bypassPermissions /
-// full autonomy / do NOT ask permission" framing read to Fable 5's safety
-// classifier as an unrestricted-agent signal, and combined with the tool list
-// it pushed the request over the refusal threshold. That line was reworded to
-// the same operational meaning without the jailbreak-style phrasing, which
-// (verified live against the full prompt + tools) stops the refusals. The
-// memory retrieval, routing, per-session auto-disable, and refusal->Opus
-// fallback all remain as additional safety nets.
-export const DEFAULT_MODEL = 'claude-fable-5[1m]';
+// Claude Opus 4.8 is the default. (Claude Fable 5 was the default for a while,
+// but Anthropic has disabled it again, so a Fable default would hard-fail. Opus
+// 4.8 is the reliable choice; Fable stays selectable in Settings for whenever
+// it returns.) The refusal->fallback, routing, and per-session auto-disable
+// still apply to anyone who selects Fable.
+export const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
 
 // When Fable 5 returns stop_reason 'refusal' (an empty response from its safety
 // classifier), the agent transparently retries that turn on this fallback

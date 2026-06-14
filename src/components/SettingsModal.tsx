@@ -31,11 +31,11 @@ interface Props {
 // Keep this in sync with `electron/anthropic.ts` DEFAULT_MODEL. The `[1m]`
 // suffix is the Claude Code convention for opting into the 1M-context
 // window — at sub-1M sizes the 200K cap forces aggressive compaction.
-const DEFAULT_MODEL = 'claude-fable-5[1m]';
+const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
 
 export function SettingsModal({ open, onClose }: Props) {
   const [model, setModel] = useState<string>(DEFAULT_MODEL);
-  const [memoryRetrieval, setMemoryRetrieval] = useState<boolean>(true);
+  const [memoryRetrieval, setMemoryRetrieval] = useState<boolean>(false);
   const [routing, setRouting] = useState<boolean>(false);
   const [cheapModel, setCheapModel] = useState<string>('claude-sonnet-4-6');
   const [routingFloor, setRoutingFloor] = useState<string>('');
@@ -75,7 +75,7 @@ export function SettingsModal({ open, onClose }: Props) {
       setModel(m && m.trim() ? m : DEFAULT_MODEL);
       const mr = await window.api.settings.get('memory_retrieval');
       if (cancelled) return;
-      setMemoryRetrieval(mr !== 'off'); // default on
+      setMemoryRetrieval(mr === 'on'); // default off
       const rt = await window.api.settings.get('routing');
       if (cancelled) return;
       setRouting(rt === 'on'); // default off (opt-in)
@@ -233,7 +233,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <Field
             icon={<Cpu size={14} />}
             label="Smart memory retrieval"
-            hint="Instead of loading your entire saved-memory tree into every prompt, a cheap model picks the notes relevant to each message and loads only those (plus a small always-on core). Cuts cost, sharpens focus, and avoids unrelated content (e.g. security notes) triggering refusals on safety-stricter models. Recommended on."
+            hint="Instead of loading your entire saved-memory tree into every prompt, a cheap model picks the notes relevant to each message and loads only those (plus a small always-on core). This can cut cost, but in practice it has produced noticeably worse results, so it is OFF by default while we improve it. Turn it on to experiment."
           >
             <label className="flex items-center gap-2 text-[13px] text-text cursor-pointer">
               <input

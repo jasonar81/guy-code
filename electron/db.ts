@@ -485,6 +485,16 @@ function migrateSettings() {
     }
     setSetting('migrated.fable5_reenable_v090', '1');
   }
+
+  // Anthropic disabled Fable 5 again, so a Fable default hard-fails. Move
+  // anyone on the Fable 5 default back to Opus 4.8 once. Users can re-select
+  // Fable in Settings if/when it returns.
+  if (!getSetting('migrated.revert_fable5_disabled')) {
+    if (getSetting('model') === 'claude-fable-5[1m]') {
+      setSetting('model', 'claude-opus-4-8[1m]');
+    }
+    setSetting('migrated.revert_fable5_disabled', '1');
+  }
 }
 
 // ---- Schema migrations ----
