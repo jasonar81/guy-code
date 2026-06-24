@@ -807,6 +807,18 @@ function migrate(d: Database) {
         ALTER TABLE sessions ADD COLUMN force_continue INTEGER NOT NULL DEFAULT 0;
       `,
     },
+    {
+      version: 11,
+      // WaitForCondition state. When set, the session is sleeping and Guy Code
+      // (NOT the model) runs a check command on each wake: if it passes the
+      // session resumes the AI; if not and we're before the deadline it
+      // re-sleeps for another interval - all with zero AI cost. Stored as JSON
+      // {command, intervalMs, deadlineTs, cwd, shell, successCodes} so it
+      // survives app restart (the governor sweep reads it from the DB).
+      up: `
+        ALTER TABLE sessions ADD COLUMN wait_condition TEXT;
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -957,6 +969,25 @@ export interface SessionRow {
    * recorded — only the gate changes. 0 = normal. Toggled via right-click.
    */
   force_continue: number;
+  /**
+   * WaitForCondition state (JSON) or NULL. When set, a sleeping session runs a
+   * check command on each wake (no AI) and resumes only when it passes or the
+   * deadline is hit. Shape:
+   * {command, intervalMs, deadlineTs, cwd, shell, successCodes}. Persisted so
+   * the wait survives app restart (the governor sweep reads it from the DB).
+   */
+  wait_condition: string | null;
+}
+
+/** Parsed WaitForCondition state stored in `sessions.wait_condition`. */
+export interface WaitConditionState {
+  command: string;
+  intervalMs: number;
+  /** Absolute epoch ms after which we stop waiting and resume the AI. */
+  deadlineTs: number;
+  cwd: string;
+  shell: 'powershell' | 'bash';
+  successCodes: number[];
 }
 
 export interface SessionFullRow extends SessionRow {
@@ -1250,6 +1281,34 @@ export function getSessionPending(
       'SELECT pending_user_text, sleeping_since FROM sessions WHERE id = ?'
     )
     .get<{ pending_user_text: string | null; sleeping_since: number | null }>(id);
+}
+
+/**
+ * Persist (or clear) the WaitForCondition state for a session. Pass null to
+ * clear (condition met, timed out, cancelled, or archived). Stored as JSON so
+ * the wake path / governor sweep can read it back after a restart.
+ */
+export function setSessionWaitCondition(id: string, state: WaitConditionState | null) {
+  db()
+    .prepare('UPDATE sessions SET wait_condition = ? WHERE id = ?')
+    .run(state ? JSON.stringify(state) : null, id);
+}
+
+/** Read + parse a session's WaitForCondition state, or null if none/invalid. */
+export function getSessionWaitCondition(id: string): WaitConditionState | null {
+  const row = db()
+    .prepare('SELECT wait_condition FROM sessions WHERE id = ?')
+    .get<{ wait_condition: string | null }>(id);
+  if (!row?.wait_condition) return null;
+  try {
+    const s = JSON.parse(row.wait_condition);
+    if (s && typeof s.command === 'string' && typeof s.deadlineTs === 'number') {
+      return s as WaitConditionState;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**

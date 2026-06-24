@@ -16,7 +16,13 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import type Anthropic from '@anthropic-ai/sdk';
 import log from 'electron-log';
-import { setSessionState, setSessionWakeAt, getSetting } from './db';
+import {
+  setSessionState,
+  setSessionWakeAt,
+  getSetting,
+  setSessionWaitCondition,
+  type WaitConditionState,
+} from './db';
 import {
   listClaudeSkills,
   recallFromDisk,
@@ -767,6 +773,56 @@ function clampPersistentWait(ms: unknown, def = 60_000): number {
   return Math.min(MAX_PERSISTENT_WAIT_MS, Math.max(100, Math.floor(n)));
 }
 
+/**
+ * Run a WaitForCondition check command and resolve its exit code. Used by both
+ * the tool (the optional immediate first check) and the wake path in agent.ts.
+ * A check that errors to spawn, or exceeds `timeoutMs`, resolves to a non-zero
+ * sentinel so the caller treats it as "not met yet" (re-sleep). NEVER throws.
+ */
+export function runConditionCheck(
+  command: string,
+  cwd: string,
+  shell: 'powershell' | 'bash',
+  timeoutMs = 60_000
+): Promise<number> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (code: number) => {
+      if (settled) return;
+      settled = true;
+      resolve(code);
+    };
+    try {
+      const child =
+        shell === 'bash'
+          ? spawn('bash', ['-lc', command], { cwd, windowsHide: true })
+          : spawn(
+              'powershell.exe',
+              ['-NoProfile', '-NonInteractive', '-Command', command],
+              { cwd, windowsHide: true }
+            );
+      const killer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+        done(124); // timeout sentinel -> treated as not-met
+      }, timeoutMs);
+      child.on('error', () => {
+        clearTimeout(killer);
+        done(125); // spawn error sentinel -> treated as not-met
+      });
+      child.on('close', (code) => {
+        clearTimeout(killer);
+        done(typeof code === 'number' ? code : 1);
+      });
+    } catch {
+      done(125);
+    }
+  });
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new Error('aborted'));
@@ -1020,6 +1076,113 @@ const WAIT_FOR_TIME: ToolDef = {
         },
       ],
       uiSummary: `WaitForTime: ${ms}ms — sleeping until ${wakeIso}`,
+      sleepUntil: wakeAtTs,
+    };
+  },
+};
+
+// ---- WaitForCondition ----
+
+const WAIT_FOR_CONDITION: ToolDef = {
+  schema: {
+    name: 'WaitForCondition',
+    description:
+      'Wait for an arbitrary condition WITHOUT spending AI calls while waiting. ' +
+      'You provide a shell `command` that EXITS 0 when the thing you are waiting for is ready (non-zero = not ready yet) - e.g. a curl that greps a status endpoint, a check for a file/row/process, anything. ' +
+      'Guy Code then runs the sleep -> run command -> check exit code loop ITSELF, with NO model calls: it sleeps `interval_ms`, runs your command, and if it exits non-zero and the deadline has not passed it sleeps again. ' +
+      'The session is suspended (costs nothing) the entire time and survives app restart. ' +
+      'You are only woken back up when the command first exits 0 (condition met) OR `timeout_ms` elapses (gave up). ' +
+      'This is the right tool for long, unpredictable waits (minutes to weeks) - e.g. "wait until my cloud reservation is ready, checking hourly, for up to 2 weeks" is command=<status check>, interval_ms=3600000, timeout_ms=1209600000. Far cheaper than waking the AI each interval to poll.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description:
+            'Shell command that exits 0 when the wait condition is met, non-zero otherwise. Runs in the session cwd. Keep it quick (hard 60s cap per check).',
+        },
+        interval_ms: {
+          type: 'integer',
+          description: 'How often to run the check, in ms (e.g. 3600000 = hourly). Min 1000.',
+        },
+        timeout_ms: {
+          type: 'integer',
+          description:
+            'Max total time to wait before giving up and waking the AI, in ms (up to 30 days). The AID is woken with a "timed out" note if the condition never becomes true.',
+        },
+        shell: {
+          type: 'string',
+          enum: ['powershell', 'bash'],
+          description: 'Which shell runs the check. Default: powershell on Windows, bash elsewhere.',
+        },
+        success_exit_codes: {
+          type: 'array',
+          items: { type: 'integer' },
+          description: 'Exit codes that count as "condition met". Default [0].',
+        },
+      },
+      required: ['command', 'interval_ms', 'timeout_ms'],
+    },
+  },
+  async execute(input, ctx) {
+    const command = String(input.command ?? '').trim();
+    if (!command) return 'WaitForCondition: error - `command` is required';
+    const intervalMs = Math.max(1000, Math.floor(Number(input.interval_ms) || 60_000));
+    const timeoutMs = clampPersistentWait(input.timeout_ms, 60 * 60 * 1000);
+    const shell: 'powershell' | 'bash' =
+      input.shell === 'bash' || input.shell === 'powershell'
+        ? input.shell
+        : process.platform === 'win32'
+          ? 'powershell'
+          : 'bash';
+    const successCodes =
+      Array.isArray(input.success_exit_codes) && input.success_exit_codes.length > 0
+        ? input.success_exit_codes.map((n: any) => Math.floor(Number(n))).filter((n: number) => isFinite(n))
+        : [0];
+    const cwd = ctx.cwd || process.cwd();
+    const deadlineTs = Date.now() + timeoutMs;
+
+    // Run the check ONCE immediately - if the condition is already met, there's
+    // no point sleeping at all; return now and let the AI continue.
+    const firstCode = await runConditionCheck(command, cwd, shell, 60_000);
+    if (successCodes.includes(firstCode)) {
+      return {
+        modelContent: [
+          {
+            type: 'text',
+            text: `WaitForCondition: condition already met (check exited ${firstCode}). Continuing.`,
+          },
+        ],
+        uiSummary: `WaitForCondition: already met`,
+      };
+    }
+
+    // Not met yet - set up the persistent wait. Store the condition + first wake
+    // in the DB (so it survives restart), then return a sleepUntil so the agent
+    // loop exits cleanly. The wake path (agent.ts) re-runs the check each wake.
+    const state: WaitConditionState = { command, intervalMs, deadlineTs, cwd, shell, successCodes };
+    const wakeAtTs = Math.min(Date.now() + intervalMs, deadlineTs);
+    try {
+      setSessionWaitCondition(ctx.sessionId, state);
+      setSessionWakeAt(ctx.sessionId, wakeAtTs);
+      setSessionState(ctx.sessionId, 'sleeping-tool');
+      broadcastStateChanged(ctx.sessionId, 'sleeping-tool');
+    } catch (e) {
+      log.warn(`[tool:WaitForCondition] persistent setup failed for ${ctx.sessionId}`, e);
+      return `WaitForCondition: error setting up the wait (${(e as Error).message}). Try WaitForTime + a manual check instead.`;
+    }
+    const deadlineIso = new Date(deadlineTs).toISOString();
+    log.info(
+      `[tool:WaitForCondition] ${ctx.sessionId} waiting (every ${intervalMs}ms until ${deadlineIso})`
+    );
+    return {
+      modelContent: [
+        {
+          type: 'text',
+          text: `WaitForCondition: condition not yet met; now waiting (checking every ${intervalMs}ms, up to ${deadlineIso}) with no further AI calls until it's met or the deadline passes.`,
+        },
+      ],
+      uiSummary: `WaitForCondition: checking every ${Math.round(intervalMs / 1000)}s`,
       sleepUntil: wakeAtTs,
     };
   },
@@ -2750,6 +2913,7 @@ export const TOOLS: Record<string, ToolDef> = {
   WaitForFile: WAIT_FOR_FILE,
   WaitForProcess: WAIT_FOR_PROCESS,
   WaitForTime: WAIT_FOR_TIME,
+  WaitForCondition: WAIT_FOR_CONDITION,
   WaitForHttp: WAIT_FOR_HTTP,
   recall_memory: RECALL_MEMORY,
   search_conversation: SEARCH_CONVERSATION,

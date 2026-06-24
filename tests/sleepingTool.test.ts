@@ -51,6 +51,7 @@ const _sleepers: SleeperRow[] = [];
 const _allSessions: FullSessionRow[] = [];
 const _setSessionStateCalls: Array<{ id: string; state: string }> = [];
 const _setSessionWakeAtCalls: Array<{ id: string; ts: number | null }> = [];
+const _setWaitConditionCalls: Array<{ id: string; state: unknown }> = [];
 const _broadcastStateCalls: Array<{ id: string; state: string }> = [];
 
 function resetFixtures() {
@@ -58,6 +59,7 @@ function resetFixtures() {
   _allSessions.length = 0;
   _setSessionStateCalls.length = 0;
   _setSessionWakeAtCalls.length = 0;
+  _setWaitConditionCalls.length = 0;
   _broadcastStateCalls.length = 0;
 }
 
@@ -89,6 +91,20 @@ vi.mock('../electron/db', () => {
     },
     upsertSession: () => {},
     getSetting: () => null,
+    setSessionWaitCondition: (id: string, state: unknown) => {
+      _setWaitConditionCalls.push({ id, state });
+      const row = _allSessions.find((r) => r.id === id);
+      if (row) row.wait_condition = state ? JSON.stringify(state) : null;
+    },
+    getSessionWaitCondition: (id: string) => {
+      const row = _allSessions.find((r) => r.id === id);
+      if (!row?.wait_condition) return null;
+      try {
+        return JSON.parse(row.wait_condition);
+      } catch {
+        return null;
+      }
+    },
   };
 });
 
@@ -406,5 +422,62 @@ describe('wakeSleepingToolSweep', () => {
     await wakeSleepingToolSweep();
     expect(_setSessionStateCalls).toHaveLength(0);
     expect(_setSessionWakeAtCalls).toHaveLength(0);
+  });
+});
+
+describe('WaitForCondition', () => {
+  const WAIT_FOR_CONDITION = TOOLS.WaitForCondition;
+  const sh: 'powershell' | 'bash' = process.platform === 'win32' ? 'powershell' : 'bash';
+  const exit0 = process.platform === 'win32' ? 'exit 0' : 'true';
+  const exit1 = process.platform === 'win32' ? 'exit 1' : 'false';
+
+  beforeEach(() => {
+    vi.useRealTimers(); // runConditionCheck spawns real subprocesses
+  });
+
+  it('runConditionCheck returns 0 for a passing command and non-zero for a failing one', async () => {
+    const { runConditionCheck } = await import('../electron/tools');
+    expect(await runConditionCheck(exit0, process.cwd(), sh, 10_000)).toBe(0);
+    expect(await runConditionCheck(exit1, process.cwd(), sh, 10_000)).not.toBe(0);
+  });
+
+  it('runConditionCheck never throws on a bad command (returns non-zero)', async () => {
+    const { runConditionCheck } = await import('../electron/tools');
+    const code = await runConditionCheck('this-command-does-not-exist-xyz', process.cwd(), sh, 10_000);
+    expect(code).not.toBe(0);
+  });
+
+  it('returns immediately (no sleep) when the condition is already met', async () => {
+    _allSessions.push({
+      id: 'c-met', project_id: 'p1', cwd: process.cwd(), jsonl_path: '/tmp/c.jsonl',
+      api_key_id: null, archived: 0, wake_at_ts: null, state: 'running', wait_condition: null,
+    });
+    const result = await WAIT_FOR_CONDITION.execute(
+      { command: exit0, interval_ms: 60000, timeout_ms: 3600000, shell: sh },
+      { sessionId: 'c-met', cwd: process.cwd(), projectId: 'p1' }
+    );
+    if (typeof result === 'string') throw new Error('expected structured result');
+    expect((result as any).sleepUntil).toBeUndefined(); // did not sleep
+    expect(_setWaitConditionCalls).toHaveLength(0); // no wait persisted
+  });
+
+  it('sets up the persistent wait + sleepUntil when not yet met', async () => {
+    _allSessions.push({
+      id: 'c-wait', project_id: 'p1', cwd: process.cwd(), jsonl_path: '/tmp/c.jsonl',
+      api_key_id: null, archived: 0, wake_at_ts: null, state: 'running', wait_condition: null,
+    });
+    const before = Date.now();
+    const result = await WAIT_FOR_CONDITION.execute(
+      { command: exit1, interval_ms: 60000, timeout_ms: 3600000, shell: sh },
+      { sessionId: 'c-wait', cwd: process.cwd(), projectId: 'p1' }
+    );
+    if (typeof result === 'string') throw new Error('expected structured result');
+    // It slept ~interval out.
+    expect((result as any).sleepUntil).toBeGreaterThanOrEqual(before + 60000 - 5000);
+    // The condition was persisted (so it survives restart).
+    const saved = _setWaitConditionCalls.find((c) => c.id === 'c-wait');
+    expect(saved).toBeDefined();
+    expect((saved!.state as any).command).toBe(exit1);
+    expect((saved!.state as any).deadlineTs).toBeGreaterThan(before);
   });
 });

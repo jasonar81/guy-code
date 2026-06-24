@@ -28,6 +28,7 @@ import {
   executeTool,
   getToolSchemas,
   isWaitForUser,
+  runConditionCheck,
   TOOLS,
 } from './tools';
 import {
@@ -37,6 +38,8 @@ import {
   setSessionState,
   setSessionPending,
   setSessionWakeAt,
+  getSessionWaitCondition,
+  setSessionWaitCondition,
   getSessionPending,
   getSessionApiKey,
   listSessionsAll,
@@ -257,6 +260,7 @@ export function cancelRun(sessionId: string) {
     const row = listSessionsAll().find((s) => s.id === sessionId);
     if (row?.state === 'sleeping-tool') {
       setSessionWakeAt(sessionId, null);
+      setSessionWaitCondition(sessionId, null); // cancel any pending WaitForCondition
       setSessionState(sessionId, 'idle');
       broadcastStateChanged(sessionId, 'idle');
       broadcastAgentEvent({
@@ -389,6 +393,67 @@ export async function wakeSleepingTool(sessionId: string) {
     log.info(`[agent] wake skipped: session ${sessionId} already has an active run`);
     return;
   }
+  // ---- WaitForCondition: run the check WITHOUT the AI -------------------
+  // If this sleeping session is in a condition-wait, run its check command
+  // here (no model call). On pass -> resume the AI. On fail before the
+  // deadline -> re-sleep another interval (stay asleep, $0). On deadline ->
+  // resume with a "timed out" note. This whole path is reached by BOTH the
+  // in-process timer and the governor's DB sweep, so it survives app restart.
+  const waitCond = getSessionWaitCondition(sessionId);
+  if (waitCond) {
+    if (activeRuns.has(sessionId)) return; // already running, leave it
+    const cwd = waitCond.cwd || row.cwd || '';
+    let resumeNote: string | null = null;
+    try {
+      const code = await runConditionCheck(waitCond.command, cwd, waitCond.shell, 60_000);
+      const met = waitCond.successCodes.includes(code);
+      const now = Date.now();
+      if (met) {
+        resumeNote = `[WaitForCondition] condition met (the check exited ${code}). Continuing.`;
+      } else if (now < waitCond.deadlineTs) {
+        // Not met, still before the deadline -> re-sleep another interval.
+        const nextWake = Math.min(now + waitCond.intervalMs, waitCond.deadlineTs);
+        setSessionWakeAt(sessionId, nextWake);
+        // state is already sleeping-tool; keep wait_condition as-is.
+        armWakeTimer(sessionId, nextWake);
+        log.info(
+          `[agent] WaitForCondition ${sessionId}: not met (exit ${code}), re-sleeping until ${new Date(nextWake).toISOString()}`
+        );
+        return;
+      } else {
+        resumeNote =
+          `[WaitForCondition] timed out: the condition did not become true before the deadline (last check exited ${code}).`;
+      }
+    } catch (e) {
+      // A failure running the check itself: if before the deadline, re-sleep;
+      // otherwise resume with the error so the AI isn't stuck forever.
+      const now = Date.now();
+      if (now < waitCond.deadlineTs) {
+        const nextWake = Math.min(now + waitCond.intervalMs, waitCond.deadlineTs);
+        setSessionWakeAt(sessionId, nextWake);
+        armWakeTimer(sessionId, nextWake);
+        log.warn(`[agent] WaitForCondition ${sessionId}: check errored, re-sleeping`, e);
+        return;
+      }
+      resumeNote = `[WaitForCondition] timed out (and the check was erroring: ${(e as Error).message}).`;
+    }
+    // Condition met or timed out -> clear the wait + resume the AI with a note
+    // (passed as userText so the model sees WHY it woke). continueExisting
+    // appends it as the next user turn on the existing history.
+    setSessionWaitCondition(sessionId, null);
+    setSessionWakeAt(sessionId, null);
+    log.info(`[agent] WaitForCondition ${sessionId}: resuming AI (${resumeNote})`);
+    await runUserTurn({
+      sessionId,
+      projectId: row.project_id,
+      cwd: row.cwd ?? '',
+      userText: resumeNote ?? '',
+      continueExisting: true,
+      seedFromJsonl: row.jsonl_path,
+    });
+    return;
+  }
+
   // Clear wake marker BEFORE the resume call so a tight-race
   // re-trigger doesn't double-resume.
   setSessionWakeAt(sessionId, null);
