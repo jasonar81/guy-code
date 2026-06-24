@@ -120,6 +120,7 @@ const ROLE_TOOLSETS: Record<SubagentRole, string[]> = {
     'WaitForFile',
     'WaitForProcess',
     'WaitForTime',
+    'WaitForCondition',
     'WaitForHttp',
     'recall_memory',
     'list_memory',
@@ -147,6 +148,7 @@ const ROLE_TOOLSETS: Record<SubagentRole, string[]> = {
     'WaitForFile',
     'WaitForProcess',
     'WaitForTime',
+    'WaitForCondition',
     'WaitForHttp',
     'recall_memory',
     'list_memory',
@@ -373,6 +375,9 @@ export async function runSubagent(
     projectId: parent.projectId,
     memory: parent.memory,
     signal: parent.signal,
+    // Subagents run synchronously inside the parent turn; wait tools must block
+    // in-process here rather than using the persistent DB-sleep mechanism.
+    inSubagent: true,
   };
 
   // Live-activity emit helper. No-op when the parent didn't wire a sink.

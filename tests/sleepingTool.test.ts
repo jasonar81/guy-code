@@ -481,3 +481,41 @@ describe('WaitForCondition', () => {
     expect((saved!.state as any).deadlineTs).toBeGreaterThan(before);
   });
 });
+
+describe('Wait tools inside a subagent (in-process, no DB sleep)', () => {
+  const WAIT_FOR_TIME = TOOLS.WaitForTime;
+  const WAIT_FOR_CONDITION = TOOLS.WaitForCondition;
+  const sh: 'powershell' | 'bash' = process.platform === 'win32' ? 'powershell' : 'bash';
+  const exit0 = process.platform === 'win32' ? 'exit 0' : 'true';
+
+  beforeEach(() => {
+    vi.useRealTimers(); // these block in-process on real timers
+  });
+
+  it('WaitForTime in a subagent actually waits in-process and does NOT touch session DB state', async () => {
+    const start = Date.now();
+    const result = await WAIT_FOR_TIME.execute(
+      { duration_ms: 150 },
+      { sessionId: 'parent-1', cwd: process.cwd(), projectId: 'p1', inSubagent: true }
+    );
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(120); // it really slept ~150ms
+    // It returned a plain string (no sleepUntil signal) ...
+    expect(typeof result).toBe('string');
+    // ... and it did NOT corrupt the parent session (no wake/state/wait writes).
+    expect(_setSessionWakeAtCalls).toHaveLength(0);
+    expect(_setSessionStateCalls).toHaveLength(0);
+    expect(_setWaitConditionCalls).toHaveLength(0);
+  });
+
+  it('WaitForCondition in a subagent runs the check loop in-process (met -> returns), no DB writes', async () => {
+    const result = await WAIT_FOR_CONDITION.execute(
+      { command: exit0, interval_ms: 1000, timeout_ms: 60000, shell: sh },
+      { sessionId: 'parent-2', cwd: process.cwd(), projectId: 'p1', inSubagent: true }
+    );
+    expect(typeof result).toBe('string');
+    expect(String(result)).toMatch(/condition met/i);
+    expect(_setSessionWakeAtCalls).toHaveLength(0);
+    expect(_setWaitConditionCalls).toHaveLength(0);
+  });
+});

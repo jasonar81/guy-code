@@ -58,6 +58,14 @@ export interface ToolContext {
    * parent. Other tools ignore it.
    */
   apiKeyId?: string | null;
+  /**
+   * True when the tool is being executed inside a SUBAGENT. Subagents run
+   * synchronously inside the parent turn and have no session row of their own,
+   * so the persistent-sleep tools (WaitForTime / WaitForCondition) must NOT do
+   * the DB sleeping-tool dance (that would mutate the PARENT session and not
+   * actually wait) - they block IN-PROCESS instead. See those tools.
+   */
+  inSubagent?: boolean;
 }
 
 /**
@@ -1019,6 +1027,20 @@ const WAIT_FOR_TIME: ToolDef = {
     },
   },
   async execute(input, ctx) {
+    // In a SUBAGENT, the persistent-sleep mechanism can't be used (no session
+    // row of its own; it runs synchronously inside the parent turn, and the DB
+    // dance would mutate the PARENT session without actually waiting). Block
+    // in-process instead - the subagent + parent turn are both alive the whole
+    // time, so a real timer is fine. No DB writes, no sleepUntil.
+    if (ctx.inSubagent) {
+      const ms = clampPersistentWait(input.duration_ms, 1000);
+      try {
+        await sleep(ms, ctx.signal);
+        return `WaitForTime: slept ${ms}ms`;
+      } catch {
+        return `WaitForTime: aborted`;
+      }
+    }
     // Persistent-sleep path. Instead of holding a setTimeout in this
     // process for `ms`, we:
     //   1. Write `sleeping-tool` state + `wake_at_ts = now + ms` to the
@@ -1141,6 +1163,29 @@ const WAIT_FOR_CONDITION: ToolDef = {
         : [0];
     const cwd = ctx.cwd || process.cwd();
     const deadlineTs = Date.now() + timeoutMs;
+
+    // In a SUBAGENT, run the whole sleep -> check -> resleep loop IN-PROCESS
+    // (no DB persistence - the subagent is synchronous and can't survive a
+    // restart anyway). Blocks the subagent turn until the condition is met or
+    // the deadline passes, exactly like the main-agent version but without the
+    // governor.
+    if (ctx.inSubagent) {
+      // Immediate check first.
+      let code = await runConditionCheck(command, cwd, shell, 60_000);
+      while (!successCodes.includes(code)) {
+        if (Date.now() >= deadlineTs) {
+          return `WaitForCondition: timed out - the condition did not become true before the deadline (last check exited ${code}).`;
+        }
+        const napMs = Math.min(intervalMs, deadlineTs - Date.now());
+        try {
+          await sleep(napMs, ctx.signal);
+        } catch {
+          return `WaitForCondition: aborted`;
+        }
+        code = await runConditionCheck(command, cwd, shell, 60_000);
+      }
+      return `WaitForCondition: condition met (the check exited ${code}). Continuing.`;
+    }
 
     // Run the check ONCE immediately - if the condition is already met, there's
     // no point sleeping at all; return now and let the AI continue.
