@@ -748,11 +748,23 @@ const PLAN_STATE: ToolDef = {
 
 // ---- WaitFor* helpers ----------------------------------------------------
 
-const MAX_WAIT_MS = 60 * 60 * 1000; // 1 hour hard cap on any blocking wait
+const MAX_WAIT_MS = 60 * 60 * 1000; // 1 hour hard cap on IN-PROCESS blocking waits
 
 function clampWait(ms: unknown, def = 60_000): number {
   const n = typeof ms === 'number' && isFinite(ms) ? ms : def;
   return Math.min(MAX_WAIT_MS, Math.max(100, Math.floor(n)));
+}
+
+// WaitForTime is a PERSISTENT sleep: the session sleeps via a DB wake_at_ts and
+// resumes from a timer / the governor sweep (it does NOT hold the turn in
+// memory and costs nothing while asleep). So it can sleep far longer than the
+// in-process cap. Allow up to 30 days - long enough for "wake once a day" /
+// "check back in a week" without burning an AI call every hour.
+const MAX_PERSISTENT_WAIT_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function clampPersistentWait(ms: unknown, def = 60_000): number {
+  const n = typeof ms === 'number' && isFinite(ms) ? ms : def;
+  return Math.min(MAX_PERSISTENT_WAIT_MS, Math.max(100, Math.floor(n)));
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -943,7 +955,7 @@ const WAIT_FOR_TIME: ToolDef = {
   schema: {
     name: 'WaitForTime',
     description:
-      'Pause the turn for a fixed duration in milliseconds (max 1 hour). Use sparingly — prefer WaitForFile/Process/Http when possible. Session shows sleeping-tool and survives app restart: the agent loop exits cleanly while sleeping and is resumed automatically when the wake time arrives (in-process timer if the app stayed alive, governor sweep if it was restarted).',
+      'Pause the turn for a fixed duration in milliseconds (up to 30 days). The session sleeps PERSISTENTLY and costs nothing while asleep - the agent loop exits cleanly and resumes automatically when the wake time arrives (in-process timer if the app stayed alive, governor sweep if it was restarted), surviving app restart. Use a LONG duration when monitoring something slow: e.g. checking once a day is duration_ms=86400000, which wakes (and spends an AI call) once a day instead of every hour. Prefer WaitForFile/Process/Http when you can wait on a concrete condition instead.',
     input_schema: {
       type: 'object',
       properties: { duration_ms: { type: 'integer' } },
@@ -970,7 +982,7 @@ const WAIT_FOR_TIME: ToolDef = {
     // the model doesn't need to know the wait was implemented
     // persistently. The wall-clock IS honored — wake won't fire
     // before `wake_at_ts`.
-    const ms = clampWait(input.duration_ms, 1000);
+    const ms = clampPersistentWait(input.duration_ms, 1000);
     const wakeAtTs = Date.now() + ms;
     try {
       setSessionWakeAt(ctx.sessionId, wakeAtTs);
@@ -986,7 +998,10 @@ const WAIT_FOR_TIME: ToolDef = {
       // failing the tool call outright.
       return await withWaitingState(ctx, async () => {
         try {
-          await sleep(ms, ctx.signal);
+          // The persistent path failed, so fall back to an in-process sleep.
+          // Cap it at the in-process max (1h) - we can't hold a multi-day timer
+          // in memory, and this is a rare DB-error path anyway.
+          await sleep(Math.min(ms, MAX_WAIT_MS), ctx.signal);
           return `WaitForTime: slept ${ms}ms (non-persistent fallback after DB error)`;
         } catch {
           return `WaitForTime: aborted`;

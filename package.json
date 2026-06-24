@@ -2,7 +2,7 @@
   "name": "guy-code",
   "productName": "Guy Code",
   "private": false,
-  "version": "0.9.8",
+  "version": "0.9.9",
   "description": "Cross-platform Claude Code-compatible desktop app",
   "author": {
     "name": "Jason Arnold",

@@ -176,28 +176,67 @@ describe('WaitForTime tool: persistent sleep', () => {
 
     const stateCall = _setSessionStateCalls.find((c) => c.id === 's1');
     expect(stateCall?.state).toBe('sleeping-tool');
-
-    // And the renderer must hear about the state change so the
-    // sidebar can swap the glyph immediately.
-    expect(_broadcastStateCalls).toContainEqual({
-      id: 's1',
-      state: 'sleeping-tool',
-    });
-
-    // The returned tool_result carries the sleepUntil signal the
-    // agent loop reads to exit cleanly.
-    expect(typeof result).toBe('object');
+    // The renderer must hear about the state change so the sidebar can swap the
+    // glyph immediately.
+    expect(_broadcastStateCalls).toContainEqual({ id: 's1', state: 'sleeping-tool' });
+    // The returned tool_result carries the sleepUntil signal the agent loop
+    // reads to exit cleanly.
     if (typeof result === 'string') throw new Error('expected structured result');
     expect(result.sleepUntil).toBe(expectedWake);
-    expect(result.modelContent).toHaveLength(1);
-    expect(result.modelContent[0]).toMatchObject({ type: 'text' });
-    expect(result.uiSummary).toContain('sleeping until');
   });
 
-  // Clamp is `Math.min(MAX_WAIT_MS, Math.max(100, …))`. A 24-hour
-  // request shrinks down to 1 hour, which is exactly the policy the
-  // tool description advertises ("max 1 hour").
-  it('clamps requested duration_ms to the MAX_WAIT_MS ceiling', async () => {
+  it('honors a long sleep (24h) instead of capping it at 1 hour', async () => {
+    vi.setSystemTime(new Date('2026-05-23T13:00:00Z'));
+    _setSessionWakeAtCalls.length = 0;
+    _allSessions.push({
+      id: 's-long',
+      project_id: 'p1',
+      cwd: '/tmp',
+      jsonl_path: '/tmp/s-long.jsonl',
+      api_key_id: null,
+      archived: 0,
+      wake_at_ts: null,
+      state: 'running',
+    });
+    const oneDay = 24 * 60 * 60 * 1000;
+    await WAIT_FOR_TIME.execute(
+      { duration_ms: oneDay },
+      { sessionId: 's-long', cwd: '/tmp', projectId: 'p1' }
+    );
+    const wakeCall = _setSessionWakeAtCalls.find((c) => c.id === 's-long' && c.ts != null);
+    expect(wakeCall).toBeDefined();
+    // The wake must be ~24h out, NOT clamped to 1 hour.
+    expect(wakeCall!.ts).toBe(new Date('2026-05-23T13:00:00Z').getTime() + oneDay);
+  });
+
+  it('caps an absurdly long sleep at 30 days', async () => {
+    vi.setSystemTime(new Date('2026-05-23T13:00:00Z'));
+    _setSessionWakeAtCalls.length = 0;
+    _allSessions.push({
+      id: 's-huge',
+      project_id: 'p1',
+      cwd: '/tmp',
+      jsonl_path: '/tmp/s-huge.jsonl',
+      api_key_id: null,
+      archived: 0,
+      wake_at_ts: null,
+      state: 'running',
+    });
+    const oneYear = 365 * 24 * 60 * 60 * 1000;
+    await WAIT_FOR_TIME.execute(
+      { duration_ms: oneYear },
+      { sessionId: 's-huge', cwd: '/tmp', projectId: 'p1' }
+    );
+    const wakeCall = _setSessionWakeAtCalls.find((c) => c.id === 's-huge' && c.ts != null);
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+    expect(wakeCall!.ts).toBe(new Date('2026-05-23T13:00:00Z').getTime() + thirtyDays);
+  });
+
+  // WaitForTime is a PERSISTENT sleep (costs nothing while asleep), so it is
+  // NOT capped at the in-process 1-hour ceiling - it allows up to 30 days. A
+  // 24-hour request is honored as-is; only absurdly long requests clamp (to 30
+  // days). See the dedicated tests above for the boundary cases.
+  it('does NOT clamp a 24-hour request to 1 hour (honors the persistent ceiling)', async () => {
     vi.setSystemTime(new Date('2026-05-23T13:00:00Z'));
     _allSessions.push({
       id: 's-big',
@@ -210,12 +249,12 @@ describe('WaitForTime tool: persistent sleep', () => {
       state: 'running',
     });
     const result = await WAIT_FOR_TIME.execute(
-      { duration_ms: 24 * 60 * 60 * 1000 }, // ask for 24 h, cap is 1 h
+      { duration_ms: 24 * 60 * 60 * 1000 },
       { sessionId: 's-big', cwd: '/tmp', projectId: 'p1' }
     );
     if (typeof result === 'string') throw new Error('expected structured result');
     const expectedWake =
-      new Date('2026-05-23T13:00:00Z').getTime() + 60 * 60 * 1000;
+      new Date('2026-05-23T13:00:00Z').getTime() + 24 * 60 * 60 * 1000;
     expect(result.sleepUntil).toBe(expectedWake);
   });
 

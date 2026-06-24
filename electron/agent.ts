@@ -322,9 +322,20 @@ function armWakeTimer(sessionId: string, wakeAtTs: number) {
     clearTimeout(prev);
     log.info(`[agent] re-arming wake timer for ${sessionId} (previous was active)`);
   }
-  const delay = Math.max(0, wakeAtTs - Date.now());
+  // Node's setTimeout fires IMMEDIATELY if the delay exceeds ~24.8 days
+  // (2^31-1 ms). For very-long sleeps, cap each timer hop well under that
+  // (1 day) and RE-ARM when it fires but the real wake time hasn't arrived yet.
+  // (The governor's 60s sweep is the durable backstop across restarts.)
+  const MAX_TIMER_DELAY = 24 * 60 * 60 * 1000; // 1 day per hop
+  const remaining = Math.max(0, wakeAtTs - Date.now());
+  const delay = Math.min(MAX_TIMER_DELAY, remaining);
   const t = setTimeout(() => {
     wakeTimers.delete(sessionId);
+    if (Date.now() < wakeAtTs) {
+      // Long sleep: another hop is needed before the real wake time.
+      armWakeTimer(sessionId, wakeAtTs);
+      return;
+    }
     wakeSleepingTool(sessionId).catch((e) =>
       log.error(`[agent] wake timer fired for ${sessionId} but resume failed`, e)
     );
