@@ -435,16 +435,21 @@ describe('WaitForCondition', () => {
     vi.useRealTimers(); // runConditionCheck spawns real subprocesses
   });
 
-  it('runConditionCheck returns 0 for a passing command and non-zero for a failing one', async () => {
+  it('runConditionCheck reports launched+code 0 for a passing command, launched+non-zero for a failing one', async () => {
     const { runConditionCheck } = await import('../electron/tools');
-    expect(await runConditionCheck(exit0, process.cwd(), sh, 10_000)).toBe(0);
-    expect(await runConditionCheck(exit1, process.cwd(), sh, 10_000)).not.toBe(0);
+    const ok = await runConditionCheck(exit0, process.cwd(), sh, 10_000);
+    expect(ok.launched).toBe(true);
+    expect(ok.code).toBe(0);
+    const bad = await runConditionCheck(exit1, process.cwd(), sh, 10_000);
+    expect(bad.launched).toBe(true);
+    expect(bad.code).not.toBe(0);
   });
 
-  it('runConditionCheck never throws on a bad command (returns non-zero)', async () => {
+  it('runConditionCheck reports launched=false when the command runs but exits non-zero is distinct from a real failure to launch', async () => {
     const { runConditionCheck } = await import('../electron/tools');
-    const code = await runConditionCheck('this-command-does-not-exist-xyz', process.cwd(), sh, 10_000);
-    expect(code).not.toBe(0);
+    // A command that runs but exits non-zero LAUNCHED (it's just "not met").
+    const ran = await runConditionCheck(exit1, process.cwd(), sh, 10_000);
+    expect(ran.launched).toBe(true);
   });
 
   it('returns immediately (no sleep) when the condition is already met', async () => {

@@ -403,30 +403,53 @@ export async function wakeSleepingTool(sessionId: string) {
   if (waitCond) {
     if (activeRuns.has(sessionId)) return; // already running, leave it
     const cwd = waitCond.cwd || row.cwd || '';
+    // After this many consecutive LAUNCH failures (the check command can't even
+    // run), stop re-sleeping and wake the AI - a broken check is not "condition
+    // not met", and silently looping for up to the deadline (which can be weeks)
+    // is the bug this guards against.
+    const MAX_LAUNCH_FAILURES = 3;
     let resumeNote: string | null = null;
     try {
-      const code = await runConditionCheck(waitCond.command, cwd, waitCond.shell, 60_000);
-      const met = waitCond.successCodes.includes(code);
+      const r = await runConditionCheck(waitCond.command, cwd, waitCond.shell, 60_000);
       const now = Date.now();
-      if (met) {
-        resumeNote = `[WaitForCondition] condition met (the check exited ${code}). Continuing.`;
+      if (r.launched && waitCond.successCodes.includes(r.code)) {
+        resumeNote = `[WaitForCondition] condition met (the check exited ${r.code}). Continuing.`;
+      } else if (!r.launched) {
+        // The check command couldn't run. Count it; bail after a few so a
+        // broken command doesn't loop to the deadline.
+        const fails = (waitCond.launchFailures ?? 0) + 1;
+        if (fails >= MAX_LAUNCH_FAILURES) {
+          resumeNote = `[WaitForCondition] the check command keeps failing to run (${r.detail ?? 'exit ' + r.code}); it can't launch, so I stopped waiting on it. Fix the command or shell (on Windows, bash runs via WSL).`;
+        } else if (now < waitCond.deadlineTs) {
+          setSessionWaitCondition(sessionId, { ...waitCond, launchFailures: fails });
+          const nextWake = Math.min(now + waitCond.intervalMs, waitCond.deadlineTs);
+          setSessionWakeAt(sessionId, nextWake);
+          armWakeTimer(sessionId, nextWake);
+          log.warn(
+            `[agent] WaitForCondition ${sessionId}: check failed to launch (${r.detail}), attempt ${fails}/${MAX_LAUNCH_FAILURES}, re-sleeping`
+          );
+          return;
+        } else {
+          resumeNote = `[WaitForCondition] timed out (and the check was failing to run: ${r.detail ?? 'exit ' + r.code}).`;
+        }
       } else if (now < waitCond.deadlineTs) {
-        // Not met, still before the deadline -> re-sleep another interval.
+        // Ran fine, condition just not met yet -> reset the failure counter and
+        // re-sleep another interval.
+        if (waitCond.launchFailures) {
+          setSessionWaitCondition(sessionId, { ...waitCond, launchFailures: 0 });
+        }
         const nextWake = Math.min(now + waitCond.intervalMs, waitCond.deadlineTs);
         setSessionWakeAt(sessionId, nextWake);
-        // state is already sleeping-tool; keep wait_condition as-is.
         armWakeTimer(sessionId, nextWake);
         log.info(
-          `[agent] WaitForCondition ${sessionId}: not met (exit ${code}), re-sleeping until ${new Date(nextWake).toISOString()}`
+          `[agent] WaitForCondition ${sessionId}: not met (exit ${r.code}), re-sleeping until ${new Date(nextWake).toISOString()}`
         );
         return;
       } else {
-        resumeNote =
-          `[WaitForCondition] timed out: the condition did not become true before the deadline (last check exited ${code}).`;
+        resumeNote = `[WaitForCondition] timed out: the condition did not become true before the deadline (last check exited ${r.code}).`;
       }
     } catch (e) {
-      // A failure running the check itself: if before the deadline, re-sleep;
-      // otherwise resume with the error so the AI isn't stuck forever.
+      // runConditionCheck never throws, but be defensive.
       const now = Date.now();
       if (now < waitCond.deadlineTs) {
         const nextWake = Math.min(now + waitCond.intervalMs, waitCond.deadlineTs);

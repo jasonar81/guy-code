@@ -781,52 +781,76 @@ function clampPersistentWait(ms: unknown, def = 60_000): number {
   return Math.min(MAX_PERSISTENT_WAIT_MS, Math.max(100, Math.floor(n)));
 }
 
+export interface ConditionCheckResult {
+  /** Process exit code (or a sentinel if it couldn't run). */
+  code: number;
+  /**
+   * Whether the check command actually LAUNCHED and ran to completion. False
+   * means the shell/command couldn't even start (ENOENT) or timed out - a
+   * BROKEN check, which must be surfaced to the user, NOT silently treated as
+   * "condition not met yet" (which would loop forever).
+   */
+  launched: boolean;
+  /** Short detail for the broken-check case (e.g. the spawn error). */
+  detail?: string;
+}
+
 /**
- * Run a WaitForCondition check command and resolve its exit code. Used by both
- * the tool (the optional immediate first check) and the wake path in agent.ts.
- * A check that errors to spawn, or exceeds `timeoutMs`, resolves to a non-zero
- * sentinel so the caller treats it as "not met yet" (re-sleep). NEVER throws.
+ * Run a WaitForCondition check command. Resolves with the exit code AND whether
+ * it actually launched, so callers can distinguish "ran and said not-ready"
+ * from "couldn't run at all". NEVER throws.
+ *
+ * On Windows a `bash` check is routed through `wsl.exe bash -lc` (plain `bash`
+ * isn't on PATH there); on other platforms it's `bash -lc` directly.
  */
 export function runConditionCheck(
   command: string,
   cwd: string,
   shell: 'powershell' | 'bash',
   timeoutMs = 60_000
-): Promise<number> {
+): Promise<ConditionCheckResult> {
   return new Promise((resolve) => {
     let settled = false;
-    const done = (code: number) => {
+    const done = (r: ConditionCheckResult) => {
       if (settled) return;
       settled = true;
-      resolve(code);
+      resolve(r);
     };
     try {
-      const child =
-        shell === 'bash'
-          ? spawn('bash', ['-lc', command], { cwd, windowsHide: true })
-          : spawn(
-              'powershell.exe',
-              ['-NoProfile', '-NonInteractive', '-Command', command],
-              { cwd, windowsHide: true }
-            );
+      let cmd: string;
+      let args: string[];
+      if (shell === 'bash') {
+        if (process.platform === 'win32') {
+          // No direct `bash` on Windows - go through WSL (matches the WSL tool).
+          cmd = 'wsl.exe';
+          args = ['bash', '-lc', command];
+        } else {
+          cmd = 'bash';
+          args = ['-lc', command];
+        }
+      } else {
+        cmd = 'powershell.exe';
+        args = ['-NoProfile', '-NonInteractive', '-Command', command];
+      }
+      const child = spawn(cmd, args, { cwd, windowsHide: true });
       const killer = setTimeout(() => {
         try {
           child.kill();
         } catch {
           /* ignore */
         }
-        done(124); // timeout sentinel -> treated as not-met
+        done({ code: 124, launched: false, detail: `check timed out after ${timeoutMs}ms` });
       }, timeoutMs);
-      child.on('error', () => {
+      child.on('error', (e) => {
         clearTimeout(killer);
-        done(125); // spawn error sentinel -> treated as not-met
+        done({ code: 125, launched: false, detail: `could not launch ${cmd}: ${(e as Error).message}` });
       });
       child.on('close', (code) => {
         clearTimeout(killer);
-        done(typeof code === 'number' ? code : 1);
+        done({ code: typeof code === 'number' ? code : 1, launched: true });
       });
-    } catch {
-      done(125);
+    } catch (e) {
+      done({ code: 125, launched: false, detail: `spawn failed: ${(e as Error).message}` });
     }
   });
 }
@@ -1135,7 +1159,8 @@ const WAIT_FOR_CONDITION: ToolDef = {
         shell: {
           type: 'string',
           enum: ['powershell', 'bash'],
-          description: 'Which shell runs the check. Default: powershell on Windows, bash elsewhere.',
+          description:
+            'Which shell runs the check. Default: powershell on Windows, bash elsewhere. On Windows, a bash check is run through WSL (so the command + any tools it uses, e.g. curl, must be available in WSL).',
         },
         success_exit_codes: {
           type: 'array',
@@ -1171,10 +1196,16 @@ const WAIT_FOR_CONDITION: ToolDef = {
     // governor.
     if (ctx.inSubagent) {
       // Immediate check first.
-      let code = await runConditionCheck(command, cwd, shell, 60_000);
-      while (!successCodes.includes(code)) {
+      let r = await runConditionCheck(command, cwd, shell, 60_000);
+      let launchFails = r.launched ? 0 : 1;
+      while (!(r.launched && successCodes.includes(r.code))) {
+        // If the check can't even LAUNCH (broken command/shell), don't loop
+        // forever - bail with a clear error after a couple of attempts.
+        if (!r.launched && launchFails >= 2) {
+          return `WaitForCondition: the check command keeps failing to LAUNCH (${r.detail ?? 'exit ' + r.code}). It is not the condition being unmet - the command itself can't run. Fix the command or the shell (on Windows, bash runs via WSL).`;
+        }
         if (Date.now() >= deadlineTs) {
-          return `WaitForCondition: timed out - the condition did not become true before the deadline (last check exited ${code}).`;
+          return `WaitForCondition: timed out - the condition did not become true before the deadline (last check exited ${r.code}).`;
         }
         const napMs = Math.min(intervalMs, deadlineTs - Date.now());
         try {
@@ -1182,20 +1213,25 @@ const WAIT_FOR_CONDITION: ToolDef = {
         } catch {
           return `WaitForCondition: aborted`;
         }
-        code = await runConditionCheck(command, cwd, shell, 60_000);
+        r = await runConditionCheck(command, cwd, shell, 60_000);
+        if (!r.launched) launchFails++;
+        else launchFails = 0;
       }
-      return `WaitForCondition: condition met (the check exited ${code}). Continuing.`;
+      return `WaitForCondition: condition met (the check exited ${r.code}). Continuing.`;
     }
 
-    // Run the check ONCE immediately - if the condition is already met, there's
-    // no point sleeping at all; return now and let the AI continue.
-    const firstCode = await runConditionCheck(command, cwd, shell, 60_000);
-    if (successCodes.includes(firstCode)) {
+    // Run the check ONCE immediately. If it can't even launch, surface that NOW
+    // rather than setting up a wait that would just loop on a broken command.
+    const first = await runConditionCheck(command, cwd, shell, 60_000);
+    if (!first.launched) {
+      return `WaitForCondition: the check command failed to run (${first.detail ?? 'exit ' + first.code}). It can't launch, so waiting on it would loop forever. Fix the command or the shell and try again. (On Windows, a bash command runs through WSL - make sure WSL + any tools it uses, e.g. curl, are available.)`;
+    }
+    if (successCodes.includes(first.code)) {
       return {
         modelContent: [
           {
             type: 'text',
-            text: `WaitForCondition: condition already met (check exited ${firstCode}). Continuing.`,
+            text: `WaitForCondition: condition already met (check exited ${first.code}). Continuing.`,
           },
         ],
         uiSummary: `WaitForCondition: already met`,

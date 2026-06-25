@@ -988,6 +988,13 @@ export interface WaitConditionState {
   cwd: string;
   shell: 'powershell' | 'bash';
   successCodes: number[];
+  /**
+   * How many consecutive times the check command failed to LAUNCH (couldn't
+   * spawn / timed out). After a few, the wake path gives up and surfaces the
+   * broken check to the user instead of re-sleeping forever. Optional for
+   * backward compat with rows written before this field existed.
+   */
+  launchFailures?: number;
 }
 
 export interface SessionFullRow extends SessionRow {
