@@ -980,6 +980,29 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     log.warn(`[agent] turn already running for ${sessionId}; ignoring`);
     return;
   }
+  // Starting a new turn CANCELS any pending sleep/condition wait. If the user
+  // sends a fresh message while the session is sleeping in WaitForTime or
+  // WaitForCondition, that wait must be torn down - clear the persistent wait
+  // condition AND cancel the armed wake timer, or an orphaned WaitForCondition
+  // would keep re-firing in the background after the new turn starts. (A
+  // continuation wake from the wait machinery itself passes continueExisting;
+  // we still clear here, which is correct - the wait already decided to resume.)
+  {
+    const sleepTimer = wakeTimers.get(sessionId);
+    if (sleepTimer) {
+      clearTimeout(sleepTimer);
+      wakeTimers.delete(sessionId);
+    }
+    try {
+      if (getSessionWaitCondition(sessionId)) {
+        setSessionWaitCondition(sessionId, null);
+        log.info(`[agent] new turn for ${sessionId} cancelled a pending WaitForCondition`);
+      }
+      setSessionWakeAt(sessionId, null);
+    } catch (e) {
+      log.warn(`[agent] failed to clear pending wait on new turn for ${sessionId}`, e);
+    }
+  }
   const ctrl = new AbortController();
   activeRuns.set(sessionId, ctrl);
 
