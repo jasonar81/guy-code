@@ -67,6 +67,7 @@ import {
   type ApiKeyRow,
 } from './db';
 import { broadcastAgentEvent } from './agentEvents';
+import { powerMonitor } from 'electron';
 import log from 'electron-log';
 
 const MICROS_PER_USD = 1_000_000;
@@ -74,6 +75,7 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
 let _resumeTimer: NodeJS.Timeout | null = null;
+let _powerResumeHandler: (() => void) | null = null;
 /**
  * Force-resume grace map: sessionId → epoch-ms timestamp. Until that
  * timestamp, every precheck for the session ALLOWS regardless of
@@ -832,6 +834,28 @@ export function startGovernor() {
   resumeSweep().catch((e) => log.error('[budget] startup sweep error', e));
   void runSleepingToolSweep();
   void runWaitingOnSystemResume();
+
+  // When the MACHINE wakes from sleep/suspend, run the sweeps immediately.
+  // While the OS is suspended, setInterval/setTimeout are frozen, so a
+  // sleeping session whose wake time passed during suspend would otherwise sit
+  // until the next 60s tick happens to land after resume - which is how a
+  // "1 minute" sleep could look like it took an hour if the laptop was closed.
+  // Firing the sweep right on resume makes the wake land promptly. Wrapped in
+  // try/catch + an _resumeHandler guard so repeated startGovernor calls don't
+  // stack listeners.
+  if (!_powerResumeHandler) {
+    try {
+      _powerResumeHandler = () => {
+        log.info('[budget] system resumed from sleep; running sweeps now');
+        resumeSweep().catch((e) => log.error('[budget] resume-event sweep error', e));
+        void runSleepingToolSweep();
+        void runWaitingOnSystemResume();
+      };
+      powerMonitor.on('resume', _powerResumeHandler);
+    } catch (e) {
+      log.warn('[budget] could not register powerMonitor resume handler', e);
+    }
+  }
 }
 
 /**
@@ -869,5 +893,13 @@ export function stopGovernor() {
   if (_resumeTimer) {
     clearInterval(_resumeTimer);
     _resumeTimer = null;
+  }
+  if (_powerResumeHandler) {
+    try {
+      powerMonitor.removeListener('resume', _powerResumeHandler);
+    } catch {
+      /* ignore */
+    }
+    _powerResumeHandler = null;
   }
 }
