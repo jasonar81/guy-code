@@ -11,21 +11,6 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, vi } from 'vitest';
 import { cleanup } from '@testing-library/react';
 
-// happy-dom defaults to QUIRKS mode without a doctype, which makes KaTeX warn
-// and bail (blanking any component that renders math via rehype-katex - and
-// even components that just import it). Force standards mode by attaching a
-// doctype so KaTeX renders normally in tests.
-try {
-  if (typeof document !== 'undefined' && !document.doctype) {
-    document.insertBefore(
-      document.implementation.createDocumentType('html', '', ''),
-      document.documentElement
-    );
-  }
-} catch {
-  /* non-DOM test environment; ignore */
-}
-
 // React Testing Library's auto-cleanup is wired through the Jest
 // global hook; under Vitest we have to register it explicitly so DOM
 // state doesn't bleed between component tests (which produced

@@ -4,11 +4,7 @@
  * sees it inline + can click to copy/save). Guards the "Guy Code can't show
  * images" regression.
  *
- * @vitest-environment jsdom
  *
- * (jsdom rather than the default happy-dom: RichText now pulls in rehype-katex,
- * which bails in happy-dom's quirks-mode document and blanks the render. jsdom
- * uses standards mode so KaTeX is happy.)
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, fireEvent, screen } from '@testing-library/react';
