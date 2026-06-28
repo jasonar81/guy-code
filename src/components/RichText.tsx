@@ -20,7 +20,10 @@
 import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { InlineImage } from './InlineImage';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import 'katex/dist/katex.min.css';
+import { escapeCurrencyDollars } from '../lib/mathText';
 import clsx from 'clsx';
 
 interface Props {
@@ -45,12 +48,6 @@ const components = {
       className="text-accent hover:underline break-all"
     />
   ),
-
-  // Images -> render inline + clickable (lightbox with copy / save). This is
-  // how the model shows a picture in the conversation: it emits
-  // ![alt](url) with an http(s) URL, a file:// path, or a data: URL.
-  img: ({ node: _n, src, alt }: any) =>
-    src ? <InlineImage src={String(src)} alt={alt ? String(alt) : undefined} /> : null,
 
   // Paragraphs: tight spacing inside chat.
   p: ({ node: _n, ...p }: any) => (
@@ -180,29 +177,18 @@ const components = {
  */
 export function RichText({ text, className }: Props): ReactNode {
   if (!text) return null;
+  const prepared = escapeCurrencyDollars(text);
   return (
     <div className={clsx('break-words', className)}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
         // Default behavior: raw HTML in markdown is treated as plain text
         // (react-markdown doesn't parse it unless we add rehype-raw). We
         // want this — no unsanitized HTML in chat output.
         components={components}
-        // react-markdown's default urlTransform strips `data:` and `file:`
-        // URLs as "unsafe". We need them for inline images: the model shows a
-        // screenshot/generated picture via ![](data:image/png;base64,...) and
-        // local files via ![](file://...). Allow http(s)/data/file/mailto/tel;
-        // strip everything else (e.g. javascript:).
-        urlTransform={(url) => {
-          if (/^(https?:|data:image\/|file:|mailto:|tel:)/i.test(url)) return url;
-          // Relative or anchor links pass through unchanged.
-          if (/^(#|\/|\.)/.test(url)) return url;
-          // Unknown/again-unsafe scheme -> drop.
-          if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return '';
-          return url;
-        }}
       >
-        {text}
+        {prepared}
       </ReactMarkdown>
     </div>
   );

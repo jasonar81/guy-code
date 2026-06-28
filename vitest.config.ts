@@ -47,6 +47,9 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+      // happy-dom can't process a real stylesheet (and KaTeX warns/blanks the
+      // render in quirks mode), so stub out CSS imports in tests.
+      'katex/dist/katex.min.css': resolve(__dirname, 'tests/stubs/empty-css.ts'),
     },
   },
 });
