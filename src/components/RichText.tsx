@@ -22,6 +22,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import type { PluggableList } from 'unified';
 import { escapeCurrencyDollars } from '../lib/mathText';
 import clsx from 'clsx';
 
@@ -176,12 +177,17 @@ const components = {
  */
 export function RichText({ text, className }: Props): ReactNode {
   if (!text) return null;
-  const prepared = escapeCurrencyDollars(text);
+  const hasMath = text.includes('$');
+  const prepared = hasMath ? escapeCurrencyDollars(text) : text;
+  const remarkPlugins: PluggableList = hasMath ? [remarkGfm, remarkMath] : [remarkGfm];
+  const rehypePlugins: PluggableList = hasMath
+    ? [[rehypeKatex, { strict: false, throwOnError: false }]]
+    : [];
   return (
     <div className={clsx('break-words', className)}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
         // Default behavior: raw HTML in markdown is treated as plain text
         // (react-markdown doesn't parse it unless we add rehype-raw). We
         // want this — no unsanitized HTML in chat output.
