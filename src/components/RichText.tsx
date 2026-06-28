@@ -199,6 +199,19 @@ export function RichText({ text, className }: Props): ReactNode {
         // (react-markdown doesn't parse it unless we add rehype-raw). We
         // want this — no unsanitized HTML in chat output.
         components={components}
+        // react-markdown's default urlTransform strips `data:` and `file:`
+        // URLs as "unsafe". We need them for inline images: the model shows a
+        // screenshot/generated picture via ![](data:image/png;base64,...) and
+        // local files via ![](file://...). Allow http(s)/data/file/mailto/tel;
+        // strip everything else (e.g. javascript:).
+        urlTransform={(url) => {
+          if (/^(https?:|data:image\/|file:|mailto:|tel:)/i.test(url)) return url;
+          // Relative or anchor links pass through unchanged.
+          if (/^(#|\/|\.)/.test(url)) return url;
+          // Unknown/again-unsafe scheme -> drop.
+          if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return '';
+          return url;
+        }}
       >
         {prepared}
       </ReactMarkdown>
