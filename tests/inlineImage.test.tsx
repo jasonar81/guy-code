@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 /**
  * Inline-image rendering: the model shows a picture by emitting a markdown
  * image, and it must render as a real <img> with the right src (so the user

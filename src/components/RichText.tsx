@@ -20,6 +20,7 @@
 import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { InlineImage } from './InlineImage';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import type { PluggableList } from 'unified';
@@ -48,6 +49,12 @@ const components = {
       className="text-accent hover:underline break-all"
     />
   ),
+
+  // Images -> render inline + clickable (lightbox with copy / save). This is
+  // how the model shows a picture in the conversation: it emits
+  // ![alt](url) with an http(s) URL, a file:// path, or a data: URL.
+  img: ({ node: _n, src, alt }: any) =>
+    src ? <InlineImage src={String(src)} alt={alt ? String(alt) : undefined} /> : null,
 
   // Paragraphs: tight spacing inside chat.
   p: ({ node: _n, ...p }: any) => (
