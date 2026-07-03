@@ -260,6 +260,21 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     }
   );
 
+  // Per-session MODEL override. Pass a model id (e.g. 'claude-fable-5[1m]') to
+  // pin this session to that model, or null to clear the override so it follows
+  // the global default. Surfaced via the right-click "Change model" submenu.
+  ipcMain.handle('sessions:setModel', (_e, id: string, model: string | null) => {
+    if (model) setSetting(`session_model_${id}`, model);
+    else setSetting(`session_model_${id}`, '');
+    return { ok: true };
+  });
+
+  // Read a session's model override ('' / null = following the global default).
+  ipcMain.handle('sessions:getModel', (_e, id: string) => {
+    const v = getSetting(`session_model_${id}`);
+    return (v as string) || null;
+  });
+
   // Clear a queued (budget-paused) user message without auto-resuming.
   // Used when the user changes their mind about what they typed while the
   // session was sleeping and wants to discard it instead of letting the

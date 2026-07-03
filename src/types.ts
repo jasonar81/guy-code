@@ -444,6 +444,8 @@ declare global {
         setDraft: (id: string, draft: string | null) => Promise<void>;
         cancelPending: (id: string) => Promise<SessionRow[]>;
         setApiKey: (id: string, apiKeyId: string | null) => Promise<SessionRow[]>;
+        setModel: (id: string, model: string | null) => Promise<{ ok: boolean }>;
+        getModel: (id: string) => Promise<string | null>;
         setForceContinue: (
           id: string,
           on: boolean

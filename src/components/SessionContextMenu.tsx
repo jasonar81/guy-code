@@ -11,10 +11,19 @@ import {
   Star,
   Moon,
   Infinity as InfinityIcon,
+  Bot,
 } from 'lucide-react';
 import type { SessionRow } from '@/types';
 import { useApp } from '@/lib/store';
 import { sessionDisplayTitle } from '@/lib/format';
+
+// The models offered in the per-session "Change model" submenu. Ids must match
+// what the agent resolves (electron/anthropic.ts). Keep this in sync if models
+// change; "Use default" (clearing the override) always follows Settings.
+const MODEL_CHOICES: { id: string; label: string }[] = [
+  { id: 'claude-opus-4-8[1m]', label: 'Claude Opus 4.8' },
+  { id: 'claude-fable-5[1m]', label: 'Claude Fable 5' },
+];
 
 interface Props {
   session: SessionRow;
@@ -69,6 +78,11 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
   // opening a separate sub-menu — keeps the portal positioning logic
   // simple and matches the rename UX.
   const [pickingKey, setPickingKey] = useState(false);
+  // Sub-mode: picking a different model for this session (overrides the global
+  // default just for this session). `sessionModel` is the current override
+  // (null = following the global default).
+  const [pickingModel, setPickingModel] = useState(false);
+  const [sessionModel, setSessionModel] = useState<string | null>(null);
   const [draft, setDraft] = useState<string>(
     s.user_title ?? sessionDisplayTitle(s)
   );
@@ -152,6 +166,31 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
     } catch (err) {
       console.error('[setSessionApiKey] failed', err);
       alert('Setting API key failed — see DevTools console for details.');
+    }
+    onClose();
+  };
+
+  // Load the session's current model override when opening the model submenu.
+  useEffect(() => {
+    if (!pickingModel) return;
+    let cancelled = false;
+    window.api.sessions
+      .getModel(s.id)
+      .then((m) => {
+        if (!cancelled) setSessionModel(m);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pickingModel, s.id]);
+
+  const doSetModel = async (model: string | null) => {
+    try {
+      await window.api.sessions.setModel(s.id, model);
+    } catch (err) {
+      console.error('[setModel] failed', err);
+      alert('Setting model failed — see DevTools console for details.');
     }
     onClose();
   };
@@ -326,6 +365,51 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
             muted
           />
         </div>
+      ) : pickingModel ? (
+        <div className="py-1">
+          <div className="px-2 py-1.5 text-[10px] uppercase tracking-wider text-text-dim font-mono">
+            Model for this session
+          </div>
+          {MODEL_CHOICES.map((m) => {
+            const isCurrent = sessionModel === m.id;
+            return (
+              <button
+                key={m.id}
+                onClick={() => doSetModel(m.id)}
+                role="menuitem"
+                className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-bg-hover"
+              >
+                <span className="shrink-0 w-3 flex justify-center">
+                  {isCurrent ? <Check size={11} className="text-state-success" /> : null}
+                </span>
+                <span className="flex-1 min-w-0 text-text truncate">{m.label}</span>
+              </button>
+            );
+          })}
+          <div className="my-1 border-t border-border" />
+          {/* Clear the per-session override so the session follows the global
+              default model (set in Settings). */}
+          <button
+            onClick={() => doSetModel(null)}
+            role="menuitem"
+            className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-bg-hover text-text-muted"
+            title="Clear this session's model override so it uses your global default model"
+          >
+            <span className="shrink-0 w-3 flex justify-center">
+              {sessionModel == null ? (
+                <Check size={11} className="text-state-success" />
+              ) : null}
+            </span>
+            <span className="flex-1">Use default</span>
+          </button>
+          <div className="my-1 border-t border-border" />
+          <MenuItem
+            icon={<X size={12} />}
+            label="Back"
+            onClick={() => setPickingModel(false)}
+            muted
+          />
+        </div>
       ) : (
         <>
           <MenuItem
@@ -337,6 +421,11 @@ export function SessionContextMenu({ session: s, x, y, onClose }: Props) {
             icon={<KeyRound size={12} />}
             label="Change API key…"
             onClick={() => setPickingKey(true)}
+          />
+          <MenuItem
+            icon={<Bot size={12} />}
+            label="Change model…"
+            onClick={() => setPickingModel(true)}
           />
           <MenuItem
             icon={

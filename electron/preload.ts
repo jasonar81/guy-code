@@ -28,6 +28,10 @@ const api = {
       ipcRenderer.invoke('sessions:cancelPending', id),
     setApiKey: (id: string, apiKeyId: string | null) =>
       ipcRenderer.invoke('sessions:setApiKey', id, apiKeyId),
+    setModel: (id: string, model: string | null) =>
+      ipcRenderer.invoke('sessions:setModel', id, model),
+    getModel: (id: string): Promise<string | null> =>
+      ipcRenderer.invoke('sessions:getModel', id),
     setForceContinue: (id: string, on: boolean) =>
       ipcRenderer.invoke('sessions:setForceContinue', id, on),
   },

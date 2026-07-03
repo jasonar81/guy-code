@@ -1145,7 +1145,13 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       );
     }
 
-    let model = (getSetting('model') as string) || DEFAULT_MODEL;
+    // Per-session model override (set from the session's right-click menu)
+    // takes precedence over the global default, so you can try a different
+    // model on a specific session without changing your global setting.
+    let model =
+      (getSetting(`session_model_${sessionId}`) as string) ||
+      (getSetting('model') as string) ||
+      DEFAULT_MODEL;
     // Effort level for the model (output_config.effort). Defaults to xhigh
     // (DEFAULT_EFFORT). A user who sets effort to '' (or pins a model that
     // doesn't accept output_config) gets it omitted.
