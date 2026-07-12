@@ -61,3 +61,67 @@ describe('sanitizeMessages: oversized image defense', () => {
     expect(blocks.some((b) => b.type === 'image')).toBe(true);
   });
 });
+
+// A PDF's magic bytes, base64-encoded, mislabeled as image/png (the exact bug:
+// ShowImage read a .pdf and stuffed it in an image block).
+function pdfAsImageBase64(): string {
+  return Buffer.from('%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj', 'latin1').toString('base64');
+}
+
+describe('sanitizeMessages: mislabeled (non-image) data defense', () => {
+  it('drops a PDF mislabeled as an image and leaves a marker', () => {
+    const msg = {
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: 'here' },
+        {
+          type: 'image' as const,
+          source: { type: 'base64' as const, media_type: 'image/png' as const, data: pdfAsImageBase64() },
+        },
+      ],
+    };
+    const out = sanitizeMessages([msg]);
+    const blocks = out[0].content as any[];
+    expect(blocks.some((b) => b.type === 'image')).toBe(false);
+    expect(blocks.some((b) => b.type === 'text' && /not a displayable image/i.test(b.text))).toBe(true);
+    expect(blocks.some((b) => b.type === 'text' && b.text === 'here')).toBe(true);
+  });
+
+  it('drops a mislabeled image nested inside a tool_result (the ShowImage case)', () => {
+    // A realistic pair: assistant tool_use (ShowImage) then the user tool_result
+    // carrying the mislabeled image (so no unpaired-tool_result pass drops it).
+    const assistant = {
+      role: 'assistant' as const,
+      content: [{ type: 'tool_use' as const, id: 'toolu_x', name: 'ShowImage', input: {} }],
+    };
+    const user = {
+      role: 'user' as const,
+      content: [
+        {
+          type: 'tool_result' as const,
+          tool_use_id: 'toolu_x',
+          content: [
+            { type: 'text' as const, text: 'Image: my note' },
+            {
+              type: 'image' as const,
+              source: { type: 'base64' as const, media_type: 'image/png' as const, data: pdfAsImageBase64() },
+            },
+          ],
+        },
+      ],
+    };
+    const out = sanitizeMessages([assistant, user]);
+    const userOut = out.find((m) => m.role === 'user')!;
+    const tr = (userOut.content as any[])[0];
+    expect(tr.type).toBe('tool_result');
+    expect(tr.content.some((b: any) => b.type === 'image')).toBe(false);
+    // the text part is preserved
+    expect(tr.content.some((b: any) => b.type === 'text' && b.text === 'Image: my note')).toBe(true);
+  });
+
+  it('keeps a real PNG image untouched', () => {
+    const out = sanitizeMessages([imageMsg(100, 100)]);
+    const blocks = out[0].content as any[];
+    expect(blocks.some((b) => b.type === 'image')).toBe(true);
+  });
+});

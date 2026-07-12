@@ -2397,6 +2397,29 @@ async function appBackendFor(appId: string) {
   return appBackendForMode(mode);
 }
 
+/**
+ * Detect a supported image format from a buffer's magic bytes, or null if it
+ * isn't one of the image types the API accepts. Used so ShowImage never labels
+ * a non-image (e.g. a PDF) as an image, and the send-path sanitizer can drop
+ * mislabeled image blocks.
+ */
+export function detectImageType(
+  buf: Buffer
+): 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | null {
+  if (buf.length < 12) return null;
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (buf.slice(0, 8).toString('hex') === '89504e470d0a1a0a') return 'image/png';
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  // GIF: "GIF87a" / "GIF89a"
+  if (buf.slice(0, 6).toString('latin1') === 'GIF87a' || buf.slice(0, 6).toString('latin1') === 'GIF89a')
+    return 'image/gif';
+  // WEBP: "RIFF"...."WEBP"
+  if (buf.slice(0, 4).toString('latin1') === 'RIFF' && buf.slice(8, 12).toString('latin1') === 'WEBP')
+    return 'image/webp';
+  return null;
+}
+
 const SHOW_IMAGE: ToolDef = {
   schema: {
     name: 'ShowImage',
@@ -2438,6 +2461,28 @@ const SHOW_IMAGE: ToolDef = {
     if (buf.length > 8 * 1024 * 1024) {
       return { modelContent: [{ type: 'text', text: `error: image too large (${Math.round(buf.length / 1024)}KB). Resize it first.` }], uiSummary: 'ShowImage too large' } as any;
     }
+    // Validate the ACTUAL bytes are a supported image. The extension / content-
+    // type can lie (e.g. a .pdf, or a mislabeled file): sending a non-image as
+    // an image block makes the API reject the request ("Could not process
+    // image") on EVERY subsequent turn, wedging the session. Detect the real
+    // format from the magic bytes and refuse anything that isn't an image.
+    const detected = detectImageType(buf);
+    if (!detected) {
+      const sniff = buf.slice(0, 5).toString('latin1').replace(/[^ -~]/g, '.');
+      const hint = sniff.startsWith('%PDF') ? ' (that looks like a PDF, not an image)' : '';
+      return {
+        modelContent: [
+          {
+            type: 'text',
+            text: `error: ShowImage can only display images (png/jpeg/gif/webp). "${path || url}" is not a supported image${hint}. Convert it to an image first (e.g. render a PDF page to PNG), then show that.`,
+          },
+        ],
+        uiSummary: 'ShowImage: not an image',
+      } as any;
+    }
+    // Trust the detected type over the extension/header so the media_type
+    // always matches the actual bytes.
+    mediaType = detected;
     return {
       modelContent: [
         { type: 'text', text: input.alt ? `Image: ${String(input.alt)}` : 'Image shown inline.' },

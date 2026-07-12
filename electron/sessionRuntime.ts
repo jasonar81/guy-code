@@ -173,6 +173,28 @@ function readAllUtf8(path: string): string {
 const MAX_IMAGE_DIMENSION_PX = 2000;
 
 /**
+ * Whether base64 data really is a supported image (png/jpeg/gif/webp) by its
+ * magic bytes. Guards against non-image data (e.g. a PDF) that was mislabeled
+ * as an image, which the API rejects with "Could not process image".
+ */
+function dataIsRealImage(dataB64: string): boolean {
+  try {
+    const head = Buffer.from(dataB64.slice(0, 24), 'base64');
+    if (head.length < 12) return false;
+    if (head.slice(0, 8).toString('hex') === '89504e470d0a1a0a') return true; // PNG
+    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return true; // JPEG
+    const s6 = head.slice(0, 6).toString('latin1');
+    if (s6 === 'GIF87a' || s6 === 'GIF89a') return true; // GIF
+    if (head.slice(0, 4).toString('latin1') === 'RIFF' && head.slice(8, 12).toString('latin1') === 'WEBP')
+      return true; // WEBP
+    return false;
+  } catch {
+    // If we can't even decode it, treat it as not-a-real-image (safer to drop).
+    return false;
+  }
+}
+
+/**
  * Read an image's pixel dimensions from its header bytes (no decode / no
  * library) and report whether either side exceeds the limit. Supports PNG,
  * GIF, and JPEG. Unknown formats return false (we don't block what we can't
@@ -302,30 +324,64 @@ export function sanitizeMessages(
   // slipped through (imports, older sessions, a future code path). We can't
   // re-encode here without an image library, so we drop the oversized image
   // and leave a short text marker in its place.
+  // Also drops image blocks whose base64 data is NOT actually a supported image
+  // (png/jpeg/gif/webp) - e.g. a PDF that ShowImage mislabeled as image/png.
+  // Such a block makes the API reject the request ("Could not process image")
+  // on every turn, wedging the session exactly like the oversized case. This
+  // applies to top-level image blocks AND images nested inside tool_result
+  // content (where ShowImage results live).
   {
-    let droppedAny = false;
+    let droppedOversized = false;
+    let droppedBad = false;
+    // Returns a replacement text block if `b` is a bad/oversized image, else null.
+    const badImageReplacement = (b: any): { type: 'text'; text: string } | null => {
+      if (b?.type !== 'image' || b.source?.type !== 'base64' || typeof b.source.data !== 'string') {
+        return null;
+      }
+      if (!dataIsRealImage(b.source.data)) {
+        droppedBad = true;
+        return { type: 'text', text: '[image removed: the file was not a displayable image]' };
+      }
+      if (imageExceedsLimit(b.source.media_type, b.source.data)) {
+        droppedOversized = true;
+        return { type: 'text', text: '[image removed: exceeded the 2000px size limit]' };
+      }
+      return null;
+    };
+    const sanitizeBlocks = (blocks: any[]): { blocks: any[]; touched: boolean } => {
+      let touched = false;
+      const out = blocks.map((b) => {
+        const rep = badImageReplacement(b);
+        if (rep) {
+          touched = true;
+          return rep;
+        }
+        // Recurse into tool_result content (ShowImage images live here).
+        if (b?.type === 'tool_result' && Array.isArray(b.content)) {
+          const inner = sanitizeBlocks(b.content);
+          if (inner.touched) {
+            touched = true;
+            // Never leave a tool_result with an empty content array.
+            const content = inner.blocks.length
+              ? inner.blocks
+              : [{ type: 'text', text: '[image removed]' }];
+            return { ...b, content };
+          }
+        }
+        return b;
+      });
+      return { blocks: out, touched };
+    };
     messages = messages.map((m) => {
       if (typeof m.content === 'string' || !Array.isArray(m.content)) return m;
-      let touched = false;
-      const out: any[] = [];
-      for (const b of m.content as any[]) {
-        if (
-          b?.type === 'image' &&
-          b.source?.type === 'base64' &&
-          typeof b.source.data === 'string' &&
-          imageExceedsLimit(b.source.media_type, b.source.data)
-        ) {
-          touched = true;
-          droppedAny = true;
-          out.push({ type: 'text', text: '[image removed: exceeded the 2000px size limit]' });
-        } else {
-          out.push(b);
-        }
-      }
-      return touched ? { ...m, content: out as any } : m;
+      const res = sanitizeBlocks(m.content as any[]);
+      return res.touched ? { ...m, content: res.blocks as any } : m;
     });
-    if (droppedAny) {
+    if (droppedOversized) {
       log.warn('[sessionRuntime] dropped oversized image(s) (>2000px) from outbound history');
+    }
+    if (droppedBad) {
+      log.warn('[sessionRuntime] dropped non-image data mislabeled as an image from outbound history');
     }
   }
 
