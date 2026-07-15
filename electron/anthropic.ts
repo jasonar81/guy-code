@@ -559,9 +559,118 @@ export async function streamMessage(args: StreamArgs): Promise<Anthropic.Message
     headers: { 'anthropic-beta': betas.join(',') },
   });
 
+  // Runaway-repetition guard. Models occasionally degenerate into emitting the
+  // same short token/line over and over (observed: a stray "court" token that
+  // looped 16000x, ballooning one message to 112KB and making the session
+  // unusable). Watch the streamed text; if the tail is clearly a degenerate
+  // loop, abort the stream early so it can't run away. We only track a bounded
+  // tail so this is cheap.
+  let streamedText = '';
+  let repetitionAborted = false;
+
   for await (const event of stream) {
+    if (
+      event.type === 'content_block_delta' &&
+      (event as any).delta?.type === 'text_delta'
+    ) {
+      streamedText += (event as any).delta.text as string;
+      // Only start checking once there's enough text to be a real loop, and
+      // check on a cadence (not every token) to keep it cheap.
+      if (streamedText.length > 2000 && streamedText.length % 512 < 64) {
+        if (isRunawayRepetition(streamedText)) {
+          repetitionAborted = true;
+          try {
+            stream.abort();
+          } catch {
+            /* ignore */
+          }
+          break;
+        }
+      }
+    }
     onEvent(event);
   }
 
+  if (repetitionAborted) {
+    // The model got stuck repeating itself. Return a synthetic final message
+    // with the (truncated) text so the turn ends cleanly instead of the
+    // half-streamed message wedging the session. Strip the degenerate tail.
+    const cleaned = trimRepetitiveTail(streamedText);
+    return {
+      id: 'msg_repetition_aborted',
+      type: 'message',
+      role: 'assistant',
+      model,
+      content: [
+        {
+          type: 'text',
+          text:
+            (cleaned ? cleaned + '\n\n' : '') +
+            '[Guy Code stopped this response: the model got stuck repeating itself.]',
+        },
+      ],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    } as unknown as Anthropic.Message;
+  }
+
   return await stream.finalMessage();
+}
+
+/**
+ * Detect a runaway repetition loop in streamed text (model degeneration).
+ * Returns true when the recent tail is overwhelmingly the same short token or
+ * line repeated - the signature of a stuck model. Conservative: requires a
+ * long, highly-uniform tail so it never trips on legitimate repetitive content
+ * like tables or lists.
+ */
+export function isRunawayRepetition(text: string): boolean {
+  // Look at the tail only (a loop shows up there; the head may be real output).
+  const tail = text.slice(-4000);
+  // (a) Same non-empty line repeated many times in a row.
+  const linesRaw = tail.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  if (linesRaw.length >= 20) {
+    const counts = new Map<string, number>();
+    for (const l of linesRaw) counts.set(l, (counts.get(l) || 0) + 1);
+    let topLine = '';
+    let topN = 0;
+    for (const [l, n] of counts) if (n > topN) { topN = n; topLine = l; }
+    // A short line repeated for >=90% of the tail's lines = degenerate.
+    if (topLine.length <= 40 && topN >= 20 && topN / linesRaw.length >= 0.9) return true;
+  }
+  // (b) Same short whitespace-delimited token repeated for most of the tail.
+  const toks = tail.split(/\s+/).filter(Boolean);
+  if (toks.length >= 40) {
+    const counts = new Map<string, number>();
+    for (const t of toks) counts.set(t, (counts.get(t) || 0) + 1);
+    let topTok = '';
+    let topN = 0;
+    for (const [t, n] of counts) if (n > topN) { topN = n; topTok = t; }
+    if (topTok.length <= 24 && topN / toks.length >= 0.9) return true;
+  }
+  return false;
+}
+
+/**
+ * Trim a degenerate repetitive tail off text, keeping the meaningful head.
+ * Cuts at the point where the runaway repetition begins.
+ */
+export function trimRepetitiveTail(text: string): string {
+  const lines = text.split('\n');
+  // Walk from the end; drop the trailing run of short, identical/near-empty
+  // lines that make up the loop.
+  let end = lines.length;
+  const isNoise = (l: string) => {
+    const t = l.trim();
+    return t.length === 0 || t.length <= 24;
+  };
+  // Find the last "real" (long) line; keep everything up to and including it.
+  let lastReal = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!isNoise(lines[i])) { lastReal = i; break; }
+  }
+  if (lastReal >= 0) end = lastReal + 1;
+  else end = Math.min(lines.length, 5); // no real line found; keep a little
+  return lines.slice(0, end).join('\n').trim();
 }
