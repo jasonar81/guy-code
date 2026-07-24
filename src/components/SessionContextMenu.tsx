@@ -21,7 +21,7 @@ import { sessionDisplayTitle } from '@/lib/format';
 // what the agent resolves (electron/anthropic.ts). Keep this in sync if models
 // change; "Use default" (clearing the override) always follows Settings.
 const MODEL_CHOICES: { id: string; label: string }[] = [
-  { id: 'claude-opus-4-8[1m]', label: 'Claude Opus 4.8' },
+  { id: 'claude-opus-5[1m]', label: 'Claude Opus 5' },
   { id: 'claude-fable-5[1m]', label: 'Claude Fable 5' },
 ];
 

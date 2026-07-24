@@ -18,7 +18,7 @@ vi.mock('electron-log', () => ({
 beforeEach(() => createMock.mockReset());
 
 const base = {
-  strongModel: 'claude-opus-4-8[1m]',
+  strongModel: 'claude-opus-5[1m]',
   cheapModel: 'claude-sonnet-4-6',
   apiKeyId: null,
 };
@@ -37,7 +37,7 @@ describe('classifyTurn', () => {
     createMock.mockResolvedValue({ content: [{ type: 'text', text: '{"tier":"strong","reason":"multi-file refactor"}' }] });
     const d = await classifyTurn({ ...base, userText: 'refactor this 5-file module to fix the race condition' });
     expect(d.tier).toBe('strong');
-    expect(d.model).toBe('claude-opus-4-8[1m]');
+    expect(d.model).toBe('claude-opus-5[1m]');
   });
 
   it('stays strong on a continuation round (empty userText) without calling the router', async () => {
@@ -97,8 +97,8 @@ describe('modelRouter internals', () => {
   it('rank orders haiku < sonnet < opus/fable', async () => {
     const { __testing } = await import('../electron/modelRouter');
     expect(__testing.rank('claude-haiku-4-5')).toBeLessThan(__testing.rank('claude-sonnet-4-6'));
-    expect(__testing.rank('claude-sonnet-4-6')).toBeLessThan(__testing.rank('claude-opus-4-8'));
-    expect(__testing.rank('claude-fable-5')).toBe(__testing.rank('claude-opus-4-8'));
+    expect(__testing.rank('claude-sonnet-4-6')).toBeLessThan(__testing.rank('claude-opus-5'));
+    expect(__testing.rank('claude-fable-5')).toBe(__testing.rank('claude-opus-5'));
   });
 
   it('parseDecision returns null on garbage and a tier on valid json', async () => {

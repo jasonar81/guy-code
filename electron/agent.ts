@@ -1258,7 +1258,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         onEv({
           type: 'text_delta',
           sessionId,
-          text: '_(Claude Fable 5 kept refusing in this session; using Claude Opus 4.8 for the rest of it. Switch models in Settings.)_\n\n',
+          text: '_(Claude Fable 5 kept refusing in this session; using Claude Opus 5 for the rest of it. Switch models in Settings.)_\n\n',
         });
       }
       log.info(`[agent] session ${sessionId} had a Fable refusal; using ${REFUSAL_FALLBACK_MODEL} directly`);
@@ -1748,7 +1748,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // classifier declined to generate on this particular content. It's
       // content-dependent (most turns are fine). Rather than leave a silent
       // blank "needs you" turn, transparently RETRY the same request on a
-      // fallback model (Opus 4.8) with a lighter refusal posture, and mark the
+      // fallback model (Opus 5) with a lighter refusal posture, and mark the
       // fallback visibly so the user knows it happened.
       //
       // 'refusal' is a real runtime stop_reason but isn't in our pinned SDK's
@@ -1769,7 +1769,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         setSetting(`session_refused_${sessionId}`, '1');
         const note =
           `_(Claude Fable 5 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
-          `retrying on Claude Opus 4.8.)_\n\n`;
+          `retrying on Claude Opus 5.)_\n\n`;
         onEv({ type: 'text_delta', sessionId, text: note });
         log.warn(
           `[agent] ${isRefusal ? 'refusal' : 'empty'} from ${model} sessionId=${sessionId} - falling back to ${REFUSAL_FALLBACK_MODEL}`
@@ -1829,7 +1829,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         } catch (fallbackErr) {
           log.error(`[agent] refusal fallback also failed: ${(fallbackErr as Error).message}`);
           const failText =
-            'Claude Fable 5 declined this turn and the automatic retry on Claude Opus 4.8 also failed. ' +
+            'Claude Fable 5 declined this turn and the automatic retry on Claude Opus 5 also failed. ' +
             'Try rephrasing, or switch the model in Settings.';
           (response.content as any) = [
             ...(Array.isArray(response.content) ? response.content : []),

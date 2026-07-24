@@ -70,25 +70,23 @@ export function resetClient(apiKeyId?: string | null): void {
 // client. Behaves like the old singleton path — uses the default key.
 void getApiKey;
 
-// Opus 4.8 with the 1M-context alias. The `[1m]` suffix follows Claude
+// Opus 5 with the 1M-context alias. The `[1m]` suffix follows Claude
 // Code's convention — we strip it before passing the real model ID to the
 // Anthropic API and turn it into the `context-1m-2025-08-07` beta header.
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-// Claude Opus 4.8 is the default. (Claude Fable 5 was the default for a while,
-// but Anthropic has disabled it again, so a Fable default would hard-fail. Opus
-// 4.8 is the reliable choice; Fable stays selectable in Settings for whenever
-// it returns.) The refusal->fallback, routing, and per-session auto-disable
-// still apply to anyone who selects Fable.
-export const DEFAULT_MODEL = 'claude-opus-4-8[1m]';
+// Claude Opus 5 is the default. (Claude Fable 5 stays selectable per-session
+// via the sidebar right-click menu; the refusal->fallback, routing, and
+// per-session auto-disable still apply to anyone who selects Fable.)
+export const DEFAULT_MODEL = 'claude-opus-5[1m]';
 
 // When Fable 5 returns stop_reason 'refusal' (an empty response from its safety
 // classifier), the agent transparently retries that turn on this fallback
 // model, which doesn't refuse legitimate coding work. The fallback is marked
 // visibly so the user knows it happened. (Only relevant when a user has
 // selected Fable 5; the default no longer refuses.)
-export const REFUSAL_FALLBACK_MODEL = 'claude-opus-4-8[1m]';
+export const REFUSAL_FALLBACK_MODEL = 'claude-opus-5[1m]';
 
 // The default `effort` level for the model. Fable 5 (and Opus 4.7/4.8) take an
 // `effort` parameter (sent as output_config.effort) that trades thoroughness

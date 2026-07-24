@@ -41,6 +41,8 @@ const TABLE: Record<string, ModelPricing> = {
   // without this the cost report would wrongly use the $5/$25 Opus default.
   'claude-fable-5': pricing(10, 50),
   'claude-mythos-5': pricing(10, 50),
+  'claude-opus-5': pricing(5, 25),
+  'claude-opus-5-1m': pricing(5, 25),
   'claude-opus-4-8': pricing(5, 25),
   'claude-opus-4-8-1m': pricing(5, 25),
   'claude-opus-4-7': pricing(5, 25),

@@ -495,6 +495,16 @@ function migrateSettings() {
     }
     setSetting('migrated.revert_fable5_disabled', '1');
   }
+
+  // Claude Opus 5 is out and is the new default. Move anyone still on the
+  // Opus 4.8 default up to Opus 5 once. (Users who deliberately picked a
+  // different global model keep it; per-session overrides are untouched.)
+  if (!getSetting('migrated.opus5_default')) {
+    if (getSetting('model') === 'claude-opus-4-8[1m]') {
+      setSetting('model', 'claude-opus-5[1m]');
+    }
+    setSetting('migrated.opus5_default', '1');
+  }
 }
 
 // ---- Schema migrations ----

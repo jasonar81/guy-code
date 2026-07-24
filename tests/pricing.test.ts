@@ -217,23 +217,23 @@ describe('Claude Fable 5 pricing + default', () => {
     expect(p.inputUsdPerMillion).not.toBe(5 * 1_000_000);
   });
 
-  it('DEFAULT_MODEL is claude-opus-4-8[1m] and DEFAULT_EFFORT is xhigh', async () => {
+  it('DEFAULT_MODEL is claude-opus-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
     const { DEFAULT_MODEL, DEFAULT_EFFORT } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-4-8[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
     expect(DEFAULT_EFFORT).toBe('xhigh');
   });
 });
 
 describe('refusal fallback config', () => {
-  it('default is opus-4-8[1m] and REFUSAL_FALLBACK_MODEL is opus-4-8[1m]', async () => {
+  it('default is opus-5[1m] and REFUSAL_FALLBACK_MODEL is opus-5[1m]', async () => {
     const { DEFAULT_MODEL, REFUSAL_FALLBACK_MODEL } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-4-8[1m]');
-    expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-4-8[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
+    expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-5[1m]');
     // Default (Fable) and fallback (Opus) differ, so a refusal actually switches.
   });
 
-  it('the fallback model is priced correctly (opus 4.8 = $5/$25)', async () => {
-    const opus = getPricing('claude-opus-4-8');
+  it('the fallback model is priced correctly (opus 5 = $5/$25)', async () => {
+    const opus = getPricing('claude-opus-5');
     expect(opus.inputUsdPerMillion).toBe(5 * 1_000_000);
     expect(opus.outputUsdPerMillion).toBe(25 * 1_000_000);
   });
