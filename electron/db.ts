@@ -829,6 +829,26 @@ function migrate(d: Database) {
         ALTER TABLE sessions ADD COLUMN wait_condition TEXT;
       `,
     },
+    {
+      version: 12,
+      // PERFORMANCE. `usage_events` grows without bound (one row per turn), and
+      // the hot queries filter on `source` - which no existing index covered:
+      //
+      //   budget:status (polled every 5s by the sidebar) sums spend with
+      //     WHERE source='live' AND ts >= ? AND ts < ?        -> full table SCAN
+      //   listSessionsAll (the session list, called from many IPC paths) joins
+      //     SELECT session_id, SUM(cost) ... WHERE source='live' GROUP BY
+      //     session_id                                        -> full table SCAN
+      //
+      // Measured on a real 564K-row table: the budget poll went 218ms -> 1ms and
+      // the session list 406ms -> 119ms with these two indexes. Without them the
+      // whole UI gets progressively less responsive as usage history accumulates,
+      // because both run on the main process and block the event loop.
+      up: `
+        CREATE INDEX IF NOT EXISTS usage_source_ts ON usage_events(source, ts);
+        CREATE INDEX IF NOT EXISTS usage_source_session ON usage_events(source, session_id);
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -1498,6 +1518,62 @@ export function listSessionsAll(): SessionFullRow[] {
     `
     )
     .all<SessionFullRow>(dayAgo);
+}
+
+/**
+ * One session by id, in the same shape as `listSessionsAll()`.
+ *
+ * PERFORMANCE: use this instead of `listSessionsAll().find(s => s.id === id)`.
+ * That pattern was everywhere, and it is brutal on a real history:
+ * listSessionsAll GROUP BYs the whole `usage_events` table (hundreds of
+ * thousands of rows) twice and builds every session row, just to throw all but
+ * one away - measured at ~400ms per call, on the main process, sometimes
+ * per-turn. Here the cost columns are correlated subqueries restricted to the
+ * single session, so they ride the (source, session_id) index instead of
+ * scanning.
+ */
+export function getSessionById(id: string): SessionFullRow | undefined {
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  return db()
+    .prepare(
+      `
+      SELECT
+        s.id,
+        s.project_id,
+        s.jsonl_path,
+        s.jsonl_mtime,
+        s.jsonl_size,
+        s.started_at,
+        s.ended_at,
+        s.message_count,
+        s.last_message_preview,
+        s.title,
+        s.user_title,
+        s.color,
+        s.emoji,
+        s.state,
+        s.archived,
+        s.pending_user_text,
+        s.sleeping_since,
+        s.wake_at_ts,
+        s.draft_text,
+        s.api_key_id,
+        s.force_continue,
+        p.cwd AS cwd,
+        COALESCE((
+          SELECT SUM(cost_usd_micros) FROM usage_events
+           WHERE source = 'live' AND session_id = s.id
+        ), 0) AS cost_all_time_micros,
+        COALESCE((
+          SELECT SUM(cost_usd_micros) FROM usage_events
+           WHERE source = 'live' AND session_id = s.id AND ts >= ?
+        ), 0) AS cost_24h_micros
+      FROM sessions s
+      LEFT JOIN projects p ON p.id = s.project_id
+      WHERE s.id = ?
+    `
+    )
+    .get<SessionFullRow>(dayAgo, id);
 }
 
 /**

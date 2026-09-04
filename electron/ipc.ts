@@ -9,6 +9,7 @@ import {
   setProjectArchived,
   listSessionsForProject,
   listSessionsAll,
+  getSessionById,
   setSessionUserTitle,
   setSessionVisuals,
   setSessionForceContinue,
@@ -148,7 +149,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
       // cancelRun already idled sleeping-tool sessions; we still do
       // this defensively for any other non-terminal state
       // (running, waiting-on-system, waiting-on-user, sleeping-budget).
-      const row = listSessionsAll().find((s) => s.id === id);
+      const row = getSessionById(id);
       const st = row?.state ?? 'idle';
       if (st !== 'idle' && st !== 'error') {
         try {
@@ -175,7 +176,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     }
     // Look up the JSONL path BEFORE deleting the row (the row carries
     // jsonl_path; once gone we wouldn't know what file to unlink).
-    const row = listSessionsAll().find((s) => s.id === id);
+    const row = getSessionById(id);
     const jsonlPath = row?.jsonl_path ?? null;
     // Always delete our own canonical copy under ~/.guycode/sessions —
     // this exists for every session we've ever loaded, regardless of
@@ -445,7 +446,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     setSessionState(sessionId, 'idle');
     // Clear pending so the resume sweep doesn't double-fire later.
     setSessionPending(sessionId, null, null);
-    const sess = listSessionsAll().find((s) => s.id === sessionId);
+    const sess = getSessionById(sessionId);
     if (!sess) return { ok: true };
     const pendingText = pending?.pending_user_text?.trim() ?? '';
     if (pendingText) {
@@ -489,7 +490,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
       // re-pause. Turning it OFF is a no-op on a running session — the next
       // budget pause will simply take effect normally.
       if (on) {
-        const sess = listSessionsAll().find((s) => s.id === sessionId);
+        const sess = getSessionById(sessionId);
         if (sess && sess.state === 'sleeping-budget') {
           const pending = getSessionPending(sessionId);
           setSessionState(sessionId, 'idle');

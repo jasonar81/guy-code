@@ -43,6 +43,7 @@ import {
   getSessionPending,
   getSessionApiKey,
   listSessionsAll,
+  getSessionById,
   listSleepingToolSessions,
   listWaitingOnSystemSessions,
   upsertSession,
@@ -257,7 +258,7 @@ export function cancelRun(sessionId: string) {
     log.info(`[agent] cancelled wake timer for sleeping-tool session ${sessionId}`);
   }
   try {
-    const row = listSessionsAll().find((s) => s.id === sessionId);
+    const row = getSessionById(sessionId);
     if (row?.state === 'sleeping-tool') {
       setSessionWakeAt(sessionId, null);
       setSessionWaitCondition(sessionId, null); // cancel any pending WaitForCondition
@@ -367,7 +368,7 @@ function armWakeTimer(sessionId: string, wakeAtTs: number) {
  * startup for sleepers whose moment passed while the app was down.
  */
 export async function wakeSleepingTool(sessionId: string) {
-  const row = listSessionsAll().find((s) => s.id === sessionId);
+  const row = getSessionById(sessionId);
   if (!row) {
     log.info(`[agent] wake skipped: session ${sessionId} not found`);
     return;

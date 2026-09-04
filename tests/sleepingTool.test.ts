@@ -67,6 +67,9 @@ vi.mock('../electron/db', () => {
   return {
     listSleepingToolSessions: () => [..._sleepers],
     listSessionsAll: () => [..._allSessions],
+    // Mirrors the real getSessionById (a single-row lookup used instead of
+    // listSessionsAll().find, which used to aggregate the whole usage table).
+    getSessionById: (id: string) => _allSessions.find((r) => r.id === id),
     setSessionState: (id: string, state: string) => {
       _setSessionStateCalls.push({ id, state });
       const row = _allSessions.find((r) => r.id === id);
