@@ -499,6 +499,9 @@ declare global {
         ) => Promise<ProjectRow[]>;
         archive: (id: string, archived: boolean) => Promise<ProjectRow[]>;
       };
+      slackBridge: {
+        test: () => Promise<{ ok: boolean; message: string }>;
+      };
       settings: {
         get: (key: string) => Promise<string | null>;
         set: (key: string, value: string) => Promise<void>;

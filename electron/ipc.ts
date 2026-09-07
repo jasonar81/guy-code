@@ -41,6 +41,7 @@ import {
 } from './budget';
 import { importClaudeProjects } from './claudeImport';
 import { listMcpServers, signInMcp, signOutMcp } from './mcp';
+import { startSlackBridge } from './slackBridge';
 import {
   hasApiKey,
   setApiKey,
@@ -314,9 +315,26 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
 
   // ---- Settings ----
   ipcMain.handle('settings:get', (_e, key: string) => getSetting(key));
-  ipcMain.handle('settings:set', (_e, key: string, value: string) =>
-    setSetting(key, value)
-  );
+  ipcMain.handle('settings:set', (_e, key: string, value: string) => {
+    const r = setSetting(key, value);
+    // The Slack remote control reads its config from settings, so re-arm the
+    // watcher whenever any of its knobs change (enable/disable, channel,
+    // interval). Cheap: it just clears + re-sets one interval.
+    if (key.startsWith('slack_bridge.') && key !== 'slack_bridge.last_ts') {
+      try {
+        startSlackBridge();
+      } catch (e) {
+        log.error('[ipc] restarting Slack bridge failed', e);
+      }
+    }
+    return r;
+  });
+
+  /** Post a test message to the configured Slack channel (Settings button). */
+  ipcMain.handle('slackBridge:test', async () => {
+    const { testSlackBridge } = await import('./slackBridge');
+    return testSlackBridge();
+  });
   ipcMain.handle('settings:list', () => listSettings());
 
   // ---- Audit log ----

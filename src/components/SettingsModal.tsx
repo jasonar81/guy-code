@@ -37,6 +37,11 @@ export function SettingsModal({ open, onClose }: Props) {
   const [model, setModel] = useState<string>(DEFAULT_MODEL);
   const [memoryRetrieval, setMemoryRetrieval] = useState<boolean>(false);
   const [routing, setRouting] = useState<boolean>(false);
+  // Slack remote control (drive Guy Code from your phone).
+  const [slackOn, setSlackOn] = useState<boolean>(false);
+  const [slackChannel, setSlackChannel] = useState<string>('');
+  const [slackPollMs, setSlackPollMs] = useState<string>('15000');
+  const [slackTestMsg, setSlackTestMsg] = useState<string | null>(null);
   const [cheapModel, setCheapModel] = useState<string>('claude-sonnet-4-6');
   const [routingFloor, setRoutingFloor] = useState<string>('');
   const [saving, setSaving] = useState(false);
@@ -79,6 +84,15 @@ export function SettingsModal({ open, onClose }: Props) {
       const rt = await window.api.settings.get('routing');
       if (cancelled) return;
       setRouting(rt === 'on'); // default off (opt-in)
+      const sbOn = await window.api.settings.get('slack_bridge.enabled');
+      if (cancelled) return;
+      setSlackOn(sbOn === '1');
+      const sbCh = await window.api.settings.get('slack_bridge.channel_id');
+      if (cancelled) return;
+      setSlackChannel(sbCh ?? '');
+      const sbMs = await window.api.settings.get('slack_bridge.poll_ms');
+      if (cancelled) return;
+      setSlackPollMs(sbMs && sbMs.trim() ? sbMs : '15000');
       const cm = await window.api.settings.get('routing.cheapModel');
       if (cancelled) return;
       setCheapModel(cm && cm.trim() ? cm : 'claude-sonnet-4-6');
@@ -291,6 +305,72 @@ export function SettingsModal({ open, onClose }: Props) {
                     className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
                     placeholder="(none)"
                   />
+                </div>
+              </div>
+            )}
+          </Field>
+
+          <Field
+            icon={<Cpu size={14} />}
+            label="Slack remote control (phone access)"
+            hint="Watch one Slack channel and treat any message starting with 'Guy, ' as a command - so you can check sessions, read output, and send input from your phone. Every other message in the channel is ignored. Most people point this at their own DM with themselves. It uses your existing Slack connection (sign in under MCP servers below). This is remote control of an agent that can run code, so it is off by default and only ever watches the one channel you name here."
+          >
+            <label className="flex items-center gap-2 text-[13px] text-text cursor-pointer">
+              <input
+                type="checkbox"
+                checked={slackOn}
+                onChange={async (e) => {
+                  setSlackOn(e.target.checked);
+                  await window.api.settings.set('slack_bridge.enabled', e.target.checked ? '1' : '');
+                }}
+              />
+              {slackOn ? 'On (watching for "Guy, ..." messages)' : 'Off'}
+            </label>
+            {slackOn && (
+              <div className="mt-2 space-y-2">
+                <div>
+                  <div className="text-[11px] text-text-dim mb-1">
+                    Channel id (a self-DM looks like <span className="font-mono">D01ABC2DEF</span>)
+                  </div>
+                  <input
+                    value={slackChannel}
+                    onChange={(e) => setSlackChannel(e.target.value)}
+                    onBlur={async () => {
+                      await window.api.settings.set('slack_bridge.channel_id', slackChannel.trim());
+                    }}
+                    className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
+                    placeholder="D01ABC2DEF"
+                  />
+                </div>
+                <div>
+                  <div className="text-[11px] text-text-dim mb-1">Check every (ms, minimum 5000)</div>
+                  <input
+                    value={slackPollMs}
+                    onChange={(e) => setSlackPollMs(e.target.value)}
+                    onBlur={async () => {
+                      await window.api.settings.set('slack_bridge.poll_ms', slackPollMs.trim());
+                    }}
+                    className="w-40 rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
+                    placeholder="15000"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="rounded-md border border-border px-2 py-1 text-[12px] text-text hover:bg-bg-hover"
+                    onClick={async () => {
+                      setSlackTestMsg('Sending...');
+                      const r = await window.api.slackBridge.test();
+                      setSlackTestMsg(r.message);
+                    }}
+                  >
+                    Send test message
+                  </button>
+                  {slackTestMsg && (
+                    <span className="text-[11px] text-text-muted">{slackTestMsg}</span>
+                  )}
+                </div>
+                <div className="text-[11px] text-text-dim">
+                  Then text yourself <span className="font-mono">Guy, help</span> to see what it can do.
                 </div>
               </div>
             )}

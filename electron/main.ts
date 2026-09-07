@@ -14,6 +14,7 @@ import { bootstrapApiKey, hasApiKey } from './secret';
 import { startGovernor, stopGovernor } from './budget';
 import { cleanupArchives } from './toolSummarizer';
 import { initMcp, shutdownMcp } from './mcp';
+import { startSlackBridge, stopSlackBridge } from './slackBridge';
 import { setAttachApprovalPrompter } from './chromeExtBridge';
 import { initAutoUpdater, shutdownAutoUpdater } from './autoUpdater';
 
@@ -248,7 +249,18 @@ app.whenReady().then(async () => {
   }
   // Fire MCP init in the background; failures are non-fatal so we don't
   // block the window. Individual servers are isolated by mcp.ts.
-  initMcp().catch((e) => log.error('[main] MCP init failed', e));
+  initMcp()
+    .catch((e) => log.error('[main] MCP init failed', e))
+    // The Slack remote control rides on the Slack MCP server, so start it
+    // once MCP is up (it's a no-op unless the user configured a channel).
+    // It also retries every poll, so a late Slack sign-in still works.
+    .finally(() => {
+      try {
+        startSlackBridge();
+      } catch (e) {
+        log.error('[main] Slack bridge start failed', e);
+      }
+    });
   // Initialize the auto-updater. In dev (`!app.isPackaged`) this is a
   // no-op — the renderer's update banner just never fires. In a
   // packaged build it kicks off the initial update check after a 30 s
@@ -331,6 +343,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   stopGovernor();
+  stopSlackBridge();
   shutdownAutoUpdater();
   shutdownMcp().catch(() => {
     /* best effort */

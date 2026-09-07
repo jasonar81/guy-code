@@ -64,6 +64,10 @@ const api = {
     archive: (id: string, archived: boolean) =>
       ipcRenderer.invoke('projects:archive', id, archived),
   },
+  slackBridge: {
+    test: (): Promise<{ ok: boolean; message: string }> =>
+      ipcRenderer.invoke('slackBridge:test'),
+  },
   settings: {
     get: (key: string) => ipcRenderer.invoke('settings:get', key),
     set: (key: string, value: string) => ipcRenderer.invoke('settings:set', key, value),
