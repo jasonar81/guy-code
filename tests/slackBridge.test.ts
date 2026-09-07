@@ -9,6 +9,13 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 // unit-test the parsing/resolution helpers.
 const _sessions: any[] = [];
 vi.mock('../electron/mcp', () => ({ invokeMcpTool: vi.fn(async () => ({ content: '{}', isError: false })) }));
+// The natural-language fallback calls a cheap model; `_llmReply` is what it
+// "says". Tests that exercise the terse fast path never reach it.
+let _llmReply = '{}';
+const _createMock = vi.fn(async () => ({ content: [{ type: 'text', text: _llmReply }] }));
+vi.mock('../electron/anthropic', () => ({
+  getClient: () => ({ messages: { create: _createMock } }),
+}));
 vi.mock('../electron/db', () => ({
   getSetting: () => null,
   setSetting: () => {},
@@ -165,10 +172,12 @@ describe('handleCommand', () => {
     expect(r).not.toMatch(/Fine/);
   });
 
-  it('unknown commands answer with help rather than failing silently', async () => {
+  it('falls back to help when even the interpreter cannot map it', async () => {
     const { handleCommand } = await import('../electron/slackBridge');
+    _llmReply = '{}'; // interpreter returns nothing usable
     const r = await handleCommand('do a barrel roll');
-    expect(r).toMatch(/Didn't understand/i);
+    expect(r).toMatch(/Not sure what you meant/i);
+    expect(r).toMatch(/status/); // help is appended
   });
 
   it('send routes to a resolvable session', async () => {
@@ -201,5 +210,87 @@ describe('handleCommand', () => {
     const { handleCommand } = await import('../electron/slackBridge');
     _sessions.push(row({ id: 's1', user_title: 'Bench' }));
     expect(await handleCommand('api key Bench Nonexistent')).toMatch(/Have: Personal/);
+  });
+
+  it('lists the API keys, marking the default', async () => {
+    const { handleCommand } = await import('../electron/slackBridge');
+    const r = await handleCommand('api keys');
+    expect(r).toMatch(/Personal/);
+    expect(r).toMatch(/default/);
+  });
+});
+
+describe('parseInterpretation', () => {
+  it('reads a command out of a JSON reply', async () => {
+    const { parseInterpretation } = await import('../electron/slackBridge');
+    expect(parseInterpretation('{"command":"needs you"}')).toEqual({ command: 'needs you' });
+  });
+
+  it('tolerates code fences and surrounding prose', async () => {
+    const { parseInterpretation } = await import('../electron/slackBridge');
+    const raw = 'Sure!\n```json\n{"command":"status"}\n```';
+    expect(parseInterpretation(raw)).toEqual({ command: 'status' });
+  });
+
+  it('reads a conversational reply when there is no command', async () => {
+    const { parseInterpretation } = await import('../electron/slackBridge');
+    expect(parseInterpretation('{"reply":"I only manage sessions."}')).toEqual({
+      reply: 'I only manage sessions.',
+    });
+  });
+
+  it('returns null on junk', async () => {
+    const { parseInterpretation } = await import('../electron/slackBridge');
+    expect(parseInterpretation('no json here')).toBeNull();
+    expect(parseInterpretation('')).toBeNull();
+  });
+});
+
+describe('plain-English requests', () => {
+  it('"which sessions need me?" runs the needs-you command', async () => {
+    const { handleCommand } = await import('../electron/slackBridge');
+    _sessions.push(
+      row({ id: '1', user_title: 'Blocked', state: 'waiting-on-user' }),
+      row({ id: '2', user_title: 'Fine', state: 'idle' })
+    );
+    _llmReply = '{"command":"needs you"}';
+    const r = await handleCommand(
+      'please give me a list of the active sessions in needs you status?'
+    );
+    expect(r).toMatch(/Blocked/);
+    expect(r).not.toMatch(/Fine/);
+  });
+
+  it('"what API keys do I have again?" lists the keys', async () => {
+    const { handleCommand } = await import('../electron/slackBridge');
+    _llmReply = '{"command":"api keys"}';
+    const r = await handleCommand('can you please tell me what API keys I have available again?');
+    expect(r).toMatch(/Personal/);
+  });
+
+  it('passes a conversational reply straight through', async () => {
+    const { handleCommand } = await import('../electron/slackBridge');
+    _llmReply = '{"reply":"I manage Guy Code sessions - ask me about those."}';
+    const r = await handleCommand('what is the weather in Chicago');
+    expect(r).toMatch(/I manage Guy Code sessions/);
+  });
+
+  it('does NOT call the interpreter for terse commands (fast path stays free)', async () => {
+    const { handleCommand } = await import('../electron/slackBridge');
+    _createMock.mockClear();
+    _sessions.push(row({ id: '1', user_title: 'A', state: 'idle' }));
+    await handleCommand('status');
+    expect(_createMock).not.toHaveBeenCalled();
+  });
+
+  it('an interpreted command cannot recurse into the interpreter again', async () => {
+    const { handleCommand } = await import('../electron/slackBridge');
+    // The interpreter returns something that still won't match any command.
+    _llmReply = '{"command":"still not a real command"}';
+    _createMock.mockClear();
+    const r = await handleCommand('do something vague');
+    expect(r).toMatch(/Didn't understand/i);
+    // Exactly one interpreter call - the re-entry runs with interpretation off.
+    expect(_createMock).toHaveBeenCalledTimes(1);
   });
 });

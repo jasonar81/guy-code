@@ -16,6 +16,7 @@
 import log from 'electron-log';
 import { randomUUID } from 'node:crypto';
 import { invokeMcpTool } from './mcp';
+import { getClient } from './anthropic';
 import {
   getSetting,
   setSetting,
@@ -217,9 +218,14 @@ const HELP = [
   '• `force continue <session> on|off`',
   '• `api key <session> <key name>`',
   '• `archive <session>`',
+  '• `api keys` - list your API keys',
+  '• `unarchive <session>`',
   '• `help`',
   '',
   '`<session>` can be a name (or part of one) or an id prefix.',
+  '',
+  "You don't need this exact syntax - plain English works too, e.g.",
+  '“which sessions need me?” or “what API keys do I have?”',
 ].join('\n');
 
 const NEEDS_YOU = new Set(['waiting-on-user', 'error']);
@@ -274,7 +280,15 @@ export function parseSince(text: string): number | null {
   return Date.now() - n * mult;
 }
 
-export async function handleCommand(command: string): Promise<string> {
+/**
+ * Run one command. Terse syntax (`status`, `send X hi`) is matched by regex -
+ * free and instant. Anything else is handed to a cheap model that rewrites it
+ * into terse syntax and we re-run that; `allowInterpret` stops recursion.
+ */
+export async function handleCommand(
+  command: string,
+  allowInterpret = true
+): Promise<string> {
   const cmd = command.trim();
   const lower = cmd.toLowerCase();
   if (!cmd || lower === 'help' || lower === '?') return HELP;
@@ -310,8 +324,30 @@ export async function handleCommand(command: string): Promise<string> {
     return l.length ? `${l.length} idle:\n` + l.map(line).join('\n') : 'No idle sessions.';
   }
 
+  // ---- api keys (list) ----
+  if (/^(?:api\s*keys?|keys)$/i.test(lower) || /^list\s+(?:api\s*)?keys$/i.test(lower)) {
+    const keys = listApiKeys();
+    if (!keys.length) return 'No API keys configured.';
+    const def = getDefaultApiKeyId();
+    return (
+      `${keys.length} API key${keys.length === 1 ? '' : 's'}:\n` +
+      keys
+        .map((k: any) => `• ${k.name}${k.id === def ? '  _(default)_' : ''}`)
+        .join('\n')
+    );
+  }
+
+  // ---- unarchive <session> ----
+  let m = cmd.match(/^unarchive\s+(.+)$/i) || cmd.match(/^restore\s+(.+)$/i);
+  if (m) {
+    const { session, error } = resolveSession(rows, m[1]);
+    if (error) return error;
+    setSessionArchived(session!.id, false);
+    return `Restored *${label(session!)}* from the archive.`;
+  }
+
   // ---- new session <name> ----
-  let m = cmd.match(/^new\s+session\s+(.+)$/i) || cmd.match(/^new\s+(.+)$/i);
+  m = cmd.match(/^new\s+session\s+(.+)$/i) || cmd.match(/^new\s+(.+)$/i);
   if (m) {
     const name = m[1].trim();
     const id = randomUUID();
@@ -442,7 +478,116 @@ export async function handleCommand(command: string): Promise<string> {
     return `Archived *${label(session!)}*.`;
   }
 
-  return `Didn't understand "${cmd}".\n\n${HELP}`;
+  // ---- nothing matched the terse syntax: interpret it as plain English ----
+  // Everything above is a free, instant regex match. Anything else (a real
+  // sentence like "can you tell me which sessions need me?") goes to a cheap
+  // model that translates it into one of the commands above, which we then run.
+  if (!allowInterpret) {
+    return `Didn't understand "${cmd}".\n\n${HELP}`;
+  }
+  const interpreted = await interpretCommand(cmd, rows);
+  if (interpreted.command) {
+    log.info(`[slackBridge] interpreted "${cmd}" as "${interpreted.command}"`);
+    // Re-enter with the canonical command. `interpretCommand` never returns a
+    // sentence (only canonical syntax), so this can't loop.
+    const out = await handleCommand(interpreted.command, /*allowInterpret=*/ false);
+    return out;
+  }
+  return (
+    (interpreted.reply ? interpreted.reply + '\n\n' : `Not sure what you meant by "${cmd}".\n\n`) +
+    HELP
+  );
+}
+
+/** Cheap model used to translate plain English into a command. */
+const INTERPRETER_MODEL = 'claude-haiku-4-5';
+
+/**
+ * Translate a plain-English request ("can you tell me which sessions need
+ * me?") into one of the terse commands. Runs on a cheap model with the user's
+ * DEFAULT api key, and is only reached when the regex fast-path didn't match,
+ * so normal terse usage costs nothing.
+ *
+ * Returns `{command}` to execute, or `{reply}` to say something back when the
+ * request isn't actionable. Never throws - on any failure the caller falls
+ * back to printing help.
+ */
+export async function interpretCommand(
+  text: string,
+  rows: SessionFullRow[]
+): Promise<{ command?: string; reply?: string }> {
+  // Give the model the live session names so "the VLDB one" resolves to a real
+  // reference. Keep it small: names only, non-archived first.
+  const names = rows
+    .filter((s) => s.archived === 0)
+    .slice(0, 60)
+    .map((s) => `${label(s)} [${s.state}]`)
+    .join('; ');
+  const system = [
+    'You translate a user\'s plain-English request into ONE command for a coding-agent manager.',
+    'Respond with ONLY a JSON object and nothing else.',
+    'If the request maps to a command: {"command":"<the command>"}',
+    'If it does not map to any command (or is just chit-chat): {"reply":"<a short friendly answer>"}',
+    '',
+    'Available commands (use EXACTLY this syntax):',
+    'status                       -> counts + all live sessions',
+    'needs you                    -> sessions waiting on the user',
+    'running                      -> sessions currently working',
+    'idle                         -> idle sessions',
+    'api keys                     -> list the configured API keys',
+    'output <session> since <N>m  -> recent transcript ("since" optional)',
+    'send <session> <text>        -> send input/instructions to a session',
+    'new session <name>           -> create a session',
+    'idle <session>               -> stop/park a session',
+    'force continue <session> on|off',
+    'api key <session> <key name> -> change a session\'s API key',
+    'archive <session>            -> archive it',
+    'unarchive <session>          -> restore it',
+    '',
+    'Rules: <session> must be a name or id-prefix the user referred to; pass it through as they said it.',
+    'Prefer the most specific matching command. Never invent commands or flags.',
+    names ? `Current sessions: ${names}` : 'There are no active sessions right now.',
+  ].join('\n');
+
+  try {
+    const client = getClient(getDefaultApiKeyId());
+    const resp = await client.messages.create({
+      model: INTERPRETER_MODEL,
+      max_tokens: 300,
+      system,
+      messages: [{ role: 'user', content: text.slice(0, 2000) }],
+    });
+    const raw = (resp.content || [])
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('')
+      .trim();
+    const parsed = parseInterpretation(raw);
+    if (!parsed) return {};
+    return parsed;
+  } catch (e) {
+    log.warn(`[slackBridge] interpret failed: ${(e as Error).message}`);
+    return {};
+  }
+}
+
+/** Pull the JSON object out of a model reply (tolerates code fences / prose). */
+export function parseInterpretation(
+  raw: string
+): { command?: string; reply?: string } | null {
+  if (!raw) return null;
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]);
+    const command = typeof o.command === 'string' ? o.command.trim() : '';
+    const reply = typeof o.reply === 'string' ? o.reply.trim() : '';
+    if (command) return { command };
+    if (reply) return { reply };
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** Best-effort text extraction from a stored message record. */
