@@ -14,6 +14,11 @@ import {
 import { Loader2, RefreshCw, Plus, Settings, ScrollText, ChevronDown, Check, Star } from 'lucide-react';
 import type { SessionRow, ProjectState, BudgetStatus, ApiKey } from '@/types';
 
+// PERF: how many idle/archived session rows to mount at once. This list is
+// not virtualized, and a long history has 1000+ archived sessions - mounting
+// them all freezes the UI. The user can page in more.
+const IDLE_PAGE = 50;
+
 const FILTERS: { v: SidebarFilter; label: string; title: string }[] = [
   { v: 'active', label: 'Active', title: 'Hide archived (default)' },
   { v: 'all', label: 'All', title: 'Show every session' },
@@ -90,6 +95,15 @@ export function Sidebar() {
     return allSessions.filter((s) => s.archived === 0);
   }, [allSessions, filter]);
 
+  // PERF: cap how many idle rows we actually mount. With a long history the
+  // Archived filter has ~1000+ rows, and this list isn't virtualized - mounting
+  // them all locks the UI for seconds. Render a bounded window and let the user
+  // ask for more. `idleShown` resets when the filter changes.
+  const [idleShown, setIdleShown] = useState(IDLE_PAGE);
+  useEffect(() => {
+    setIdleShown(IDLE_PAGE);
+  }, [filter]);
+
   const groups = useMemo(() => {
     const needs: SessionRow[] = [];
     const running: SessionRow[] = [];
@@ -102,8 +116,15 @@ export function Sidebar() {
     needs.sort((a, b) => (sessionLastTs(a) ?? 0) - (sessionLastTs(b) ?? 0));
     running.sort((a, b) => (sessionLastTs(b) ?? 0) - (sessionLastTs(a) ?? 0));
     idle.sort((a, b) => (sessionLastTs(b) ?? 0) - (sessionLastTs(a) ?? 0));
-    return { needs, running, idle, idleByDate: groupByDate(idle) };
-  }, [sessions]);
+    const idleVisible = idle.slice(0, idleShown);
+    return {
+      needs,
+      running,
+      idle,
+      idleHidden: Math.max(0, idle.length - idleVisible.length),
+      idleByDate: groupByDate(idleVisible),
+    };
+  }, [sessions, idleShown]);
 
   const total24h = useMemo(
     () => sessions.reduce((sum, s) => sum + s.cost_24h_micros, 0),
@@ -185,16 +206,28 @@ export function Sidebar() {
           {groups.idle.length === 0 ? (
             <div className="px-3 py-2 text-[11px] text-text-dim italic">No idle sessions.</div>
           ) : (
-            groups.idleByDate.map((g) => (
-              <div key={g.label} className="select-none">
-                <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-text-dim font-mono">
-                  {g.label}
+            <>
+              {groups.idleByDate.map((g) => (
+                <div key={g.label} className="select-none">
+                  <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-text-dim font-mono">
+                    {g.label}
+                  </div>
+                  {g.rows.map((s) => (
+                    <SessionListRow key={s.id} session={s} />
+                  ))}
                 </div>
-                {g.rows.map((s) => (
-                  <SessionListRow key={s.id} session={s} />
-                ))}
-              </div>
-            ))
+              ))}
+              {groups.idleHidden > 0 && (
+                <button
+                  className="w-full px-3 py-2 text-[11px] text-text-muted hover:text-text hover:bg-bg-hover text-left"
+                  onClick={() => setIdleShown((n) => n + IDLE_PAGE)}
+                  title="This list isn't virtualized, so rows are shown in pages to keep the UI responsive"
+                >
+                  Show {Math.min(groups.idleHidden, IDLE_PAGE)} more
+                  <span className="text-text-dim"> ({groups.idleHidden} hidden)</span>
+                </button>
+              )}
+            </>
           )}
         </Section>
       </div>

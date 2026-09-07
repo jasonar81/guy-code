@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import clsx from 'clsx';
 import { Archive, ArchiveRestore, Infinity as InfinityIcon } from 'lucide-react';
 import type { SessionRow } from '@/types';
@@ -15,8 +15,14 @@ interface Props {
 /**
  * One session = one row. The user's primary unit of attention.
  * Compact; cost pills + state glyph + title; cwd shown only when toggled.
+ *
+ * PERF: exported wrapped in React.memo (see the bottom of this file). The
+ * sessions array is replaced wholesale on every refresh, so without memo every
+ * visible row re-renders on every store update - which, with agent events
+ * streaming in, is constant. The row only depends on its own session object
+ * (plus narrow store selectors), so a reference-equal session can skip.
  */
-export function SessionListRow({ session: s, showCwd = false }: Props) {
+function SessionListRowImpl({ session: s, showCwd = false }: Props) {
   const active = useApp((st) => st.activeSessionId === s.id);
   const setActive = useApp((st) => st.setActive);
   const archive = useApp((st) => st.archive);
@@ -153,3 +159,9 @@ export function SessionListRow({ session: s, showCwd = false }: Props) {
     </div>
   );
 }
+
+/**
+ * Memoized row. Re-renders only when its own `session` object (or showCwd)
+ * actually changes, not every time the sessions array is rebuilt.
+ */
+export const SessionListRow = memo(SessionListRowImpl);

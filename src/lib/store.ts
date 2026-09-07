@@ -388,6 +388,12 @@ function readInitialBudgetFilter(): string | null {
   }
 }
 
+// Coalescing state for refreshSessions (see its implementation): one refresh in
+// flight at a time, with at most one trailing re-run for requests that arrive
+// while it's busy. Module-level so it's shared by every caller.
+let _refreshInFlight: Promise<void> | null = null;
+let _refreshQueued = false;
+
 export const useApp = create<AppState>((set, get) => ({
   sessions: [],
   activeSessionId: null,
@@ -402,8 +408,32 @@ export const useApp = create<AppState>((set, get) => ({
   setSessions: (sessions) => set({ sessions }),
 
   refreshSessions: async () => {
-    const sessions = await window.api.sessions.listAll();
-    set({ sessions });
+    // PERF: this is an expensive round trip - listSessionsAll aggregates the
+    // usage table and returns EVERY session row (hundreds of KB once you have
+    // real history), and the result replaces the whole sessions array. Agent
+    // events can ask for it many times in a burst (several sessions finishing
+    // turns, budget transitions, etc.), so coalesce: at most one in-flight
+    // refresh, and if requests arrive while one is running, do exactly one more
+    // afterwards. Callers can still `await` it.
+    if (_refreshInFlight) {
+      _refreshQueued = true;
+      return _refreshInFlight;
+    }
+    const run = async (): Promise<void> => {
+      try {
+        const sessions = await window.api.sessions.listAll();
+        set({ sessions });
+      } finally {
+        _refreshInFlight = null;
+        if (_refreshQueued) {
+          _refreshQueued = false;
+          // Trailing refresh for anything that asked while we were busy.
+          void get().refreshSessions();
+        }
+      }
+    };
+    _refreshInFlight = run();
+    return _refreshInFlight;
   },
 
   setActive: (id) => {
@@ -809,6 +839,9 @@ export const useApp = create<AppState>((set, get) => ({
       const sid = e.sessionId;
       const cur = s.chats[sid] ?? emptyChat();
       const next = { ...cur };
+      // Set by the `usage` case to bump ONE session row's cost in place,
+      // instead of refetching every session (see that case for why).
+      let sessionsCostPatch: { id: string; deltaMicros: number } | null = null;
       switch (e.type) {
         case 'turn_start': {
           next.streaming = true;
@@ -987,8 +1020,17 @@ export const useApp = create<AppState>((set, get) => ({
         }
         case 'usage':
           next.liveTurnCostMicros = next.liveTurnCostMicros + e.costUsdMicros;
-          // refresh sidebar costs asynchronously
-          setTimeout(() => get().refreshSessions(), 0);
+          // PERF: a `usage` event fires on EVERY api call. This used to call
+          // refreshSessions(), which re-runs listSessionsAll (aggregating the
+          // whole usage table), ships every session row over IPC (~hundreds of
+          // KB with a real history), and replaces the entire sessions array so
+          // every row re-renders. With a few sessions running that alone made
+          // the UI stutter and go "Not Responding".
+          //
+          // The event already tells us which session spent what, so patch that
+          // one row's cost locally instead. The authoritative numbers still get
+          // reconciled by the debounced refresh on turn_done.
+          sessionsCostPatch = { id: sid, deltaMicros: e.costUsdMicros };
           break;
         case 'wait_for_user':
           next.pendingQuestion = { id: e.id, question: e.question };
@@ -1171,6 +1213,25 @@ export const useApp = create<AppState>((set, get) => ({
           // Just re-fetch sessions; row state will move out of sleeping-budget.
           setTimeout(() => get().refreshSessions(), 0);
           break;
+        }
+      }
+      if (sessionsCostPatch) {
+        // Bump just the one row (and only if it actually exists in the list) so
+        // the sidebar cost ticks up without a full refetch. Other rows keep
+        // their identity, so they don't re-render.
+        const { id, deltaMicros } = sessionsCostPatch;
+        let touched = false;
+        const sessions = s.sessions.map((row) => {
+          if (row.id !== id) return row;
+          touched = true;
+          return {
+            ...row,
+            cost_all_time_micros: (row.cost_all_time_micros ?? 0) + deltaMicros,
+            cost_24h_micros: (row.cost_24h_micros ?? 0) + deltaMicros,
+          };
+        });
+        if (touched) {
+          return { chats: { ...s.chats, [sid]: next }, sessions };
         }
       }
       return { chats: { ...s.chats, [sid]: next } };
