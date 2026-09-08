@@ -77,6 +77,61 @@ describe('parseMessages', () => {
     expect(parseMessages('not json')).toEqual([]);
     expect(parseMessages('')).toEqual([]);
   });
+
+  /**
+   * The REAL shape the Slack MCP server returns: `messages` is a formatted
+   * transcript STRING, not an array. Assuming an array meant no command was
+   * ever seen - this payload is copied from a live call.
+   */
+  it('parses the real formatted-transcript payload', async () => {
+    const { parseMessages } = await import('../electron/slackBridge');
+    const real = JSON.stringify({
+      messages:
+        'Channel: DM (D3MC8RWSE)\n\n' +
+        '=== Message from Jason Arnold <j@x.com> (U3LLWAJJU) at 2026-09-08 08:04:47 CDT === \n' +
+        'Message TS: 1788872687.940679\n' +
+        'Guy, just testing to see if you can see this.\n\n' +
+        '=== Message from Jason Arnold <j@x.com> (U3LLWAJJU) at 2026-09-08 07:37:42 CDT === \n' +
+        'Message TS: 1788871062.936449\n' +
+        'Guy, help\n\n' +
+        '=== Message from Jason Arnold <j@x.com> (U3LLWAJJU) at 2026-09-08 07:37:30 CDT === \n' +
+        'Message TS: 1788871050.604319\n' +
+        'Guy Code is connected. Send me commands starting with `Guy,`',
+      pagination_info: 'more',
+    });
+    const msgs = parseMessages(real);
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0].ts).toBe('1788872687.940679');
+    expect(msgs[0].text).toContain('just testing');
+    expect(msgs[0].userId).toBe('U3LLWAJJU');
+    expect(msgs[1].text).toBe('Guy, help');
+  });
+
+  it('does not treat our own reply as a command (no feedback loop)', async () => {
+    const { parseMessages } = await import('../electron/slackBridge');
+    const PREFIX = /^\s*guy\s*,\s*/i;
+    const real = JSON.stringify({
+      messages:
+        '=== Message from Me <m@x.com> (U1) at t === \n' +
+        'Message TS: 2.0\n' +
+        'Guy Code is connected. Send me commands starting with `Guy,`',
+    });
+    const msgs = parseMessages(real);
+    expect(msgs).toHaveLength(1);
+    expect(PREFIX.test(msgs[0].text)).toBe(false);
+  });
+
+  it('keeps a multi-line message body intact', async () => {
+    const { parseMessages } = await import('../electron/slackBridge');
+    const real = JSON.stringify({
+      messages:
+        '=== Message from A <a@x.com> (U9) at t === \n' +
+        'Message TS: 3.5\n' +
+        'Guy, send Bench do this\nand then that',
+    });
+    const msgs = parseMessages(real);
+    expect(msgs[0].text).toBe('Guy, send Bench do this\nand then that');
+  });
 });
 
 describe('resolveSession', () => {

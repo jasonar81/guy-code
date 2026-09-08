@@ -307,7 +307,20 @@ async function fileToAttachment(file: File): Promise<Attachment | { error: strin
 
 /** Bottom composer: text input, attachments, send/cancel, pending-question banner, live cost. */
 export function Composer({ sessionId, visible }: Props) {
-  const chat = useApp((s) => s.chats[sessionId]);
+  // PERF: do NOT subscribe to the whole chat object. It is replaced on every
+  // streamed token (its `messages` array grows constantly), which re-rendered
+  // the composer - and therefore stuttered typing - throughout a turn. The
+  // composer only needs these few primitives, and each is reference-stable, so
+  // it now re-renders only when one of them actually changes.
+  const streaming = useApp((s) => s.chats[sessionId]?.streaming ?? false);
+  const awaitingResponse = useApp((s) => s.chats[sessionId]?.awaitingResponse ?? null);
+  const errorMessage = useApp((s) => s.chats[sessionId]?.errorMessage ?? null);
+  const liveTurnCostMicros = useApp((s) => s.chats[sessionId]?.liveTurnCostMicros ?? 0);
+  const pendingQuestion = useApp((s) => s.chats[sessionId]?.pendingQuestion ?? null);
+  const retryNoticeVal = useApp((s) => s.chats[sessionId]?.retryNotice ?? null);
+  const pendingInterruptsLen = useApp(
+    (s) => s.chats[sessionId]?.pendingInterrupts?.length ?? 0
+  );
   const sendMessage = useApp((s) => s.sendMessage);
   const cancelTurn = useApp((s) => s.cancelTurn);
   const markIdle = useApp((s) => s.markIdle);
@@ -377,19 +390,25 @@ export function Composer({ sessionId, visible }: Props) {
     return () => clearTimeout(id);
   }, [text, sessionId]);
 
-  const streaming = chat?.streaming ?? false;
-  const pending = chat?.pendingQuestion ?? null;
-  const liveError = chat?.errorMessage ?? null;
-  const liveCost = chat?.liveTurnCostMicros ?? 0;
+  const pending = pendingQuestion;
+  const liveError = errorMessage;
+  const liveCost = liveTurnCostMicros;
   const interruptTurn = useApp((s) => s.interruptTurn);
-  const queuedCount = chat?.pendingInterrupts.length ?? 0;
-  const awaiting = chat?.awaitingResponse ?? null;
-  const retryNotice = chat?.retryNotice ?? null;
+  const queuedCount = pendingInterruptsLen;
+  const awaiting = awaitingResponse;
+  const retryNotice = retryNoticeVal;
   // Pull the matching session row so we can detect sleeping-budget state and
   // show the force-resume affordance only when it's actionable.
-  const sessionRow = useApp((s) => s.sessions.find((r) => r.id === sessionId));
-  const sleeping = sessionRow?.state === 'sleeping-budget';
-  const sleepingSince = sessionRow?.sleeping_since ?? null;
+  // PERF: select the two PRIMITIVES we need, not the row object. `sessions` is
+  // rebuilt on every refresh, so `.find(...)` returns a new reference each time
+  // and would re-render the composer (and therefore stutter your typing) on
+  // every session update. Comparing a string and a number is stable.
+  const sleeping = useApp(
+    (s) => s.sessions.find((r) => r.id === sessionId)?.state === 'sleeping-budget'
+  );
+  const sleepingSince = useApp(
+    (s) => s.sessions.find((r) => r.id === sessionId)?.sleeping_since ?? null
+  );
   // Sleeping-budget banner: when the live `errorMessage` is set (the
   // session entered sleeping-budget IN THIS PROCESS via the
   // `budget_blocked` event), use it as-is — it carries the full
@@ -422,8 +441,12 @@ export function Composer({ sessionId, visible }: Props) {
   // we surface that as a countdown in the status bar so the user can
   // see exactly when the session will resume, and a Stop button on
   // the composer cancels the wait via the same cancelRun path.
-  const sleepingTool = sessionRow?.state === 'sleeping-tool';
-  const wakeAtTs = sessionRow?.wake_at_ts ?? null;
+  const sleepingTool = useApp(
+    (s) => s.sessions.find((r) => r.id === sessionId)?.state === 'sleeping-tool'
+  );
+  const wakeAtTs = useApp(
+    (s) => s.sessions.find((r) => r.id === sessionId)?.wake_at_ts ?? null
+  );
   // Tick once per second whenever there's a moving time display:
   // the awaiting-API counter (during a turn), or the sleeping-tool
   // wake countdown (while paused). Cheap re-render — only one small
@@ -439,7 +462,9 @@ export function Composer({ sessionId, visible }: Props) {
   // the composer prevents the user from confusedly typing into a field
   // whose contents won't go anywhere. Unarchive (via sidebar / row
   // button / context menu) re-enables.
-  const archived = sessionRow?.archived === 1;
+  const archived = useApp(
+    (s) => s.sessions.find((r) => r.id === sessionId)?.archived === 1
+  );
 
   // ---- Slash-command autocomplete --------------------------------------
   //
@@ -453,7 +478,7 @@ export function Composer({ sessionId, visible }: Props) {
   // The skills list is loaded once per cwd (cheap filesystem scan on
   // the main side) and cached in component state. We do NOT re-fetch
   // on every keystroke — only on cwd change.
-  const cwd = sessionRow?.cwd ?? null;
+  const cwd = useApp((s) => s.sessions.find((r) => r.id === sessionId)?.cwd ?? null);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   useEffect(() => {
     let cancelled = false;

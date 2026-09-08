@@ -126,6 +126,50 @@ export function ensureOurPathSeeded(
 }
 
 /** Returns one big string of all bytes in the file, decoded as UTF-8. */
+/**
+ * Read at most the LAST `maxBytes` of a file as UTF-8, starting at a line
+ * boundary.
+ *
+ * PERF: session transcripts grow without bound (the largest in the wild is
+ * ~157MB). The message loaders only ever keep the last N messages, but they
+ * used to `readAllUtf8` the entire file first - allocating and UTF-8 decoding
+ * hundreds of megabytes on the MAIN process, then JSON.parsing every line. That
+ * blocks the event loop for seconds and is what puts "(Not Responding)" in the
+ * title bar. Reading a bounded tail gives the same messages for a fraction of
+ * the work.
+ *
+ * A truncated first line (we may land mid-line) is dropped by the caller's
+ * JSON.parse guard, and we also trim to the first newline to avoid it.
+ */
+export function readTailUtf8(path: string, maxBytes: number): string {
+  const stat = statSync(path);
+  if (stat.size === 0) return '';
+  if (stat.size <= maxBytes) return readAllUtf8(path);
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    let read = 0;
+    const start = stat.size - maxBytes;
+    while (read < maxBytes) {
+      const n = readSync(fd, buf, read, maxBytes - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    const text = buf.toString('utf8', 0, read);
+    // Drop the (probably partial) first line so we always start clean.
+    const nl = text.indexOf('\n');
+    return nl >= 0 ? text.slice(nl + 1) : text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * How much of a transcript's tail to read. 12MB is far more than the ~1500
+ * messages the loaders keep, while capping the worst case.
+ */
+const TAIL_BYTES = 12 * 1024 * 1024;
+
 function readAllUtf8(path: string): string {
   const stat = statSync(path);
   if (stat.size === 0) return '';
@@ -661,7 +705,7 @@ export function loadMessagesFromJsonl(
 ): Anthropic.MessageParam[] {
   if (!existsSync(path)) return [];
   const out: Anthropic.MessageParam[] = [];
-  const text = readAllUtf8(path);
+  const text = readTailUtf8(path, TAIL_BYTES);
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let evt: any;
@@ -753,7 +797,7 @@ export function loadMessagesWithTsFromJsonl(
 }> {
   if (!existsSync(path)) return [];
   const out: Array<{ role: 'user' | 'assistant'; content: any; ts: number | null }> = [];
-  const text = readAllUtf8(path);
+  const text = readTailUtf8(path, TAIL_BYTES);
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let evt: any;

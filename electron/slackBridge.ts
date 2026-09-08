@@ -84,7 +84,10 @@ export function startSlackBridge(): void {
   _timer = setInterval(() => {
     void pollOnce();
   }, cfg.pollMs);
-  _timer.unref?.();
+  // NOTE: deliberately NOT unref'd. This is a long-lived background service;
+  // unref'ing it lets the timer stop firing, which is exactly what happened -
+  // the very first poll hit "MCP server slack not connected" and the loop then
+  // never ran again, so no command was ever picked up.
   // Kick immediately so a just-saved config responds without waiting a cycle.
   void pollOnce();
 }
@@ -133,21 +136,65 @@ async function slackRead(channelId: string, oldest: string): Promise<any[]> {
 }
 
 /**
- * The MCP tool returns text. Usually that's JSON with a `messages` array, but
- * be defensive: different server versions shape this differently, and a parse
- * failure must not kill the loop.
+ * Normalize whatever `slack_read_channel` returned into `{ts, text, userId}`.
+ *
+ * The Slack MCP server does NOT return a messages array - it returns JSON whose
+ * `messages` field is a formatted human-readable transcript, e.g.
+ *
+ *   {"messages":"Channel: DM (D3MC8RWSE)\n\n
+ *     === Message from Jason Arnold <j@x.com> (U3LLWAJJU) at 2026-09-08 08:04:47 CDT ===\n
+ *     Message TS: 1788872687.940679\n
+ *     Guy, just testing\n\n
+ *     === Message from ... ==="}
+ *
+ * (An earlier version of this function assumed an array and silently returned
+ * nothing, so no command was ever seen.) We still accept a real array in case a
+ * future server version returns one. Never throws.
  */
-export function parseMessages(content: string): any[] {
+export function parseMessages(content: string): Array<{ ts: string; text: string; userId?: string }> {
   if (!content || !content.trim()) return [];
+  let payload: unknown = content;
   try {
-    const o = JSON.parse(content);
-    if (Array.isArray(o)) return o;
-    if (Array.isArray(o?.messages)) return o.messages;
-    if (Array.isArray(o?.result?.messages)) return o.result.messages;
-    return [];
+    const o: any = JSON.parse(content);
+    // Already structured? Use it.
+    const arr = Array.isArray(o) ? o : Array.isArray(o?.messages) ? o.messages : Array.isArray(o?.result?.messages) ? o.result.messages : null;
+    if (arr) {
+      return arr
+        .filter((m: any) => m && typeof m.ts === 'string')
+        .map((m: any) => ({ ts: m.ts, text: typeof m.text === 'string' ? m.text : '', userId: m.user }));
+    }
+    if (typeof o?.messages === 'string') payload = o.messages;
+    else if (typeof o === 'string') payload = o;
   } catch {
-    return [];
+    // not JSON - treat the whole thing as the transcript
   }
+  return parseTranscript(String(payload));
+}
+
+/**
+ * Parse the `=== Message from NAME <email> (UID) at TIME ===` / `Message TS: N`
+ * transcript format into structured messages. The body is every line after the
+ * TS line up to the next header.
+ */
+export function parseTranscript(text: string): Array<{ ts: string; text: string; userId?: string }> {
+  const out: Array<{ ts: string; text: string; userId?: string }> = [];
+  if (!text) return out;
+  // Split on the header line, keeping the header so we can read the user id.
+  const parts = text.split(/^===\s*Message from /m);
+  for (const part of parts) {
+    const tsM = part.match(/^Message TS:\s*([0-9.]+)\s*$/m);
+    if (!tsM) continue;
+    const uidM = part.match(/\(([UWB][A-Z0-9]+)\)/);
+    // Body = everything after the "Message TS:" line.
+    const idx = part.indexOf(tsM[0]);
+    const body = part.slice(idx + tsM[0].length).replace(/^\s*\n/, '');
+    out.push({
+      ts: tsM[1],
+      text: body.replace(/\s+$/, ''),
+      userId: uidM ? uidM[1] : undefined,
+    });
+  }
+  return out;
 }
 
 async function slackPost(channelId: string, text: string, threadTs?: string) {
@@ -175,6 +222,20 @@ async function pollOnce(): Promise<void> {
     const ordered = msgs
       .filter((m) => typeof m?.ts === 'string')
       .sort((a, b) => Number(a.ts) - Number(b.ts));
+    log.info(
+      `[slackBridge] poll ok: ${ordered.length} message(s) since ${lastTs || '(start)'}`
+    );
+    // FIRST RUN (no cursor): don't replay the channel's history - just take the
+    // newest message as the starting point. Otherwise enabling the bridge would
+    // execute every old "Guy, ..." message in the DM.
+    if (!lastTs) {
+      const newest = ordered[ordered.length - 1];
+      if (newest) {
+        setLastTs(newest.ts);
+        log.info(`[slackBridge] first run - starting from ts ${newest.ts} (history skipped)`);
+      }
+      return;
+    }
     for (const m of ordered) {
       const ts: string = m.ts;
       if (lastTs && Number(ts) <= Number(lastTs)) continue;
