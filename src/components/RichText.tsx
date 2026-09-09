@@ -17,6 +17,7 @@
 // chat transcript doesn't look like a doc page. Tables and code blocks
 // are the only elements with a visible "card" treatment.
 
+import { memo } from 'react';
 import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -182,7 +183,7 @@ const components = {
  * lists) with chat-friendly styling. URLs are clickable and open in the
  * user's default browser via the main process's setWindowOpenHandler.
  */
-export function RichText({ text, className }: Props): ReactNode {
+function RichTextImpl({ text, className }: Props): ReactNode {
   if (!text) return null;
   const hasMath = text.includes('$');
   const prepared = hasMath ? escapeCurrencyDollars(text) : text;
@@ -218,3 +219,13 @@ export function RichText({ text, className }: Props): ReactNode {
     </div>
   );
 }
+
+/**
+ * PERF: memoized. Rendering markdown means running the full remark/rehype (and
+ * for math, KaTeX) pipeline, which is expensive. While a reply streams, the
+ * containing message re-renders on every update - without memo that re-parsed
+ * the entire message each time. Props are (text, className), both primitives,
+ * so the default shallow comparison is exactly right: it re-parses only when
+ * the text actually changes.
+ */
+export const RichText = memo(RichTextImpl);

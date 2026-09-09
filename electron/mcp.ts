@@ -300,6 +300,49 @@ export async function initMcp(): Promise<void> {
   );
 }
 
+/**
+ * Retry a server that previously failed (or was never reached).
+ *
+ * Without this, a server that times out during `initMcp` stays dead until the
+ * app is restarted - observed in the wild: Slack timed out once at boot and
+ * every subsequent tool call for the rest of the day returned "not connected",
+ * so the Slack remote control polled a corpse ~400 times. Callers that depend
+ * on a server (the Slack bridge) can now ask for a reconnect.
+ *
+ * Returns true if the server is connected when this resolves. Never throws.
+ */
+export async function reconnectMcpServer(name: string): Promise<boolean> {
+  const state = _servers.get(name);
+  if (!state) {
+    log.warn(`[mcp] reconnect("${name}"): unknown server`);
+    return false;
+  }
+  if (state.status === 'connected') return true;
+  if (state.status === 'disabled') return false;
+  if (state.status === 'connecting') return false; // already in flight
+  const prev = state.status;
+  state.status = 'connecting';
+  state.error = undefined;
+  log.info(`[mcp] reconnecting "${name}" (was ${prev})`);
+  try {
+    await connectOne(state);
+    log.info(`[mcp] "${name}" reconnected - ${state.tools.length} tools`);
+    // connectOne mutates state.status; read it back through the map so TS
+    // doesn't narrow it to the 'connecting' we assigned above.
+    return _servers.get(name)?.status === 'connected';
+  } catch (e: any) {
+    if (e instanceof UnauthorizedError) {
+      state.status = 'needs-auth';
+      state.error = 'OAuth sign-in required';
+    } else {
+      state.status = 'error';
+      state.error = e?.message ?? String(e);
+    }
+    log.warn(`[mcp] reconnect("${name}") failed: ${state.error}`);
+    return false;
+  }
+}
+
 async function connectOne(state: ServerState): Promise<void> {
   const { name, spec } = state;
   state.status = 'connecting';

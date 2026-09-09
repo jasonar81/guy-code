@@ -15,7 +15,7 @@
  */
 import log from 'electron-log';
 import { randomUUID } from 'node:crypto';
-import { invokeMcpTool } from './mcp';
+import { invokeMcpTool, reconnectMcpServer } from './mcp';
 import { getClient } from './anthropic';
 import {
   getSetting,
@@ -43,6 +43,9 @@ const MAX_REPLY_CHARS = 3500;
 
 let _timer: NodeJS.Timeout | null = null;
 let _polling = false;
+/** Last Slack-MCP reconnect attempt, so we retry at most occasionally. */
+let _lastReconnectAt = 0;
+const RECONNECT_COOLDOWN_MS = 60_000;
 
 // ---- settings ------------------------------------------------------------
 
@@ -259,8 +262,26 @@ async function pollOnce(): Promise<void> {
       setLastTs(ts);
     }
   } catch (e) {
-    // Includes "slack MCP not connected" - log and try again next tick.
-    log.warn(`[slackBridge] poll failed: ${(e as Error).message}`);
+    const msg = (e as Error).message || '';
+    log.warn(`[slackBridge] poll failed: ${msg}`);
+    // If the Slack MCP server is dead (it can time out during startup and then
+    // stays dead forever), ask for a reconnect instead of polling a corpse on
+    // every tick. Rate-limited so a permanently-broken server doesn't get
+    // hammered - and reported once so the user can see it in Slack terms.
+    if (/not connected|not available/i.test(msg)) {
+      const now = Date.now();
+      if (now - _lastReconnectAt > RECONNECT_COOLDOWN_MS) {
+        _lastReconnectAt = now;
+        log.info('[slackBridge] attempting Slack MCP reconnect');
+        const ok = await reconnectMcpServer('slack').catch(() => false);
+        log.info(`[slackBridge] reconnect ${ok ? 'succeeded' : 'failed'}`);
+        if (ok) {
+          // Try the poll again right away so a command isn't delayed a cycle.
+          _polling = false;
+          return pollOnce();
+        }
+      }
+    }
   } finally {
     _polling = false;
   }
