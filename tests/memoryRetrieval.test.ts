@@ -71,7 +71,11 @@ describe('gateTail', () => {
   });
 });
 
-describe('gatherLeafMeta + loadRelevantMemory (real memory tree)', () => {
+// These walk the REAL memory tree on disk, so they're I/O bound and can exceed
+// vitest's 5s default when the full suite is running in parallel (they pass in
+// isolation). Give the block room rather than leaving a load-sensitive test to
+// fail CI at random.
+describe('gatherLeafMeta + loadRelevantMemory (real memory tree)', { timeout: 30_000 }, () => {
   it('gatherLeafMeta returns leaves with pinned flag + tier', async () => {
     const { gatherLeafMeta } = await import('../electron/memoryRetrieval');
     const metas = gatherLeafMeta({ cwd: process.cwd(), projectId: '' });

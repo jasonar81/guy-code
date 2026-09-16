@@ -438,7 +438,10 @@ describe('WaitForCondition', () => {
     vi.useRealTimers(); // runConditionCheck spawns real subprocesses
   });
 
-  it('runConditionCheck reports launched+code 0 for a passing command, launched+non-zero for a failing one', async () => {
+  // Spawns TWO real shells, each allowed 10s internally, so vitest's default
+  // 5s per-test budget is too small - it timed out on the Windows CI runner
+  // (and only there) while passing locally. Give it room for both spawns.
+  it('runConditionCheck reports launched+code 0 for a passing command, launched+non-zero for a failing one', { timeout: 30_000 }, async () => {
     const { runConditionCheck } = await import('../electron/tools');
     const ok = await runConditionCheck(exit0, process.cwd(), sh, 10_000);
     expect(ok.launched).toBe(true);
@@ -448,7 +451,8 @@ describe('WaitForCondition', () => {
     expect(bad.code).not.toBe(0);
   });
 
-  it('runConditionCheck reports launched=false when the command runs but exits non-zero is distinct from a real failure to launch', async () => {
+  // Also spawns a real shell with a 10s internal allowance - same reason.
+  it('runConditionCheck reports launched=false when the command runs but exits non-zero is distinct from a real failure to launch', { timeout: 30_000 }, async () => {
     const { runConditionCheck } = await import('../electron/tools');
     // A command that runs but exits non-zero LAUNCHED (it's just "not met").
     const ran = await runConditionCheck(exit1, process.cwd(), sh, 10_000);
