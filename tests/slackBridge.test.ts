@@ -227,12 +227,15 @@ describe('handleCommand', () => {
     expect(r).not.toMatch(/Fine/);
   });
 
-  it('falls back to help when even the interpreter cannot map it', async () => {
+  it('says so briefly (NOT a full help dump) when the interpreter cannot map it', async () => {
     const { handleCommand } = await import('../electron/slackBridge');
     _llmReply = '{}'; // interpreter returns nothing usable
     const r = await handleCommand('do a barrel roll');
     expect(r).toMatch(/Not sure what you meant/i);
-    expect(r).toMatch(/status/); // help is appended
+    // It should point at help, not paste the whole command list (which used to
+    // be appended to every miss and made replies unreadable on a phone).
+    expect(r).toMatch(/Guy, help/);
+    expect(r.length).toBeLessThan(200);
   });
 
   it('send routes to a resolvable session', async () => {
