@@ -15,6 +15,7 @@ import { startGovernor, stopGovernor } from './budget';
 import { cleanupArchives } from './toolSummarizer';
 import { initMcp, shutdownMcp } from './mcp';
 import { startSlackBridge, stopSlackBridge } from './slackBridge';
+import { startLagMonitor, stopLagMonitor, logLagReport } from './lagMonitor';
 import { setAttachApprovalPrompter } from './chromeExtBridge';
 import { initAutoUpdater, shutdownAutoUpdater } from './autoUpdater';
 
@@ -247,6 +248,12 @@ app.whenReady().then(async () => {
   } catch (e) {
     log.warn('[main] tool-result archive cleanup failed', e);
   }
+  // Measure main-process stalls (what produces "(Not Responding)") and
+  // attribute them to named operations, so this stops being guesswork.
+  startLagMonitor();
+  // Periodically summarise what has been blocking, worst first.
+  setInterval(() => logLagReport(), 5 * 60 * 1000).unref?.();
+
   // Fire MCP init in the background; failures are non-fatal so we don't
   // block the window. Individual servers are isolated by mcp.ts.
   initMcp()
@@ -344,6 +351,7 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   stopGovernor();
   stopSlackBridge();
+  stopLagMonitor();
   shutdownAutoUpdater();
   shutdownMcp().catch(() => {
     /* best effort */

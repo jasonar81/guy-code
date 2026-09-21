@@ -182,8 +182,13 @@ export function parseMessages(content: string): Array<{ ts: string; text: string
 export function parseTranscript(text: string): Array<{ ts: string; text: string; userId?: string }> {
   const out: Array<{ ts: string; text: string; userId?: string }> = [];
   if (!text) return out;
-  // Split on the header line, keeping the header so we can read the user id.
-  const parts = text.split(/^===\s*Message from /m);
+  // Split on ANY message header. The channel reader and the thread reader use
+  // DIFFERENT layouts, and assuming only the channel one meant thread replies
+  // parsed to nothing (so replying in a thread did nothing at all):
+  //   channel: "=== Message from NAME <email> (UID) at TIME ==="
+  //   thread:  "=== THREAD PARENT MESSAGE ===" / "--- Reply 1 of 3 ---"
+  //            followed by "From: NAME <email> (UID)" on its own line.
+  const parts = text.split(/^(?:===\s*(?:Message from |THREAD PARENT MESSAGE)|---\s*Reply \d+ of \d+)/m);
   for (const part of parts) {
     const tsM = part.match(/^Message TS:\s*([0-9.]+)\s*$/m);
     if (!tsM) continue;
@@ -205,13 +210,36 @@ export function parseTranscript(text: string): Array<{ ts: string; text: string;
  * so we can recognise our own messages later - in a self-DM they come back
  * authored by the user, so 'who sent it' cannot distinguish us.
  */
+/**
+ * Post a reply, SPLITTING it across as many Slack messages as it takes.
+ *
+ * We used to cut anything over the limit and tack on "(truncated)", which threw
+ * away the end of the answer - exactly the part you were waiting for. Returns
+ * every ts we created so all of them are recorded as "ours".
+ */
+async function slackPostAll(
+  channelId: string,
+  text: string,
+  threadTs?: string
+): Promise<string[]> {
+  const chunks = chunkForSlack(text);
+  const ids: string[] = [];
+  for (const chunk of chunks) {
+    const ts = await slackPost(channelId, chunk, threadTs);
+    if (ts) ids.push(ts);
+  }
+  return ids;
+}
+
 async function slackPost(
   channelId: string,
   text: string,
   threadTs?: string
 ): Promise<string | null> {
+  // Callers should use slackPostAll; this is the single-message primitive. The
+  // slice is only a hard backstop - chunkForSlack has already split the text.
   const message =
-    text.length > MAX_REPLY_CHARS ? text.slice(0, MAX_REPLY_CHARS) + '\n...(truncated)' : text;
+    text.length > MAX_REPLY_CHARS ? text.slice(0, MAX_REPLY_CHARS) : text;
   const args: Record<string, unknown> = { channel_id: channelId, message };
   if (threadTs) args.thread_ts = threadTs;
   const r = await invokeMcpTool('mcp__slack__slack_send_message', args);
@@ -219,7 +247,21 @@ async function slackPost(
     log.warn(`[slackBridge] reply failed: ${r.content}`);
     return null;
   }
-  const m = (r?.content ?? '').match(/"?(?:message_)?ts"?\s*[:=]\s*"?(\d+\.\d+)"?/);
+  // Pull the ts of the message WE just created. The tool replies with
+  //   {"message_link":"...","message_context":{"message_ts":"1789998133.418689",...}}
+  // Parse it properly rather than regexing the first ts-looking thing in the
+  // blob - getting this wrong meant we recorded the USER's message id as
+  // "ours", so thread replies were never recognised as our own.
+  const content = r?.content ?? '';
+  try {
+    const o = JSON.parse(content);
+    const ts =
+      o?.message_context?.message_ts ?? o?.message_ts ?? o?.ts ?? o?.message?.ts;
+    if (typeof ts === 'string' && /^\d+\.\d+$/.test(ts)) return ts;
+  } catch {
+    /* fall through to the regex */
+  }
+  const m = content.match(/"message_ts"\s*:\s*"(\d+\.\d+)"/);
   return m ? m[1] : null;
 }
 
@@ -282,15 +324,14 @@ export function saveThreads(t: Record<string, ThreadState>, now = Date.now()) {
 }
 
 /** Start or refresh tracking of the thread rooted at `threadTs`. */
-export function rememberThread(threadTs: string, ourReplyTs?: string) {
+export function rememberThread(threadTs: string, ourReplyTs?: string | string[]) {
   const t = loadThreads();
   const cur: ThreadState = t[threadTs] ?? { cursor: threadTs, touched: 0, ours: [] };
   cur.touched = Date.now();
   if (!cur.ours) cur.ours = [];
-  if (ourReplyTs && !cur.ours.includes(ourReplyTs)) {
-    cur.ours.push(ourReplyTs);
-    if (cur.ours.length > 40) cur.ours = cur.ours.slice(-40);
-  }
+  const ids = Array.isArray(ourReplyTs) ? ourReplyTs : ourReplyTs ? [ourReplyTs] : [];
+  for (const id of ids) if (!cur.ours.includes(id)) cur.ours.push(id);
+  if (cur.ours.length > 40) cur.ours = cur.ours.slice(-40);
   t[threadTs] = cur;
   saveThreads(t);
 }
@@ -298,6 +339,20 @@ export function rememberThread(threadTs: string, ourReplyTs?: string) {
 /** Strip an optional leading "Guy," - inside a thread it isn't needed. */
 export function stripPrefix(text: string): string {
   return (text || '').replace(PREFIX_RE, '');
+}
+
+/**
+ * Whether a message looks like one WE posted.
+ *
+ * In a DM with yourself every message - including the app's - is authored by
+ * the user, so author checks are useless. Slack appends a "Sent using @<app>"
+ * footer to messages posted through the app, which is a reliable signature.
+ * Used alongside the recorded message ids so a missing/incorrect id can't make
+ * us answer our own reply.
+ */
+export function isOurReply(text: string): boolean {
+  if (!text) return false;
+  return /\bSent using\b\s*<@[A-Z0-9]+\|/i.test(text) || /_?\*?Sent using\*?_?\s*<@/i.test(text);
 }
 
 /**
@@ -319,9 +374,17 @@ async function pollThreads(channelId: string): Promise<void> {
     if (!msgs.length) continue;
     const ordered = msgs.slice().sort((a, b) => Number(a.ts) - Number(b.ts));
     const ours = st.ours ?? [];
+    // Is this message one of ours? Primarily the ts we recorded when posting,
+    // but ALSO a content signature: everything we post through the Slack app
+    // carries a "Sent using @<bot>" footer, and in a self-DM our replies come
+    // back authored by the user so there is no other way to tell. The belt and
+    // braces matter because a stored id can be wrong or missing (it was: we
+    // used to record the user's message id by mistake).
+    const isOurs = (mm: { ts: string; text: string }) =>
+      ours.includes(mm.ts) || isOurReply(mm.text);
     // Conversation so far: our posts are 'assistant', the rest are the user.
     const history = ordered.map((mm) => ({
-      role: ours.includes(mm.ts) ? ('assistant' as const) : ('user' as const),
+      role: isOurs(mm) ? ('assistant' as const) : ('user' as const),
       text: stripPrefix(mm.text),
     }));
 
@@ -329,7 +392,7 @@ async function pollThreads(channelId: string): Promise<void> {
     for (let i = 0; i < ordered.length; i++) {
       const mm = ordered[i];
       if (Number(mm.ts) <= Number(cursor)) continue;
-      if (ours.includes(mm.ts)) { cursor = mm.ts; continue; }
+      if (isOurs(mm)) { cursor = mm.ts; continue; }
       const body = stripPrefix(mm.text).trim();
       if (!body) { cursor = mm.ts; continue; }
       log.info(`[slackBridge] thread follow-up: ${body.slice(0, 120)}`);
@@ -340,14 +403,14 @@ async function pollThreads(channelId: string): Promise<void> {
         reply = `Error: ${(e as Error).message}`;
         log.error('[slackBridge] thread command failed', e);
       }
-      const postedTs = await slackPost(channelId, reply, threadTs);
+      const postedIds = await slackPostAll(channelId, reply, threadTs);
       cursor = mm.ts;
       const t2 = loadThreads();
       const s2: ThreadState = t2[threadTs] ?? { cursor, touched: Date.now(), ours: [] };
       s2.cursor = cursor;
       s2.touched = Date.now();
       if (!s2.ours) s2.ours = [];
-      if (postedTs && !s2.ours.includes(postedTs)) s2.ours.push(postedTs);
+      for (const pid of postedIds) if (!s2.ours.includes(pid)) s2.ours.push(pid);
       t2[threadTs] = s2;
       saveThreads(t2);
     }
@@ -395,9 +458,9 @@ async function pollOnce(): Promise<void> {
       const ts: string = m.ts;
       if (lastTs && Number(ts) <= Number(lastTs)) continue;
       const text: string = typeof m.text === 'string' ? m.text : '';
-      // Only messages addressed to us. Our own replies never start with
-      // "Guy," so this also prevents feedback loops.
-      if (!PREFIX_RE.test(text)) {
+      // Only messages addressed to us, and never our own posts (belt and
+      // braces against a feedback loop if a reply ever begins with "Guy,").
+      if (!PREFIX_RE.test(text) || isOurReply(text)) {
         setLastTs(ts);
         continue;
       }
@@ -410,10 +473,10 @@ async function pollOnce(): Promise<void> {
         reply = `Error: ${(e as Error).message}`;
         log.error('[slackBridge] command failed', e);
       }
-      const postedTs = await slackPost(cfg.channelId, reply, ts);
-      // Track this thread so follow-ups need no prefix, recording our own
-      // reply so we never read it back as user input.
-      rememberThread(ts, postedTs ?? undefined);
+      const postedIds = await slackPostAll(cfg.channelId, reply, ts);
+      // Track this thread so follow-ups need no prefix, recording EVERY message
+      // we posted so we never read our own replies back as user input.
+      rememberThread(ts, postedIds);
       setLastTs(ts);
     }
     // Follow-ups inside threads we already answered (no prefix needed).
@@ -693,19 +756,10 @@ export async function handleCommand(
     const msgs = loadMessagesWithTsFromJsonl(session!.jsonl_path) ?? [];
     const cutoff = since ?? 0;
     const recent = msgs.filter((x: any) => !cutoff || (x.ts ?? 0) >= cutoff);
-    const pick = recent.slice(-12);
-    if (!pick.length) {
+    if (!recent.length) {
       return `*${label(session!)}* (${session!.state}) — nothing${since ? ' since then' : ''}.`;
     }
-    const body = pick
-      .map((x: any) => {
-        const who = x.role === 'user' ? 'you' : 'guy';
-        const text = extractText(x).replace(/\s+/g, ' ').trim();
-        return text ? `*${who}:* ${text.slice(0, 400)}` : null;
-      })
-      .filter(Boolean)
-      .join('\n');
-    return `*${label(session!)}* (${session!.state})\n${body}`;
+    return formatTranscript(label(session!), session!.state, recent, !!since);
   }
 
   // ---- send <session> <text> ----
@@ -1010,6 +1064,138 @@ export function parseInterpretation(raw: string): Interpretation | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Render a session transcript for Slack so it is actually READABLE.
+ *
+ * The old version produced a truncated mess: it kept the last 12 messages, cut
+ * each to 400 characters mid-sentence, joined them into one blob, and then the
+ * sender cut the blob again at 3500 characters. Tool-call chatter
+ * ("[PowerShell]", "[Write]") dominated, and the actual answer - the thing you
+ * asked for - was the part that got clipped.
+ *
+ * What it does now:
+ *   - Leads with the session's LATEST substantive reply, in full.
+ *   - Summarises the tool activity around it as a short line rather than
+ *     interleaving one line per tool call.
+ *   - Returns an ARRAY of chunks; the caller posts them as separate Slack
+ *     messages, so nothing is silently dropped when it exceeds one message.
+ */
+export function formatTranscript(
+  name: string,
+  state: string,
+  msgs: Array<any>,
+  sinceFilterApplied: boolean
+): string {
+  const header = `*${name}* _(${state})_`;
+
+  // The newest assistant message that actually SAYS something (not a bare
+  // tool call) is what the user is asking for.
+  let latest: any = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const mm = msgs[i];
+    if (mm?.role !== 'assistant') continue;
+    // Take the message's REAL text blocks only. extractText renders a tool
+    // call as "[PowerShell]", which would otherwise count as "it said
+    // something" and we'd show tool noise instead of the actual answer.
+    const t = assistantProse(mm);
+    if (t.length > 0) { latest = { mm, text: t, index: i }; break; }
+  }
+
+  if (!latest) {
+    // Only tool activity in range - say so plainly instead of dumping noise.
+    const tools = countTools(msgs);
+    const window = sinceFilterApplied ? ' in that window' : '';
+    const toolPart = tools ? `, ${tools} tool call(s)` : '';
+    return (
+      header +
+      `\nStill working${window} - ${msgs.length} step(s)${toolPart}, no written update yet.`
+    );
+  }
+
+  // What happened since that message (tool calls it kicked off), and what the
+  // user last said before it, for a little context.
+  const after = msgs.slice(latest.index + 1);
+  const toolsAfter = countTools(after);
+
+  const parts: string[] = [header, '', latest.text.trim()];
+  if (toolsAfter > 0) {
+    parts.push('', `_...then ${toolsAfter} more tool call(s) with no written update yet._`);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * The assistant's actual prose from a message - text blocks only, never the
+ * "[ToolName]" placeholders that extractText produces for tool calls.
+ */
+function assistantProse(mm: any): string {
+  const c = mm?.content;
+  if (typeof c === 'string') return c.trim();
+  if (!Array.isArray(c)) return '';
+  return c
+    .filter((b: any) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b: any) => b.text)
+    .join('\n')
+    .trim();
+}
+
+/** Count tool_use blocks in a set of messages. */
+function countTools(msgs: Array<any>): number {
+  let n = 0;
+  for (const mm of msgs) {
+    const c = mm?.content;
+    if (Array.isArray(c)) for (const b of c) if (b?.type === 'tool_use') n++;
+  }
+  return n;
+}
+
+/**
+ * Split a long reply into Slack-sized chunks WITHOUT losing anything.
+ *
+ * Slack rejects very long messages, and we used to just cut the text and add
+ * "(truncated)" - so the end of the answer was silently thrown away. Now the
+ * caller posts each chunk as its own message. Splits on paragraph, then line,
+ * then (last resort) a hard cut, so formatting survives.
+ */
+export function chunkForSlack(text: string, max = MAX_REPLY_CHARS): string[] {
+  const clean = (text ?? '').trimEnd();
+  if (!clean) return [];
+  if (clean.length <= max) return [clean];
+
+  const out: string[] = [];
+  let buf = '';
+  const flush = () => { if (buf.trim()) out.push(buf.trim()); buf = ''; };
+
+  for (const para of clean.split(/\n\n+/)) {
+    const candidate = buf ? buf + '\n\n' + para : para;
+    if (candidate.length <= max) { buf = candidate; continue; }
+    flush();
+    if (para.length <= max) { buf = para; continue; }
+    // Paragraph itself too big - split by lines.
+    let lineBuf = '';
+    for (const line of para.split('\n')) {
+      const c2 = lineBuf ? lineBuf + '\n' + line : line;
+      if (c2.length <= max) { lineBuf = c2; continue; }
+      if (lineBuf.trim()) out.push(lineBuf.trim());
+      lineBuf = '';
+      // Single line too big - hard split it.
+      let rest = line;
+      while (rest.length > max) {
+        out.push(rest.slice(0, max));
+        rest = rest.slice(max);
+      }
+      lineBuf = rest;
+    }
+    if (lineBuf.trim()) buf = lineBuf;
+  }
+  flush();
+  // Label the pieces so a multi-part answer is obvious on a phone.
+  if (out.length > 1) {
+    return out.map((c, i) => `${c}\n_(${i + 1}/${out.length})_`);
+  }
+  return out;
 }
 
 /** Best-effort text extraction from a stored message record. */

@@ -5,6 +5,7 @@
 
 import { BrowserWindow } from 'electron';
 import log from 'electron-log';
+import { instrument } from './lagMonitor';
 import { randomUUID } from 'node:crypto';
 import type Anthropic from '@anthropic-ai/sdk';
 import {
@@ -1092,7 +1093,10 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // Load existing history. ourPath is now canonical; the legacy "fall back
     // to seed" branch is kept as a defensive backstop in case seeding failed
     // (e.g. disk full, permissions).
-    let messages: Anthropic.MessageParam[] = loadMessagesFromJsonl(ourPath);
+    let messages: Anthropic.MessageParam[] = instrument(
+      'agent: load history',
+      () => loadMessagesFromJsonl(ourPath)
+    );
     if (messages.length === 0 && seedFromJsonl) {
       messages = loadMessagesFromJsonl(seedFromJsonl);
     }

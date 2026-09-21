@@ -42,6 +42,7 @@ import {
 import { importClaudeProjects } from './claudeImport';
 import { listMcpServers, signInMcp, signOutMcp } from './mcp';
 import { startSlackBridge } from './slackBridge';
+import { instrument } from './lagMonitor';
 import {
   hasApiKey,
   setApiKey,
@@ -83,7 +84,7 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
   ipcMain.handle('app:version', () => app.getVersion());
 
   // ---- Sessions (primary entity in the UI) ----
-  ipcMain.handle('sessions:listAll', () => listSessionsAll());
+  ipcMain.handle('sessions:listAll', () => instrument('sessions:listAll', () => listSessionsAll()));
 
   ipcMain.handle('sessions:rename', (_e, id: string, title: string | null) => {
     setSessionUserTitle(id, title && title.trim() ? title.trim() : null);
@@ -684,7 +685,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
   });
 
   // ---- Agent ----
-  ipcMain.handle('agent:loadMessages', (_e, sessionId: string, opts?: { fallbackPath?: string }) => {
+  ipcMain.handle('agent:loadMessages', (_e, sessionId: string, opts?: { fallbackPath?: string }) =>
+    instrument(`agent:loadMessages ${sessionId.slice(0, 8)}`, () => {
     const ours = ourJsonlPath(sessionId);
 
     // Try to seed ourPath from the imported Claude Code JSONL. This is a
@@ -738,7 +740,8 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     // Silence unused-import warning in dev; this branch exists for parity.
     void loadMessagesFromJsonl;
     return [];
-  });
+    })
+  );
 
   ipcMain.handle(
     'agent:run',
