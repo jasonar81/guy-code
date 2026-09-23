@@ -18,13 +18,33 @@ export interface ModelPricing {
 
 const M = 1_000_000; // micros per dollar
 
-function pricing(input: number, output: number): ModelPricing {
+/**
+ * Build a pricing row.
+ *
+ * By default the cache rates follow Anthropic's standard multipliers
+ * (0.1x read, 1.25x 5m write, 2x 1h write). Newer models DO NOT always follow
+ * them - Claude Opus 5.5 charges $0.20/MTok for cache hits against a $4 input
+ * price, i.e. 5%, not 10% - so `overrides` lets a model state its real cache
+ * prices. Deriving them would silently overstate that model's cached cost by 2x.
+ */
+function pricing(
+  input: number,
+  output: number,
+  overrides?: {
+    cacheRead?: number;
+    cacheWrite5m?: number;
+    cacheWrite1h?: number;
+  }
+): ModelPricing {
   return {
     inputUsdPerMillion: input * M,
     outputUsdPerMillion: output * M,
-    cacheReadUsdPerMillion: input * M * 0.1,
-    cacheWrite5mUsdPerMillion: input * M * 1.25,
-    cacheWrite1hUsdPerMillion: input * M * 2.0,
+    cacheReadUsdPerMillion:
+      overrides?.cacheRead !== undefined ? overrides.cacheRead * M : input * M * 0.1,
+    cacheWrite5mUsdPerMillion:
+      overrides?.cacheWrite5m !== undefined ? overrides.cacheWrite5m * M : input * M * 1.25,
+    cacheWrite1hUsdPerMillion:
+      overrides?.cacheWrite1h !== undefined ? overrides.cacheWrite1h * M : input * M * 2.0,
   };
 }
 
@@ -41,6 +61,14 @@ const TABLE: Record<string, ModelPricing> = {
   // without this the cost report would wrongly use the $5/$25 Opus default.
   'claude-fable-5': pricing(10, 50),
   'claude-mythos-5': pricing(10, 50),
+  // Claude Opus 5.5: cheaper than Opus 5 on BOTH uncached and cached tokens.
+  // $4 input / $20 output, 5m write $5, 1h write $8, and cache hits $0.20/MTok.
+  // That cache-hit rate is 5% of input, NOT the usual 10%, so it has to be
+  // stated explicitly - the derived value would be $0.40 and every cached
+  // token would be billed at double its real cost.
+  // (Verified against Anthropic's published pricing table.)
+  'claude-opus-5-5': pricing(4, 20, { cacheRead: 0.2, cacheWrite5m: 5, cacheWrite1h: 8 }),
+  'claude-opus-5-5-1m': pricing(4, 20, { cacheRead: 0.2, cacheWrite5m: 5, cacheWrite1h: 8 }),
   'claude-opus-5': pricing(5, 25),
   'claude-opus-5-1m': pricing(5, 25),
   'claude-opus-4-8': pricing(5, 25),

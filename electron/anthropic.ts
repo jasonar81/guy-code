@@ -76,17 +76,19 @@ void getApiKey;
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-// Claude Opus 5 is the default. (Claude Fable 5 stays selectable per-session
-// via the sidebar right-click menu; the refusal->fallback, routing, and
-// per-session auto-disable still apply to anyone who selects Fable.)
-export const DEFAULT_MODEL = 'claude-opus-5[1m]';
+// Claude Opus 5.5 is the default. It is cheaper than Opus 5 on both uncached
+// and cached tokens ($4/$20 vs $5/$25, and $0.20 vs $0.50 per MTok on cache
+// hits). (Claude Fable 5 stays selectable per-session via the sidebar
+// right-click menu; the refusal->fallback, routing, and per-session
+// auto-disable still apply to anyone who selects Fable.)
+export const DEFAULT_MODEL = 'claude-opus-5-5[1m]';
 
 // When Fable 5 returns stop_reason 'refusal' (an empty response from its safety
 // classifier), the agent transparently retries that turn on this fallback
 // model, which doesn't refuse legitimate coding work. The fallback is marked
 // visibly so the user knows it happened. (Only relevant when a user has
 // selected Fable 5; the default no longer refuses.)
-export const REFUSAL_FALLBACK_MODEL = 'claude-opus-5[1m]';
+export const REFUSAL_FALLBACK_MODEL = 'claude-opus-5-5[1m]';
 
 // The default `effort` level for the model. Fable 5 (and Opus 4.7/4.8) take an
 // `effort` parameter (sent as output_config.effort) that trades thoroughness

@@ -29,6 +29,57 @@ describe('getPricing', () => {
     expect(opus.outputUsdPerMillion).toBe(25 * M);
   });
 
+  /**
+   * Opus 5.5 cut BOTH uncached and cached prices, and its cache-hit rate does
+   * NOT follow the usual 10%-of-input multiplier - it's $0.20 against a $4
+   * input, i.e. 5%. Deriving it would bill cached tokens at double.
+   * Figures from Anthropic's published pricing table:
+   *   $4 in / $20 out / $5 5m-write / $8 1h-write / $0.20 cache hit.
+   */
+  describe('Opus 5.5 pricing (cheaper uncached AND cached)', () => {
+    it('uses $4 input / $20 output', () => {
+      const p = getPricing('claude-opus-5-5');
+      expect(p.inputUsdPerMillion).toBe(4 * M);
+      expect(p.outputUsdPerMillion).toBe(20 * M);
+    });
+
+    it('charges $0.20/MTok for cache hits (5% of input, NOT the standard 10%)', () => {
+      const p = getPricing('claude-opus-5-5');
+      expect(p.cacheReadUsdPerMillion).toBe(0.2 * M);
+      // Guard the exact bug this protects against: the derived value.
+      expect(p.cacheReadUsdPerMillion).not.toBe(4 * M * 0.1);
+    });
+
+    it('charges $5 for a 5m cache write and $8 for a 1h cache write', () => {
+      const p = getPricing('claude-opus-5-5');
+      expect(p.cacheWrite5mUsdPerMillion).toBe(5 * M);
+      expect(p.cacheWrite1hUsdPerMillion).toBe(8 * M);
+    });
+
+    it('applies with the [1m] suffix too (that is what the default uses)', () => {
+      const p = getPricing('claude-opus-5-5[1m]');
+      expect(p.inputUsdPerMillion).toBe(4 * M);
+      expect(p.cacheReadUsdPerMillion).toBe(0.2 * M);
+    });
+
+    it('is strictly cheaper than Opus 5 on every dimension', () => {
+      const five = getPricing('claude-opus-5');
+      const fiveFive = getPricing('claude-opus-5-5');
+      expect(fiveFive.inputUsdPerMillion).toBeLessThan(five.inputUsdPerMillion);
+      expect(fiveFive.outputUsdPerMillion).toBeLessThan(five.outputUsdPerMillion);
+      expect(fiveFive.cacheReadUsdPerMillion).toBeLessThan(five.cacheReadUsdPerMillion);
+      expect(fiveFive.cacheWrite5mUsdPerMillion).toBeLessThan(five.cacheWrite5mUsdPerMillion);
+      expect(fiveFive.cacheWrite1hUsdPerMillion).toBeLessThan(five.cacheWrite1hUsdPerMillion);
+    });
+
+    it('Opus 5 keeps its own (unchanged) rates', () => {
+      const p = getPricing('claude-opus-5');
+      expect(p.inputUsdPerMillion).toBe(5 * M);
+      expect(p.outputUsdPerMillion).toBe(25 * M);
+      expect(p.cacheReadUsdPerMillion).toBe(0.5 * M);
+    });
+  });
+
   it('strips trailing [1m] suffix tags', () => {
     const opus = getPricing('claude-opus-4-7[1m]');
     expect(opus.inputUsdPerMillion).toBe(5 * M);
@@ -217,24 +268,24 @@ describe('Claude Fable 5 pricing + default', () => {
     expect(p.inputUsdPerMillion).not.toBe(5 * 1_000_000);
   });
 
-  it('DEFAULT_MODEL is claude-opus-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
+  it('DEFAULT_MODEL is claude-opus-5-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
     const { DEFAULT_MODEL, DEFAULT_EFFORT } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5-5[1m]');
     expect(DEFAULT_EFFORT).toBe('xhigh');
   });
 });
 
 describe('refusal fallback config', () => {
-  it('default is opus-5[1m] and REFUSAL_FALLBACK_MODEL is opus-5[1m]', async () => {
+  it('default is opus-5-5[1m] and REFUSAL_FALLBACK_MODEL is opus-5-5[1m]', async () => {
     const { DEFAULT_MODEL, REFUSAL_FALLBACK_MODEL } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
-    expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-5[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5-5[1m]');
+    expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-5-5[1m]');
     // Default (Fable) and fallback (Opus) differ, so a refusal actually switches.
   });
 
-  it('the fallback model is priced correctly (opus 5 = $5/$25)', async () => {
-    const opus = getPricing('claude-opus-5');
-    expect(opus.inputUsdPerMillion).toBe(5 * 1_000_000);
-    expect(opus.outputUsdPerMillion).toBe(25 * 1_000_000);
+  it('the fallback model is priced correctly (opus 5.5 = $4/$20)', async () => {
+    const opus = getPricing('claude-opus-5-5');
+    expect(opus.inputUsdPerMillion).toBe(4 * 1_000_000);
+    expect(opus.outputUsdPerMillion).toBe(20 * 1_000_000);
   });
 });

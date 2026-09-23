@@ -505,6 +505,17 @@ function migrateSettings() {
     }
     setSetting('migrated.opus5_default', '1');
   }
+
+  // Claude Opus 5.5 is out: cheaper than Opus 5 on both uncached and cached
+  // tokens, so move anyone still on the Opus 5 default up to it once. (A
+  // deliberately-chosen different global model is left alone, and per-session
+  // overrides are untouched.)
+  if (!getSetting('migrated.opus5_5_default')) {
+    if (getSetting('model') === 'claude-opus-5[1m]') {
+      setSetting('model', 'claude-opus-5-5[1m]');
+    }
+    setSetting('migrated.opus5_5_default', '1');
+  }
 }
 
 // ---- Schema migrations ----
