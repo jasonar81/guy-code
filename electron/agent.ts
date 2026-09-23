@@ -1263,7 +1263,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         onEv({
           type: 'text_delta',
           sessionId,
-          text: '_(Claude Fable 5 kept refusing in this session; using Claude Opus 5.5 for the rest of it. Switch models in Settings.)_\n\n',
+          text: '_(Claude Fable 5.1 kept refusing in this session; using Claude Opus 5.5 for the rest of it. Switch models in Settings.)_\n\n',
         });
       }
       log.info(`[agent] session ${sessionId} had a Fable refusal; using ${REFUSAL_FALLBACK_MODEL} directly`);
@@ -1773,7 +1773,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         // module-level Set could have).
         setSetting(`session_refused_${sessionId}`, '1');
         const note =
-          `_(Claude Fable 5 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
+          `_(Claude Fable 5.1 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
           `retrying on Claude Opus 5.5.)_\n\n`;
         onEv({ type: 'text_delta', sessionId, text: note });
         log.warn(
@@ -1834,7 +1834,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         } catch (fallbackErr) {
           log.error(`[agent] refusal fallback also failed: ${(fallbackErr as Error).message}`);
           const failText =
-            'Claude Fable 5 declined this turn and the automatic retry on Claude Opus 5.5 also failed. ' +
+            'Claude Fable 5.1 declined this turn and the automatic retry on Claude Opus 5.5 also failed. ' +
             'Try rephrasing, or switch the model in Settings.';
           (response.content as any) = [
             ...(Array.isArray(response.content) ? response.content : []),

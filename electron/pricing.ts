@@ -59,6 +59,14 @@ const TABLE: Record<string, ModelPricing> = {
   // 0.1x/1.25x/2x multipliers, so the derived pricing() values are exact.
   // Required as an explicit entry: "fable" matches no family fallback, so
   // without this the cost report would wrongly use the $5/$25 Opus default.
+  // Claude Fable 5.1 / Mythos 5.1: same $10 input / $50 output as Fable 5, but
+  // cache hits dropped to $0.25/MTok - 0.025x the input price, a QUARTER of the
+  // standard 0.1x. Stated explicitly; the derived value ($1) would bill cached
+  // tokens at 4x their real cost.
+  'claude-fable-5-1': pricing(10, 50, { cacheRead: 0.25 }),
+  'claude-fable-5-1-1m': pricing(10, 50, { cacheRead: 0.25 }),
+  'claude-mythos-5-1': pricing(10, 50, { cacheRead: 0.25 }),
+  'claude-mythos-5-1-1m': pricing(10, 50, { cacheRead: 0.25 }),
   'claude-fable-5': pricing(10, 50),
   'claude-mythos-5': pricing(10, 50),
   // Claude Opus 5.5: cheaper than Opus 5 on BOTH uncached and cached tokens.
@@ -77,7 +85,16 @@ const TABLE: Record<string, ModelPricing> = {
   'claude-opus-4-7-1m': pricing(5, 25),
   'claude-opus-4-6': pricing(5, 25),
   'claude-opus-4-5': pricing(5, 25),
+  // Opus 4.1 / 4 predate the price cut and keep the legacy $15/$75. Opus 4.1
+  // needs an explicit entry: without one it would hit the opus family fallback
+  // and be reported at $5/$25, understating its real cost threefold.
+  'claude-opus-4-1': pricing(15, 75),
   'claude-opus-4': pricing(15, 75),
+  // Claude Sonnet 5: $2 input / $10 output, cheaper than Sonnet 4.6's $3/$15.
+  // Its cache rates ($0.20 hit, $2.50 5m, $4 1h) follow the standard
+  // multipliers, so they derive correctly.
+  'claude-sonnet-5': pricing(2, 10),
+  'claude-sonnet-5-1m': pricing(2, 10),
   'claude-sonnet-4-6': pricing(3, 15),
   'claude-sonnet-4-5': pricing(3, 15),
   'claude-sonnet-4': pricing(3, 15),

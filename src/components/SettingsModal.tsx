@@ -233,7 +233,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <Field
             icon={<Cpu size={14} />}
             label="Model"
-            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-opus-5-5[1m]) - strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless. Default is Claude Opus 5.5 at xhigh effort. Smart routing can send simple turns to a cheaper model. You can also switch an individual session's model by right-clicking it in the sidebar. If Fable 5 ever refuses a turn it auto-retries on Opus 5.5, and if it keeps refusing in a session that session switches to Opus."
+            hint="Anthropic model id. Append [1m] for 1M-context (e.g. claude-opus-5-5[1m]) - strongly recommended for agentic work; the 200K cap forces lots of compaction. Server-side micro-compaction is enabled regardless. Default is Claude Opus 5.5 at xhigh effort. Smart routing can send simple turns to a cheaper model. You can also switch an individual session's model by right-clicking it in the sidebar. If Fable 5.1 ever refuses a turn it auto-retries on Opus 5.5, and if it keeps refusing in a session that session switches to Opus."
           >
             <input
               type="text"

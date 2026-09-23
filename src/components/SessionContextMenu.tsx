@@ -22,7 +22,7 @@ import { sessionDisplayTitle } from '@/lib/format';
 // change; "Use default" (clearing the override) always follows Settings.
 const MODEL_CHOICES: { id: string; label: string }[] = [
   { id: 'claude-opus-5-5[1m]', label: 'Claude Opus 5.5' },
-  { id: 'claude-fable-5[1m]', label: 'Claude Fable 5' },
+  { id: 'claude-fable-5-1[1m]', label: 'Claude Fable 5.1' },
 ];
 
 interface Props {
