@@ -76,19 +76,36 @@ void getApiKey;
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-// Claude Opus 5.5 is the default. It is cheaper than Opus 5 on both uncached
-// and cached tokens ($4/$20 vs $5/$25, and $0.20 vs $0.50 per MTok on cache
-// hits). (Claude Fable 5 stays selectable per-session via the sidebar
-// right-click menu; the refusal->fallback, routing, and per-session
-// auto-disable still apply to anyone who selects Fable.)
-export const DEFAULT_MODEL = 'claude-opus-5-5[1m]';
+// Claude Opus 5 is the default.
+//
+// ⚠ Opus 5.5 is cheaper ($4/$20 vs $5/$25, and $0.20 vs $0.50 on cache hits)
+// and was briefly the default, but its safety classifier REFUSES ordinary
+// agentic work. Measured against real workloads: it declined 3 of 3 prompts
+// involving ssh / scp / remote scripting with
+//   stop_reason 'refusal', stop_details.category 'cyber'
+// and ZERO content blocks, while Opus 5 handled all three. A refusal produces
+// an empty turn, so the user sees tool calls with no prose - the symptom that
+// made 1.5.x unusable.
+//
+// Opus 5.5 stays selectable per-session (right-click a session) for work that
+// doesn't touch remote hosts, where it is cheaper and just as capable. If it
+// refuses there, the refusal fallback retries on Opus 5 automatically.
+export const DEFAULT_MODEL = 'claude-opus-5[1m]';
 
-// When Fable 5 returns stop_reason 'refusal' (an empty response from its safety
-// classifier), the agent transparently retries that turn on this fallback
-// model, which doesn't refuse legitimate coding work. The fallback is marked
-// visibly so the user knows it happened. (Only relevant when a user has
-// selected Fable 5; the default no longer refuses.)
-export const REFUSAL_FALLBACK_MODEL = 'claude-opus-5-5[1m]';
+// When a model ends a turn with stop_reason 'refusal' (empty content from its
+// safety classifier), the agent transparently retries that turn on this
+// fallback model and marks the fallback visibly.
+//
+// ⚠ This MUST NOT equal DEFAULT_MODEL. The retry is guarded by
+// `model !== REFUSAL_FALLBACK_MODEL`, so making them the same silently
+// disables the whole mechanism: a refusal then ends the turn with no content
+// and no explanation, which is exactly what broke 1.5.x (Opus 5.5 was both).
+// There is a test asserting they differ.
+//
+// Opus 4.8 predates the tightened classifiers and does not refuse the ssh /
+// remote-scripting work that Opus 5.5 declines, so it is the safety net for a
+// session that hits a refusal on any newer model.
+export const REFUSAL_FALLBACK_MODEL = 'claude-opus-4-8[1m]';
 
 // The default `effort` level for the model. Fable 5 (and Opus 4.7/4.8) take an
 // `effort` parameter (sent as output_config.effort) that trades thoroughness

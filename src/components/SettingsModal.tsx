@@ -31,7 +31,7 @@ interface Props {
 // Keep this in sync with `electron/anthropic.ts` DEFAULT_MODEL. The `[1m]`
 // suffix is the Claude Code convention for opting into the 1M-context
 // window — at sub-1M sizes the 200K cap forces aggressive compaction.
-const DEFAULT_MODEL = 'claude-opus-5-5[1m]';
+const DEFAULT_MODEL = 'claude-opus-5[1m]';
 
 export function SettingsModal({ open, onClose }: Props) {
   const [model, setModel] = useState<string>(DEFAULT_MODEL);

@@ -268,24 +268,28 @@ describe('Claude Fable 5 pricing + default', () => {
     expect(p.inputUsdPerMillion).not.toBe(5 * 1_000_000);
   });
 
-  it('DEFAULT_MODEL is claude-opus-5-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
+  it('DEFAULT_MODEL is claude-opus-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
     const { DEFAULT_MODEL, DEFAULT_EFFORT } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-5-5[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
     expect(DEFAULT_EFFORT).toBe('xhigh');
   });
 });
 
 describe('refusal fallback config', () => {
-  it('default is opus-5-5[1m] and REFUSAL_FALLBACK_MODEL is opus-5-5[1m]', async () => {
+  it('the refusal fallback is a DIFFERENT model from the default', async () => {
     const { DEFAULT_MODEL, REFUSAL_FALLBACK_MODEL } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-5-5[1m]');
-    expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-5-5[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
+    expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-4-8[1m]');
+    // THE INVARIANT THAT BROKE 1.5.x: the retry is guarded by
+    // `model !== REFUSAL_FALLBACK_MODEL`, so if the default IS the fallback a
+    // refusal silently ends the turn with no content and no explanation.
+    expect(REFUSAL_FALLBACK_MODEL).not.toBe(DEFAULT_MODEL);
     // Default (Fable) and fallback (Opus) differ, so a refusal actually switches.
   });
 
-  it('the fallback model is priced correctly (opus 5.5 = $4/$20)', async () => {
-    const opus = getPricing('claude-opus-5-5');
-    expect(opus.inputUsdPerMillion).toBe(4 * 1_000_000);
-    expect(opus.outputUsdPerMillion).toBe(20 * 1_000_000);
+  it('the fallback model is priced correctly (opus 4.8 = $5/$25)', async () => {
+    const opus = getPricing('claude-opus-4-8');
+    expect(opus.inputUsdPerMillion).toBe(5 * 1_000_000);
+    expect(opus.outputUsdPerMillion).toBe(25 * 1_000_000);
   });
 });

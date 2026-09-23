@@ -516,6 +516,31 @@ function migrateSettings() {
     }
     setSetting('migrated.opus5_5_default', '1');
   }
+
+  // ...and straight back again. Opus 5.5's safety classifier refuses ordinary
+  // agentic work: ssh / scp / remote scripting return stop_reason 'refusal',
+  // category 'cyber', with NO content - so turns showed tool calls and no
+  // prose. Measured 3 of 3 real workflows refused on 5.5, 0 of 3 on Opus 5.
+  // Move anyone the previous migration pushed onto 5.5 back to Opus 5. It
+  // stays selectable per-session for work that doesn't touch remote hosts.
+  if (!getSetting('migrated.revert_opus5_5_refusals')) {
+    if (getSetting('model') === 'claude-opus-5-5[1m]') {
+      setSetting('model', 'claude-opus-5[1m]');
+    }
+    // Sessions that hit an Opus 5.5 refusal have a `session_refused_<id>` flag
+    // pinning them to the fallback forever. That flag was recorded against a
+    // model they are no longer using, so clear it and let them start clean.
+    try {
+      db()
+        .prepare(
+          "DELETE FROM settings WHERE key LIKE 'session_refused_%' OR key LIKE 'session_refused_notified_%'"
+        )
+        .run();
+    } catch {
+      /* non-fatal */
+    }
+    setSetting('migrated.revert_opus5_5_refusals', '1');
+  }
 }
 
 // ---- Schema migrations ----

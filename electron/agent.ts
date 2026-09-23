@@ -937,6 +937,20 @@ export function broadcast(e: AgentEvent) {
  * exits (turn_done or wait_for_user). Multiple tool-use sub-turns happen
  * inside this one call; each contributes a usage_event row.
  */
+/**
+ * Human-readable model name for user-facing notices: 'claude-opus-5-5[1m]' ->
+ * 'Claude Opus 5.5'. Derived rather than hardcoded, because hardcoding it meant
+ * a refusal notice said "Fable 5.1 declined" no matter which model refused.
+ */
+export function prettyModelName(model: string): string {
+  const id = (model || '').replace(/\[.*?\]$/, '').trim();
+  const m = id.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?/i);
+  if (!m) return id || 'the model';
+  const family = m[1].charAt(0).toUpperCase() + m[1].slice(1);
+  const version = m[3] ? `${m[2]}.${m[3]}` : m[2];
+  return `Claude ${family} ${version}`;
+}
+
 export async function runUserTurn(args: RunArgs): Promise<void> {
   const { sessionId, projectId, cwd, seedFromJsonl } = args;
   // Slash-command rewriting: a leading `/skill-name [args]` becomes a
@@ -1249,24 +1263,35 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         log.warn(`[agent] routing failed, keeping strong model: ${(e as Error).message}`);
       }
     }
-    // If the selected model (Fable 5) already refused in this session, stop
-    // calling it - use the fallback model directly so we don't waste a call and
-    // show a refusal notice every turn. Tell the user about the switch once.
+    // If the selected model already refused in this session, stop calling it -
+    // use the fallback directly so we don't waste a call and show a refusal
+    // notice every turn. Tell the user about the switch once.
+    //
+    // ⚠ This used to be gated on /fable|mythos/, back when only Fable refused.
+    // Opus 5.5's classifier declines ordinary agentic work too (ssh + remote
+    // scripting => category 'cyber'), so an Opus 5.5 session would refuse on
+    // EVERY turn and never switch. The rule is now about the REFUSAL, not the
+    // model family.
     if (
       getSetting(`session_refused_${sessionId}`) === '1' &&
-      model !== REFUSAL_FALLBACK_MODEL &&
-      /fable|mythos/i.test(model)
+      model !== REFUSAL_FALLBACK_MODEL
     ) {
+      const wasModel = model;
       model = REFUSAL_FALLBACK_MODEL;
       if (getSetting(`session_refused_notified_${sessionId}`) !== '1') {
         setSetting(`session_refused_notified_${sessionId}`, '1');
         onEv({
           type: 'text_delta',
           sessionId,
-          text: '_(Claude Fable 5.1 kept refusing in this session; using Claude Opus 5.5 for the rest of it. Switch models in Settings.)_\n\n',
+          text:
+            `_(${prettyModelName(wasModel)} kept refusing in this session; using ` +
+            `${prettyModelName(REFUSAL_FALLBACK_MODEL)} for the rest of it. ` +
+            'Switch models in Settings.)_\n\n',
         });
       }
-      log.info(`[agent] session ${sessionId} had a Fable refusal; using ${REFUSAL_FALLBACK_MODEL} directly`);
+      log.info(
+        `[agent] session ${sessionId} had a refusal from ${wasModel}; using ${REFUSAL_FALLBACK_MODEL} directly`
+      );
     }
     // Skills loaded from ~/.guycode/skills, <cwd>/.guycode/skills, and
     // imported from ~/.claude/skills + <cwd>/.claude/skills. The
@@ -1759,6 +1784,17 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // 'refusal' is a real runtime stop_reason but isn't in our pinned SDK's
       // union type yet, so compare as a string.
       const isRefusal = (response.stop_reason as string) === 'refusal';
+      // The API explains WHY in stop_details; surfacing the category turns a
+      // baffling blank turn into something actionable (e.g. 'cyber' for ssh
+      // + remote scripting, which Opus 5.5's classifier flags).
+      const refusalCategory: string =
+        ((response as any)?.stop_details?.category as string) || '';
+      if (isRefusal) {
+        log.warn(
+          `[agent] ${model} refused sessionId=${sessionId} category=${refusalCategory || 'unknown'} ` +
+            `explanation=${((response as any)?.stop_details?.explanation || '').slice(0, 200)}`
+        );
+      }
       const hasAnyContent = Array.isArray(response.content)
         ? response.content.some(
             (b: any) =>
@@ -1772,9 +1808,20 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         // survives restarts and avoids any module-instance ambiguity that a
         // module-level Set could have).
         setSetting(`session_refused_${sessionId}`, '1');
+        // Name the models involved DYNAMICALLY. This used to hardcode
+        // "Fable 5.1 -> Opus 5.5", which was wrong the moment any other model
+        // refused - and actively confusing once Opus 5.5 became the default
+        // and started refusing ordinary ssh work itself.
+        const refusedLabel = prettyModelName(model);
+        const fallbackLabel = prettyModelName(REFUSAL_FALLBACK_MODEL);
+        const reason = isRefusal
+          ? refusalCategory
+            ? ` (refused: ${refusalCategory})`
+            : ' (refusal)'
+          : ' (empty response)';
         const note =
-          `_(Claude Fable 5.1 declined this turn${isRefusal ? ' (refusal)' : ' (empty response)'}; ` +
-          `retrying on Claude Opus 5.5.)_\n\n`;
+          `_(${refusedLabel} declined this turn${reason}; ` +
+          `retrying on ${fallbackLabel}.)_\n\n`;
         onEv({ type: 'text_delta', sessionId, text: note });
         log.warn(
           `[agent] ${isRefusal ? 'refusal' : 'empty'} from ${model} sessionId=${sessionId} - falling back to ${REFUSAL_FALLBACK_MODEL}`
@@ -1829,12 +1876,32 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
             { type: 'text', text: note },
             ...(Array.isArray(fallbackResponse.content) ? fallbackResponse.content : []),
           ];
+          // The fallback can refuse too (measured: Opus 5 also declines some
+          // scp-and-run prompts). Never leave the user with a blank turn -
+          // explain what happened instead.
+          const fbHasContent = Array.isArray(fallbackResponse.content)
+            ? fallbackResponse.content.some(
+                (b: any) =>
+                  (b.type === 'text' && (b.text || '').trim()) || b.type === 'tool_use'
+              )
+            : false;
+          if (!fbHasContent) {
+            const bothText =
+              `Both ${refusedLabel} and ${fallbackLabel} declined this turn` +
+              (refusalCategory ? ` (category: ${refusalCategory})` : '') +
+              '. This usually means a safety classifier flagged the request - ' +
+              'rephrasing it, or splitting it into smaller steps, normally works. ' +
+              'You can also switch models in Settings.';
+            onEv({ type: 'text_delta', sessionId, text: bothText });
+            (fallbackResponse.content as any) = [{ type: 'text', text: bothText }];
+          }
           response = fallbackResponse;
           stopReason = fallbackResponse.stop_reason;
         } catch (fallbackErr) {
           log.error(`[agent] refusal fallback also failed: ${(fallbackErr as Error).message}`);
           const failText =
-            'Claude Fable 5.1 declined this turn and the automatic retry on Claude Opus 5.5 also failed. ' +
+            `${prettyModelName(model)} declined this turn and the automatic retry on ` +
+            `${prettyModelName(REFUSAL_FALLBACK_MODEL)} also failed. ` +
             'Try rephrasing, or switch the model in Settings.';
           (response.content as any) = [
             ...(Array.isArray(response.content) ? response.content : []),
