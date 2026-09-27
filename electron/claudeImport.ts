@@ -18,6 +18,8 @@ import {
   setImportedFile,
   listSessionsForTitleBackfill,
   setSessionTitle,
+  getSetting,
+  setSetting,
 } from './db';
 import { computeCostMicros } from './pricing';
 
@@ -454,6 +456,30 @@ function bestTitle(s: {
 }
 
 /**
+ * `sessionId -> "<size>:<mtimeMs>"` for the last title scan, so unchanged
+ * transcripts can be skipped. Kept in settings (one small JSON blob) rather
+ * than a table - it is a cache, and losing it just means one slow scan.
+ */
+function getTitleScanIndex(): Record<string, string> {
+  try {
+    const raw = getSetting('import.title_scan_index');
+    if (!raw) return {};
+    const o = JSON.parse(String(raw));
+    return o && typeof o === 'object' ? (o as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function setTitleScanIndex(idx: Record<string, string>): void {
+  try {
+    setSetting('import.title_scan_index', JSON.stringify(idx));
+  } catch (e) {
+    log.warn(`[backfillTitles] could not persist scan index: ${(e as Error).message}`);
+  }
+}
+
+/**
  * Scan EVERY known session JSONL and upgrade its `title` to the best
  * available signal: latest `custom-title` event (user rename) > latest
  * `ai-title` event (Claude's own auto title) > first user message.
@@ -463,8 +489,33 @@ function bestTitle(s: {
 export function backfillTitles(): number {
   const targets = listSessionsForTitleBackfill();
   let count = 0;
+  // PERF: this runs at EVERY startup and used to read + JSON.parse every
+  // session transcript in full. On a real install that is 814 files / 1.5GB /
+  // 730,590 lines - measured at 9s of parsing alone, and ~48s of blocked main
+  // process once the per-session DB writes are included. It was the single
+  // longest freeze after the database flush was fixed.
+  //
+  // A title can only change if the FILE changed, so skip anything whose
+  // size+mtime matches what we recorded last time. First run after upgrading
+  // still does the full pass; after that it is nearly free.
+  const seen = getTitleScanIndex();
+  const nextIndex: Record<string, string> = {};
+  let skipped = 0;
+  const t0 = Date.now();
   for (const t of targets) {
     if (!existsSync(t.jsonl_path)) continue;
+    let stamp = '';
+    try {
+      const st = statSync(t.jsonl_path);
+      stamp = `${st.size}:${st.mtimeMs}`;
+      nextIndex[t.id] = stamp;
+      if (seen[t.id] === stamp) {
+        skipped++;
+        continue; // unchanged since the last scan - title cannot have changed
+      }
+    } catch {
+      /* fall through and scan it */
+    }
     try {
       // Read whole file as text so we can pick up `custom-title` / `ai-title`
       // events which may appear anywhere (the user can rename mid-conversation).
@@ -508,5 +559,10 @@ export function backfillTitles(): number {
       log.warn(`[backfillTitles] ${t.jsonl_path}: ${(e as Error).message}`);
     }
   }
+  setTitleScanIndex(nextIndex);
+  log.info(
+    `[backfillTitles] scanned ${targets.length - skipped} of ${targets.length} session(s) ` +
+      `(${skipped} unchanged, skipped) in ${Date.now() - t0}ms`
+  );
   return count;
 }

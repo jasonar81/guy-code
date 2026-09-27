@@ -11,6 +11,13 @@ import { resolve } from 'node:path';
 export default defineConfig({
   plugins: [react()],
   test: {
+    // Vitest's 5s default is too tight for this suite when it runs in
+    // parallel: several tests spawn real shells, walk the real memory tree, or
+    // import large module graphs. They finish in ~1s standalone but can exceed
+    // 5s under load, which made CI fail at random on a different file each
+    // run. 30s is still short enough to catch a genuine hang.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
     // Run all tests in tests/ + colocated *.test.ts(x) files anywhere
     // under src/ or electron/.
     include: [
