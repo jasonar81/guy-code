@@ -12,7 +12,9 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('electron', () => ({ app: { getPath: () => '/tmp' }, safeStorage: {} }));
 vi.mock('electron-log', () => ({ default: { info() {}, warn() {}, error() {} } }));
 
-describe('prettyModelName', () => {
+// Importing agent.ts pulls in a large module graph, which can exceed vitest's
+// 5s default on the first import when the suite runs in parallel.
+describe('prettyModelName', { timeout: 30_000 }, () => {
   it('renders the current models the way a person would say them', async () => {
     const { prettyModelName } = await import('../electron/agent');
     expect(prettyModelName('claude-opus-5-5[1m]')).toBe('Claude Opus 5.5');

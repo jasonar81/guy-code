@@ -32,6 +32,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+// Async file APIs for the periodic flush - see flushAsync(). Writing the
+// database synchronously froze the UI for ~1.7s every 5s on a large DB.
+import * as fsp from 'node:fs/promises';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
@@ -196,14 +199,185 @@ export async function initDb(): Promise<void> {
   _db.exec('PRAGMA foreign_keys = ON');
   migrate(_db);
   migrateSettings();
+  // Housekeeping: roll up old usage + prune audit rows so the file we
+  // rewrite on every flush stays small.
+  compactDatabase();
   flush(); // ensure freshly migrated DB hits disk
 
-  _flushTimer = setInterval(() => flush(), 5000);
+  // Persist on a timer, ASYNCHRONOUSLY and with an interval that backs off as
+  // the database grows. The old `setInterval(flush, 5000)` rewrote the entire
+  // file synchronously - 1.7s of frozen UI every 5s on a 656MB DB.
+  const armFlushTimer = () => {
+    if (_flushTimer) clearInterval(_flushTimer);
+    const every = flushIntervalMs();
+    log.info(`[db] flushing every ${every}ms`);
+    _flushTimer = setInterval(() => {
+      void flushAsync();
+    }, every);
+  };
+  armFlushTimer();
+  // Re-evaluate the cadence occasionally so a growing DB backs off on its own.
+  const _cadenceTimer = setInterval(armFlushTimer, 10 * 60 * 1000);
+  _cadenceTimer.unref?.();
 
   app.on('before-quit', () => {
+    // Synchronous here on purpose: the process is going away and we must not
+    // lose the last writes.
     flush();
     if (_flushTimer) clearInterval(_flushTimer);
+    clearInterval(_cadenceTimer);
   });
+}
+
+/**
+ * True while an async flush is writing. Prevents overlapping writes (two
+ * concurrent renames onto the same path) and lets the caller skip a tick.
+ */
+let _flushing = false;
+/** Set when a change lands while a flush is in flight. */
+let _flushAgain = false;
+
+/**
+ * Persist the database WITHOUT blocking the main process.
+ *
+ * ⚠ THIS IS THE BIGGEST SOURCE OF UI FREEZES. sql.js keeps the whole database
+ * in memory, so persisting means serializing and rewriting the ENTIRE file.
+ * Measured on a real 656MB database: export() 278ms + writeFileSync() 1438ms =
+ * **1.7 seconds of hard main-thread blocking, every 5 seconds** - roughly a
+ * third of all wall-clock time, which is exactly the constant "(Not
+ * Responding)", the laggy typing, and the stalled scrolling.
+ *
+ * Two changes fix it:
+ *   1. The file write is ASYNC (fs.promises.writeFile + rename). Only the
+ *      export() remains synchronous, because sql.js has no async export - and
+ *      that is the cheaper half by 5x.
+ *   2. The interval BACKS OFF as the database grows (see flushIntervalMs), so
+ *      a large DB isn't rewritten every 5 seconds.
+ */
+async function flushAsync(): Promise<void> {
+  if (!_db || !_dirty || _flushing) {
+    if (_dirty && _flushing) _flushAgain = true;
+    return;
+  }
+  _flushing = true;
+  _dirty = false;
+  try {
+    // Unavoidably synchronous (sql.js API), but it is the fast half.
+    const data = _db.export();
+    const tmpPath = _dbPath + '.tmp';
+    // ...whereas the write is the expensive half, and it can be awaited so
+    // the event loop keeps pumping input, IPC and paint while it happens.
+    await fsp.writeFile(tmpPath, Buffer.from(data));
+    await fsp.rename(tmpPath, _dbPath);
+  } catch (e) {
+    _dirty = true; // try again next tick
+    log.error('[db] async flush failed', e);
+  } finally {
+    _flushing = false;
+    if (_flushAgain) {
+      _flushAgain = false;
+      _dirty = true;
+    }
+  }
+}
+
+/**
+ * How often to persist, scaled to the cost of doing so. A small DB flushes
+ * promptly; a large one (where a flush is expensive) flushes less often. The
+ * synchronous flush on quit means nothing is lost either way.
+ */
+function flushIntervalMs(): number {
+  let mb = 0;
+  try {
+    mb = statSync(_dbPath).size / (1024 * 1024);
+  } catch {
+    /* first run */
+  }
+  if (mb > 400) return 60_000;
+  if (mb > 150) return 30_000;
+  if (mb > 50) return 15_000;
+  return 5_000;
+}
+
+/** Synchronous flush. Only for app quit, where blocking is acceptable. */
+/**
+ * Keep the database small.
+ *
+ * sql.js persists by rewriting the WHOLE file, so every megabyte is paid on
+ * every flush. Measured on a real install: 656MB -> export 278ms + write
+ * 1438ms, i.e. 1.7s of blocked UI per flush. Most of that size was history
+ * nobody reads per-event: 659,343 usage_events (321,504 of them older than 90
+ * days) and 271,214 audit_events.
+ *
+ * Old usage is ROLLED UP (one row per day/session/model/source) rather than
+ * deleted, so every cost total - all-time session cost, per-project spend -
+ * stays exactly correct. Audit rows, which are a debugging aid, are pruned.
+ *
+ * Runs once at startup, after migrations. Best-effort: any failure is logged
+ * and ignored, because this is housekeeping, never correctness.
+ */
+const USAGE_DETAIL_DAYS = 90;
+const AUDIT_KEEP_DAYS = 30;
+
+function compactDatabase(): void {
+  if (!_db) return;
+  try {
+    const usageCutoff = Date.now() - USAGE_DETAIL_DAYS * 86_400_000;
+    const auditCutoff = Date.now() - AUDIT_KEEP_DAYS * 86_400_000;
+
+    const before = (() => {
+      try { return statSync(_dbPath).size; } catch { return 0; }
+    })();
+
+    const oldCount = (
+      _db.exec(`SELECT count(*) FROM usage_events WHERE ts < ${usageCutoff}`)[0]
+        ?.values?.[0]?.[0] as number
+    ) ?? 0;
+
+    if (oldCount > 0) {
+      // Fold the detail into the rollup table, then drop it. date(ts/1000,
+      // 'unixepoch') gives a stable YYYY-MM-DD bucket.
+      _db.exec(`
+        INSERT INTO usage_rollup
+          (day, session_id, project_id, model, source, api_key_id,
+           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+           cost_usd_micros, events)
+        SELECT date(ts/1000, 'unixepoch'), session_id, project_id, model, source, api_key_id,
+               COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+               COALESCE(SUM(cache_read_tokens),0),
+               COALESCE(SUM(cache_write_5m_tokens),0) + COALESCE(SUM(cache_write_1h_tokens),0),
+               COALESCE(SUM(cost_usd_micros),0), COUNT(*)
+          FROM usage_events
+         WHERE ts < ${usageCutoff}
+         GROUP BY date(ts/1000, 'unixepoch'), session_id, project_id, model, source, api_key_id;
+      `);
+      _db.exec(`DELETE FROM usage_events WHERE ts < ${usageCutoff}`);
+    }
+
+    const auditCount = (
+      _db.exec(`SELECT count(*) FROM audit_events WHERE ts < ${auditCutoff}`)[0]
+        ?.values?.[0]?.[0] as number
+    ) ?? 0;
+    if (auditCount > 0) {
+      _db.exec(`DELETE FROM audit_events WHERE ts < ${auditCutoff}`);
+    }
+
+    if (oldCount > 0 || auditCount > 0) {
+      // Reclaim the pages, otherwise the file (and therefore every flush)
+      // stays exactly as big as it was.
+      _db.exec('VACUUM');
+      _dirty = true;
+      flush();
+      let after = 0;
+      try { after = statSync(_dbPath).size; } catch { /* ignore */ }
+      log.info(
+        `[db] compacted: rolled up ${oldCount} usage event(s), pruned ${auditCount} audit row(s); ` +
+          `${(before / 1048576).toFixed(0)}MB -> ${(after / 1048576).toFixed(0)}MB`
+      );
+    }
+  } catch (e) {
+    log.error('[db] compaction failed (non-fatal)', e);
+  }
 }
 
 function flush() {
@@ -885,6 +1059,37 @@ function migrate(d: Database) {
         CREATE INDEX IF NOT EXISTS usage_source_session ON usage_events(source, session_id);
       `,
     },
+    {
+      version: 13,
+      // SIZE. sql.js holds the whole database in memory and persists by
+      // rewriting the ENTIRE file, so file size is paid on every flush -
+      // measured at 1.7s of blocking on a 656MB database. The bulk of that
+      // size is history nobody queries per-event:
+      //   usage_events  659,343 rows (321,504 older than 90 days)
+      //   audit_events  271,214 rows
+      //
+      // Roll old usage up into ONE row per (day, session, model, source) so
+      // every cost total stays exactly right, and drop audit rows past the
+      // window. VACUUM afterwards to actually return the space.
+      up: `
+        CREATE TABLE IF NOT EXISTS usage_rollup (
+          day TEXT NOT NULL,
+          session_id TEXT,
+          project_id TEXT,
+          model TEXT,
+          source TEXT,
+          api_key_id TEXT,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd_micros INTEGER NOT NULL DEFAULT 0,
+          events INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS usage_rollup_day ON usage_rollup(day);
+        CREATE INDEX IF NOT EXISTS usage_rollup_session ON usage_rollup(session_id);
+      `,
+    },
   ];
 
   for (const m of migrations) {
@@ -937,7 +1142,8 @@ export function listProjects(): ProjectRow[] {
         p.archived,
         p.last_activity_ts,
         p.created_at,
-        COALESCE((SELECT SUM(cost_usd_micros) FROM usage_events u WHERE u.project_id = p.id AND u.source = 'live'), 0) AS cost_all_time_micros,
+        COALESCE((SELECT SUM(cost_usd_micros) FROM usage_events u WHERE u.project_id = p.id AND u.source = 'live'), 0)
+          + COALESCE((SELECT SUM(cost_usd_micros) FROM usage_rollup r WHERE r.project_id = p.id AND r.source = 'live'), 0) AS cost_all_time_micros,
         COALESCE((SELECT SUM(cost_usd_micros) FROM usage_events u WHERE u.project_id = p.id AND u.source = 'live' AND u.ts >= ?), 0) AS cost_24h_micros,
         COALESCE((SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id), 0) AS session_count,
         (SELECT last_message_preview
@@ -1238,6 +1444,9 @@ export function deleteSession(id: string): void {
   // schema versions don't have all of them).
   for (const sql of [
     'DELETE FROM usage_events WHERE session_id = ?',
+    // Rolled-up history for the same session, or its cost would linger after
+    // the session is gone.
+    'DELETE FROM usage_rollup WHERE session_id = ?',
     'DELETE FROM audit_events WHERE session_id = ?',
     'DELETE FROM sessions WHERE id = ?',
   ]) {
@@ -1545,7 +1754,15 @@ export function listSessionsAll(): SessionFullRow[] {
       FROM sessions s
       LEFT JOIN projects p ON p.id = s.project_id
       LEFT JOIN (
-        SELECT session_id, SUM(cost_usd_micros) AS total FROM usage_events WHERE source = 'live' GROUP BY session_id
+        -- All-time cost must include rolled-up history, or every session that
+        -- predates the retention window would suddenly report less than it
+        -- really cost. (24h cost below needs no union: the rollup only ever
+        -- holds rows older than the detail window.)
+        SELECT session_id, SUM(total) AS total FROM (
+          SELECT session_id, SUM(cost_usd_micros) AS total FROM usage_events WHERE source = 'live' GROUP BY session_id
+          UNION ALL
+          SELECT session_id, SUM(cost_usd_micros) AS total FROM usage_rollup WHERE source = 'live' GROUP BY session_id
+        ) GROUP BY session_id
       ) c ON c.session_id = s.id
       LEFT JOIN (
         SELECT session_id, SUM(cost_usd_micros) AS total FROM usage_events WHERE source = 'live' AND ts >= ? GROUP BY session_id
@@ -1596,8 +1813,12 @@ export function getSessionById(id: string): SessionFullRow | undefined {
         s.api_key_id,
         s.force_continue,
         p.cwd AS cwd,
+        -- Includes rolled-up history (see listSessionsAll for why).
         COALESCE((
           SELECT SUM(cost_usd_micros) FROM usage_events
+           WHERE source = 'live' AND session_id = s.id
+        ), 0) + COALESCE((
+          SELECT SUM(cost_usd_micros) FROM usage_rollup
            WHERE source = 'live' AND session_id = s.id
         ), 0) AS cost_all_time_micros,
         COALESCE((
