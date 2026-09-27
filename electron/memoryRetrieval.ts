@@ -47,6 +47,16 @@ const TAIL_TOTAL_CAP = 48 * 1024;
 const PER_LEAF_CAP = 24 * 1024;
 /** If the tail is this small, skip the gate and just include it all. */
 const GATE_MIN_CANDIDATES = 6;
+/**
+ * Cap on the memory-relevance call. It runs before EVERY turn and blocks it,
+ * so an unbounded request means an unbounded freeze - measured at 15s and 34s
+ * on a real machine. Past this we skip the optional tail notes for the turn.
+ */
+const GATE_TIMEOUT_MS = 4_000;
+/** How long a gate answer stays good for. */
+const GATE_CACHE_MS = 90_000;
+/** contextKey -> the names the gate last chose. Bounded to ~32 entries. */
+const _gateCache = new Map<string, { at: number; names: string[] }>();
 
 export interface LeafMeta {
   path: string;
@@ -141,33 +151,66 @@ export async function gateTail(
 ): Promise<string[]> {
   if (tail.length === 0) return [];
   if (tail.length <= GATE_MIN_CANDIDATES) return tail.map((t) => t.name);
+
+  // Serve a recent answer rather than calling the model again. This runs
+  // BEFORE EVERY TURN, and the call is a network round trip: measured stalls
+  // of 15s and 34s on a real machine, where the only thing between
+  // "appended placeholder user message" and "loaded memory" was this request.
+  // The set of relevant notes barely moves within a single piece of work, so a
+  // short-lived cache removes almost all of those calls.
+  const cacheKey = `${tail.length}:${truncate(contextText, 400)}`;
+  const cached = _gateCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < GATE_CACHE_MS) {
+    return cached.names;
+  }
+
   try {
     const list = tail.map((c) => `- ${c.name}: ${truncate(c.description, 200)}`).join('\n');
     const client = getClient(apiKeyId);
-    const resp = await client.messages.create({
-      model: GATE_MODEL,
-      max_tokens: 1024,
+    // HARD TIMEOUT. Without one this call is unbounded, and a slow response
+    // holds up the whole turn - which is exactly what the 34s freeze was. If
+    // it doesn't answer quickly we simply skip the optional tail notes; the
+    // pinned/recent memory is loaded regardless, so nothing important is lost.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), GATE_TIMEOUT_MS);
+    let resp;
+    try {
+      resp = await client.messages.create(
+        {
+          model: GATE_MODEL,
+          max_tokens: 1024,
       system:
         'You select which of the user\'s older saved notes are relevant to what they are CURRENTLY working on. ' +
         'You are given recent conversation context (and possibly an active plan) plus a list of note names+descriptions. ' +
         'Return ONLY a JSON array of the exact `name` values worth loading. Prefer to INCLUDE a note if there is any reasonable chance it applies to the current work (recall matters more than precision here); always include relevant safety, workflow, and convention rules. ' +
         'Return [] if none apply. Output nothing but the JSON array.',
-      messages: [
-        {
-          role: 'user',
-          content: `Older saved notes (name: description):\n${list}\n\nWhat I'm currently working on:\n${truncate(
-            contextText,
-            8000
-          )}`,
+          messages: [
+            {
+              role: 'user',
+              content: `Older saved notes (name: description):\n${list}\n\nWhat I'm currently working on:\n${truncate(
+                contextText,
+                8000
+              )}`,
+            },
+          ],
         },
-      ],
-    });
+        { signal: ctrl.signal }
+      );
+    } finally {
+      clearTimeout(timer);
+    }
     const text = (resp.content || [])
       .filter((b: any) => b.type === 'text')
       .map((b: any) => b.text)
       .join('');
     const names = parseNameArray(text);
     if (names === null) throw new Error('gate returned no parseable JSON array');
+    _gateCache.set(cacheKey, { at: Date.now(), names });
+    if (_gateCache.size > 32) {
+      // Cheap bound: drop the oldest entry.
+      const oldest = [..._gateCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (oldest) _gateCache.delete(oldest[0]);
+    }
     return names;
   } catch (e) {
     log.warn(`[memoryRetrieval] tail gate failed (${(e as Error).message}); tail not added this turn`);
