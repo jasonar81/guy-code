@@ -219,6 +219,17 @@ export async function initDb(): Promise<void> {
   // Re-evaluate the cadence occasionally so a growing DB backs off on its own.
   const _cadenceTimer = setInterval(armFlushTimer, 10 * 60 * 1000);
   _cadenceTimer.unref?.();
+  // Re-compact daily. Usage accumulates fast on a busy install (335,666 rows
+  // came back inside the retention window within days), and the file size is
+  // paid on every flush - so this cannot be startup-only.
+  const _compactTimer = setInterval(
+    () => {
+      compactDatabase();
+      armFlushTimer();
+    },
+    24 * 60 * 60 * 1000
+  );
+  _compactTimer.unref?.();
 
   app.on('before-quit', () => {
     // Synchronous here on purpose: the process is going away and we must not
@@ -226,6 +237,7 @@ export async function initDb(): Promise<void> {
     flush();
     if (_flushTimer) clearInterval(_flushTimer);
     clearInterval(_cadenceTimer);
+    clearInterval(_compactTimer);
   });
 }
 
@@ -316,8 +328,17 @@ function flushIntervalMs(): number {
  * Runs once at startup, after migrations. Best-effort: any failure is logged
  * and ignored, because this is housekeeping, never correctness.
  */
-const USAGE_DETAIL_DAYS = 90;
-const AUDIT_KEEP_DAYS = 30;
+// Retention windows. These are the numbers that decide how big the file we
+// rewrite on every flush is, so they matter for responsiveness, not just disk.
+//
+// 90/30 days left a 224MB database on a heavy install (335,666 usage_events
+// still inside the window, plus 44MB of audit_events.input_json), and a
+// 224MB rewrite is ~100ms of export plus a 225MB write. Tightened, with the
+// rollup still preserving every cost total exactly.
+const USAGE_DETAIL_DAYS = 30;
+const AUDIT_KEEP_DAYS = 7;
+/** Tool inputs are a debugging aid; keep them briefly, keep the rows longer. */
+const AUDIT_INPUT_KEEP_DAYS = 2;
 
 function compactDatabase(): void {
   if (!_db) return;
@@ -362,7 +383,22 @@ function compactDatabase(): void {
       _db.exec(`DELETE FROM audit_events WHERE ts < ${auditCutoff}`);
     }
 
-    if (oldCount > 0 || auditCount > 0) {
+    // The tool INPUT blobs dominate what is left (44MB across 47k rows on a
+    // real install). Drop the payload but keep the row, so the audit trail -
+    // which tool ran, when, how long, whether it failed - stays intact.
+    const inputCutoff = Date.now() - AUDIT_INPUT_KEEP_DAYS * 86_400_000;
+    const fatInputs = (
+      _db.exec(
+        `SELECT count(*) FROM audit_events WHERE ts < ${inputCutoff} AND input_json IS NOT NULL AND LENGTH(input_json) > 200`
+      )[0]?.values?.[0]?.[0] as number
+    ) ?? 0;
+    if (fatInputs > 0) {
+      _db.exec(
+        `UPDATE audit_events SET input_json = NULL WHERE ts < ${inputCutoff} AND input_json IS NOT NULL AND LENGTH(input_json) > 200`
+      );
+    }
+
+    if (oldCount > 0 || auditCount > 0 || fatInputs > 0) {
       // Reclaim the pages, otherwise the file (and therefore every flush)
       // stays exactly as big as it was.
       _db.exec('VACUUM');
@@ -371,7 +407,8 @@ function compactDatabase(): void {
       let after = 0;
       try { after = statSync(_dbPath).size; } catch { /* ignore */ }
       log.info(
-        `[db] compacted: rolled up ${oldCount} usage event(s), pruned ${auditCount} audit row(s); ` +
+        `[db] compacted: rolled up ${oldCount} usage event(s), pruned ${auditCount} audit row(s), ` +
+          `cleared ${fatInputs} tool input blob(s); ` +
           `${(before / 1048576).toFixed(0)}MB -> ${(after / 1048576).toFixed(0)}MB`
       );
     }

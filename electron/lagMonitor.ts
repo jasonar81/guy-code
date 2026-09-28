@@ -20,6 +20,12 @@ import log from 'electron-log';
 const TICK_MS = 250;
 /** Only report stalls longer than this (below it, nobody notices). */
 const REPORT_MS = 400;
+/**
+ * Report an instrumented operation that runs long even if the sampler didn't
+ * happen to tick during it. Lower than REPORT_MS because attributing a 250ms
+ * step is how we find the ones that add up.
+ */
+const SLOW_OP_MS = 250;
 
 let timer: NodeJS.Timeout | null = null;
 let last = 0;
@@ -68,7 +74,7 @@ export function instrument<T>(name: string, fn: () => T): T {
     // sampler happened not to tick during it.
     if (entry) {
       const took = Date.now() - entry.started;
-      if (took >= REPORT_MS) {
+      if (took >= SLOW_OP_MS) {
         log.warn(`[lag] "${name}" took ${took}ms on the main process`);
         const t = tally.get(name) ?? { count: 0, totalMs: 0, worstMs: 0 };
         t.count += 1;

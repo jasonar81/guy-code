@@ -5,7 +5,7 @@
 
 import { BrowserWindow } from 'electron';
 import log from 'electron-log';
-import { instrument } from './lagMonitor';
+import { instrument, instrumentAsync } from './lagMonitor';
 import { randomUUID } from 'node:crypto';
 import type Anthropic from '@anthropic-ai/sdk';
 import {
@@ -1176,7 +1176,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // doesn't accept output_config) gets it omitted.
     const effortSetting = getSetting('effort');
     const effort = effortSetting === undefined ? DEFAULT_EFFORT : (effortSetting as string);
-    const memory = loadMemory({ cwd, projectId });
+    const memory = instrument('agent: loadMemory', () => loadMemory({ cwd, projectId }));
     if (memory.sources.length > 0) {
       log.info(
         `[agent] loaded memory: ${memory.sources.length} files, ${memory.text.length}b (truncated ${memory.truncatedBytes}b)`
@@ -1479,10 +1479,14 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // what gets used by subsequent loop iterations. The on-disk JSONL
       // is the canonical source of truth and is unchanged — compaction
       // is purely a runtime projection.
-      const sanitized = sanitizeMessages(messages, knownToolNames);
+      const sanitized = instrument('agent: sanitize', () =>
+        sanitizeMessages(messages, knownToolNames)
+      );
       let preflighted: Anthropic.MessageParam[] = sanitized;
       try {
-        preflighted = await preflightCompactIfNeeded(sanitized, model);
+        preflighted = await instrumentAsync('agent: preflight compaction', () =>
+          preflightCompactIfNeeded(sanitized, model)
+        );
       } catch (e) {
         log.warn('[agent] preflight compaction failed; sending uncompacted', e);
         preflighted = sanitized;
@@ -1492,10 +1496,14 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         // boundary can leave orphaned tool pairings, and replace the
         // working `messages` so subsequent loop iterations see the
         // smaller form.
-        messages = sanitizeMessages(preflighted, knownToolNames);
+        messages = instrument('agent: re-sanitize after compaction', () =>
+          sanitizeMessages(preflighted, knownToolNames)
+        );
         preflighted = messages;
       }
-      let messagesToSend = withConversationCacheBreakpoint(preflighted);
+      let messagesToSend = instrument('agent: cache breakpoint', () =>
+        withConversationCacheBreakpoint(preflighted)
+      );
 
       // Surface the API call to the UI so the "thinking..." gap is visible.
       // Use `estimateTokens` (the same estimator compaction uses) so the
@@ -1503,7 +1511,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // pre-flight checks against.
       let estTokens = 0;
       try {
-        estTokens = estimateTokens(messagesToSend);
+        estTokens = instrument('agent: estimateTokens', () => estimateTokens(messagesToSend));
       } catch {
         estTokens = 0;
       }

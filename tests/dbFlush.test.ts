@@ -99,4 +99,30 @@ describe('compaction keeps the file small without losing cost history', () => {
     const body = bodyOf(dbSrc, 'function compactDatabase');
     expect(body).toMatch(/catch \(e\)[\s\S]*log\.error/);
   });
+
+  /**
+   * Startup-only compaction wasn't enough: on a busy install 335,666 usage
+   * rows came back inside the retention window within days, taking the file
+   * (and therefore every flush) back to 224MB.
+   */
+  it('also re-compacts on a timer, not just at startup', () => {
+    expect(dbSrc).toMatch(/setInterval\(\s*\(\)\s*=>\s*\{\s*compactDatabase\(\)/);
+    expect(dbSrc).toMatch(/clearInterval\(_compactTimer\)/);
+  });
+
+  it('strips fat tool-input blobs but keeps the audit rows', () => {
+    const body = bodyOf(dbSrc, 'function compactDatabase');
+    // UPDATE ... SET input_json = NULL, not DELETE - the trail survives.
+    expect(body).toMatch(/UPDATE audit_events SET input_json = NULL/);
+    expect(body).toMatch(/LENGTH\(input_json\) > 200/);
+  });
+
+  it('retention windows are tight enough to keep the file small', () => {
+    const usage = Number(dbSrc.match(/const USAGE_DETAIL_DAYS = (\d+)/)?.[1]);
+    const audit = Number(dbSrc.match(/const AUDIT_KEEP_DAYS = (\d+)/)?.[1]);
+    expect(usage).toBeGreaterThan(0);
+    expect(usage).toBeLessThanOrEqual(30);
+    expect(audit).toBeGreaterThan(0);
+    expect(audit).toBeLessThanOrEqual(30);
+  });
 });
