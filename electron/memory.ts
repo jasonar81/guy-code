@@ -287,6 +287,72 @@ export function loadMemory(args: {
   cwd: string;
   projectId: string;
 }): MemoryBundle {
+  // PERF: this reads the whole memory tree - 3,024 .md files / 48MB on a real
+  // install - SYNCHRONOUSLY, on the main process, BEFORE EVERY TURN. Idle it
+  // costs ~130ms, but with several sessions and subagents hammering the same
+  // disk it was measured at 8s, 15s, 21s and 32s, and it was the single
+  // named offender in the lag log (86s across 7 calls). The content barely
+  // changes between turns, so serve a cached bundle and only re-read when the
+  // memory directories have actually been touched.
+  const cached = _bundleCache;
+  if (cached && cached.cwd === args.cwd && cached.projectId === args.projectId) {
+    const fresh = Date.now() - cached.at < MEMORY_CACHE_MS;
+    if (fresh && cached.stamp === memoryTreeStamp(args.cwd, args.projectId)) {
+      return cached.bundle;
+    }
+  }
+  const bundle = loadMemoryUncached(args);
+  _bundleCache = {
+    cwd: args.cwd,
+    projectId: args.projectId,
+    at: Date.now(),
+    stamp: memoryTreeStamp(args.cwd, args.projectId),
+    bundle,
+  };
+  return bundle;
+}
+
+/** How long a memory bundle may be reused before we re-check the tree. */
+const MEMORY_CACHE_MS = 60_000;
+
+let _bundleCache:
+  | { cwd: string; projectId: string; at: number; stamp: string; bundle: MemoryBundle }
+  | null = null;
+
+/**
+ * A cheap fingerprint of the memory tree: the mtime+size of each memory
+ * DIRECTORY (not every file). Directory mtime changes when a leaf is added,
+ * removed or renamed, and saveMemory touches the file - so pair it with the
+ * TTL above, which bounds how long an in-place edit can go unnoticed.
+ */
+function memoryTreeStamp(cwd: string, projectId: string): string {
+  const dirs = [
+    join(homedir(), '.guycode', 'memory'),
+    join(homedir(), '.guycode', 'projects', projectId, 'memory'),
+    join(homedir(), '.claude'),
+    cwd,
+  ];
+  const parts: string[] = [];
+  for (const d of dirs) {
+    try {
+      const st = statSync(d);
+      parts.push(`${st.mtimeMs}`);
+    } catch {
+      parts.push('-');
+    }
+  }
+  return parts.join('|');
+}
+
+/** Clear the cache - call after writing a memory leaf so the next turn sees it. */
+export function invalidateMemoryCache(): void {
+  _bundleCache = null;
+}
+
+function loadMemoryUncached(args: {
+  cwd: string;
+  projectId: string;
+}): MemoryBundle {
   const { cwd, projectId } = args;
   const sources: string[] = [];
   const segments: string[] = [];
@@ -559,6 +625,7 @@ export function saveMemory(args: {
       };
     }
     writeFileSync(path, final, 'utf8');
+  invalidateMemoryCache();
     log.info(`[memory] saved ${scope} memory ${key} (${final.length}b) -> ${path}`);
     return { ok: true, path, bytes: final.length };
   } catch (e: any) {
@@ -621,6 +688,7 @@ export function setMemoryPriority(args: {
       /* ignore */
     }
     writeFileSync(path, updated, 'utf8');
+  invalidateMemoryCache();
     if (prevMtime) {
       try {
         utimesSync(path, prevMtime, prevMtime);
@@ -786,6 +854,7 @@ export function deleteGuyMemory(args: {
   if (!existsSync(path)) return { ok: false, error: 'not found' };
   try {
     unlinkSync(path);
+    invalidateMemoryCache();
     log.info(`[memory] deleted ${args.scope} memory ${key} -> ${path}`);
     return { ok: true };
   } catch (e: any) {
