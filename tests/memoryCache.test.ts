@@ -44,8 +44,29 @@ describe('loadMemory caching', () => {
 
   it('keys the cache on cwd AND projectId (different sessions differ)', () => {
     const body = bodyOf('export function loadMemory');
-    expect(body).toMatch(/cached\.cwd === args\.cwd/);
-    expect(body).toMatch(/cached\.projectId === args\.projectId/);
+    expect(body).toMatch(/const key = `\$\{args\.projectId\}/);
+    expect(body).toMatch(/_bundleCache\.get\(key\)/);
+  });
+
+  /**
+   * The first version of this cache MISSED EVERY TIME and loadMemory still
+   * took 23s and 35s in production. Two reasons, both guarded here.
+   */
+  it('holds MANY entries - concurrent sessions must not evict each other', () => {
+    expect(src).toMatch(/_bundleCache = new Map</);
+    const body = bodyOf('export function loadMemory');
+    expect(body).toMatch(/_bundleCache\.set\(key/);
+    // and it stays bounded
+    expect(body).toMatch(/_bundleCache\.size > \d+/);
+  });
+
+  it('does NOT include cwd in the freshness stamp (agents write there constantly)', () => {
+    const stamp = bodyOf('function memoryTreeStamp', 900);
+    // The parameter is deliberately unused.
+    expect(stamp).toMatch(/_cwd: string/);
+    // The directory list must not contain a bare `cwd` entry.
+    const dirList = stamp.slice(stamp.indexOf('const dirs'), stamp.indexOf(']'));
+    expect(dirList).not.toMatch(/^\s*cwd,\s*$/m);
   });
 
   it('re-reads when the memory directories change', () => {

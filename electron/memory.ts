@@ -294,30 +294,45 @@ export function loadMemory(args: {
   // named offender in the lag log (86s across 7 calls). The content barely
   // changes between turns, so serve a cached bundle and only re-read when the
   // memory directories have actually been touched.
-  const cached = _bundleCache;
-  if (cached && cached.cwd === args.cwd && cached.projectId === args.projectId) {
+  // ⚠ TWO BUGS MADE THE FIRST VERSION OF THIS CACHE MISS EVERY SINGLE TIME,
+  // so loadMemory still showed up at 23s and 35s after it shipped:
+  //   1. `cwd` was part of the freshness stamp. Agents WRITE FILES INTO cwd
+  //      constantly, so its mtime changed on almost every turn and busted the
+  //      cache immediately. The memory tree does not live in cwd; only the
+  //      walk-up for CLAUDE.md does, and that is cheap.
+  //   2. It was a SINGLE slot. With several sessions running concurrently,
+  //      each one evicted the others, so every turn was a miss.
+  // Now: one entry PER (cwd, projectId), and the stamp covers only the
+  // directories memory actually comes from.
+  const key = `${args.projectId}\u0000${args.cwd}`;
+  const cached = _bundleCache.get(key);
+  if (cached) {
     const fresh = Date.now() - cached.at < MEMORY_CACHE_MS;
     if (fresh && cached.stamp === memoryTreeStamp(args.cwd, args.projectId)) {
       return cached.bundle;
     }
   }
   const bundle = loadMemoryUncached(args);
-  _bundleCache = {
-    cwd: args.cwd,
-    projectId: args.projectId,
+  _bundleCache.set(key, {
     at: Date.now(),
     stamp: memoryTreeStamp(args.cwd, args.projectId),
     bundle,
-  };
+  });
+  // Bound it: one entry per live session is plenty.
+  if (_bundleCache.size > 64) {
+    const oldest = [..._bundleCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) _bundleCache.delete(oldest[0]);
+  }
   return bundle;
 }
 
 /** How long a memory bundle may be reused before we re-check the tree. */
 const MEMORY_CACHE_MS = 60_000;
 
-let _bundleCache:
-  | { cwd: string; projectId: string; at: number; stamp: string; bundle: MemoryBundle }
-  | null = null;
+const _bundleCache = new Map<
+  string,
+  { at: number; stamp: string; bundle: MemoryBundle }
+>();
 
 /**
  * A cheap fingerprint of the memory tree: the mtime+size of each memory
@@ -325,12 +340,16 @@ let _bundleCache:
  * removed or renamed, and saveMemory touches the file - so pair it with the
  * TTL above, which bounds how long an in-place edit can go unnoticed.
  */
-function memoryTreeStamp(cwd: string, projectId: string): string {
+function memoryTreeStamp(_cwd: string, projectId: string): string {
+  // ⚠ DELIBERATELY NOT `cwd`. Agents write files into the working directory on
+  // nearly every turn, so including it changed the stamp constantly and the
+  // cache never hit. Memory does not live in cwd - the only thing cwd
+  // contributes is the CLAUDE.md walk-up, which is a handful of stats and is
+  // bounded by the TTL anyway.
   const dirs = [
     join(homedir(), '.guycode', 'memory'),
     join(homedir(), '.guycode', 'projects', projectId, 'memory'),
     join(homedir(), '.claude'),
-    cwd,
   ];
   const parts: string[] = [];
   for (const d of dirs) {
@@ -346,7 +365,7 @@ function memoryTreeStamp(cwd: string, projectId: string): string {
 
 /** Clear the cache - call after writing a memory leaf so the next turn sees it. */
 export function invalidateMemoryCache(): void {
-  _bundleCache = null;
+  _bundleCache.clear();
 }
 
 function loadMemoryUncached(args: {
