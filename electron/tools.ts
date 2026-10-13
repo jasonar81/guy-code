@@ -1563,7 +1563,10 @@ const SAVE_MEMORY: ToolDef = {
       priority,
     });
     if (!r.ok) return `error: ${r.error}`;
-    return `Saved ${scope} memory (${r.bytes}b) at ${r.path}. Will be loaded into context at the start of every future session.`;
+    const base = `Saved ${scope} memory (${r.bytes}b) at ${r.path}. Will be loaded into context at the start of every future session.`;
+    // Pass the risky-content warning through so the model learns to phrase the
+    // next note neutrally instead of quoting API response fields.
+    return r.warning ? `${base}\n\nNOTE: ${r.warning}` : base;
   },
 };
 

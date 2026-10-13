@@ -22,7 +22,11 @@ import { sessionDisplayTitle } from '@/lib/format';
 // change; "Use default" (clearing the override) always follows Settings.
 const MODEL_CHOICES: { id: string; label: string }[] = [
   { id: 'claude-opus-5[1m]', label: 'Claude Opus 5' },
-  { id: 'claude-opus-5-5[1m]', label: 'Claude Opus 5.5 (refuses ssh work)' },
+  // 5.5 is ~20% cheaper on input/output and much cheaper on cache hits. It
+  // declines roughly 1 turn in 5 of remote-shell work, but those turns are
+  // retried automatically on Opus 5, so the cost saving is real and the
+  // refusals are invisible.
+  { id: 'claude-opus-5-5[1m]', label: 'Claude Opus 5.5 (cheaper, auto-retries)' },
   { id: 'claude-fable-5-1[1m]', label: 'Claude Fable 5.1' },
 ];
 

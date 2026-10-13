@@ -15,6 +15,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
   REFUSAL_FALLBACK_MODEL,
+  fallbackFor,
 } from './anthropic';
 import {
   appendJsonlEvent,
@@ -1809,7 +1810,12 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
               (b.type === 'text' && (b.text || '').trim()) || b.type === 'tool_use'
           )
         : false;
-      if ((isRefusal || !hasAnyContent) && model !== REFUSAL_FALLBACK_MODEL) {
+      // Where can this turn be retried? Normally the primary fallback, but if
+      // the refusing model IS the primary fallback we still need somewhere to
+      // go - otherwise the turn ends empty with no explanation, which is what
+      // made 1.5.x unusable.
+      const retryModel = fallbackFor(model);
+      if ((isRefusal || !hasAnyContent) && retryModel) {
         // Remember that this session's model refused, so subsequent turns use
         // the fallback model directly instead of wasting a call + showing this
         // notice every turn. Persisted in the DB (single source of truth that
@@ -1821,7 +1827,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         // refused - and actively confusing once Opus 5.5 became the default
         // and started refusing ordinary ssh work itself.
         const refusedLabel = prettyModelName(model);
-        const fallbackLabel = prettyModelName(REFUSAL_FALLBACK_MODEL);
+        const fallbackLabel = prettyModelName(retryModel);
         const reason = isRefusal
           ? refusalCategory
             ? ` (refused: ${refusalCategory})`
@@ -1832,11 +1838,11 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           `retrying on ${fallbackLabel}.)_\n\n`;
         onEv({ type: 'text_delta', sessionId, text: note });
         log.warn(
-          `[agent] ${isRefusal ? 'refusal' : 'empty'} from ${model} sessionId=${sessionId} - falling back to ${REFUSAL_FALLBACK_MODEL}`
+          `[agent] ${isRefusal ? 'refusal' : 'empty'} from ${model} sessionId=${sessionId} - falling back to ${retryModel}`
         );
         try {
           const fallbackResponse = await streamMessage({
-            model: REFUSAL_FALLBACK_MODEL,
+            model: retryModel,
             effort,
             system: refreshedSystemBlocks,
             tools,

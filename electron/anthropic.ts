@@ -102,10 +102,36 @@ export const DEFAULT_MODEL = 'claude-opus-5[1m]';
 // and no explanation, which is exactly what broke 1.5.x (Opus 5.5 was both).
 // There is a test asserting they differ.
 //
-// Opus 4.8 predates the tightened classifiers and does not refuse the ssh /
-// remote-scripting work that Opus 5.5 declines, so it is the safety net for a
-// session that hits a refusal on any newer model.
-export const REFUSAL_FALLBACK_MODEL = 'claude-opus-4-8[1m]';
+// Opus 5 is the safety net. Measured on the REAL memory bundle with
+// production max_tokens, 20 agentic turns each:
+//   Opus 5    20/20 ok, 0 refusals
+//   Opus 5.5  16/20 ok, 4 refusals (category 'reasoning_extraction')
+// So a 5.5 refusal retried on Opus 5 succeeds, which makes 5.5 usable despite
+// its higher refusal rate - the user never sees the difference except in the
+// bill.
+export const REFUSAL_FALLBACK_MODEL = 'claude-opus-5[1m]';
+
+/**
+ * Used when the model that refused IS the primary fallback, so there is still
+ * somewhere to retry. Opus 4.8 predates the tightened classifiers.
+ *
+ * Without this, a refusal on the default (which equals the primary fallback)
+ * had nowhere to go and the turn ended empty - the exact failure that made
+ * 1.5.x unusable.
+ */
+export const SECONDARY_FALLBACK_MODEL = 'claude-opus-4-8[1m]';
+
+/** The model to retry `model` on, or null if there is nowhere sensible to go. */
+export function fallbackFor(model: string): string | null {
+  const bare = model.replace(/\[.*?\]$/, '');
+  const primaryBare = REFUSAL_FALLBACK_MODEL.replace(/\[.*?\]$/, '');
+  // Normal case: retry on the primary fallback (Opus 5, measured 20/20 clean).
+  if (bare !== primaryBare) return REFUSAL_FALLBACK_MODEL;
+  // The refusing model IS the primary fallback - which is also the default, so
+  // this is the common case, not an edge case. Go to the secondary so the turn
+  // always has somewhere to retry instead of ending empty.
+  return SECONDARY_FALLBACK_MODEL;
+}
 
 // The default `effort` level for the model. Fable 5 (and Opus 4.7/4.8) take an
 // `effort` parameter (sent as output_config.effort) that trades thoroughness

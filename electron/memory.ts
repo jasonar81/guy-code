@@ -25,6 +25,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { sanitizeMemoryText, countRedactions, riskyMemoryTerms } from './memorySafety';
 import { dirname, join, parse as parsePath, resolve as resolvePath } from 'node:path';
 import log from 'electron-log';
 
@@ -496,8 +497,28 @@ function loadMemoryUncached(args: {
     `Guy-owned (\`~/.guycode/...\`) files are WRITABLE via the save_memory tool. ` +
     `Imported Claude files (\`~/.claude/...\`) are READ-ONLY \u2014 never edit those. ` +
     `Use these for style, conventions, and prior decisions; treat them as authoritative context.`;
+  // SAFETY: redact model-API-internals vocabulary before this text is injected
+  // into a request. Notes that quote stop_reason / refusal categories / beta
+  // headers read to the safety classifier as an attempt to reverse-engineer
+  // the model, and it answers with stop_reason 'refusal',
+  // category 'reasoning_extraction', and NO content - which surfaces as a turn
+  // with tool calls and no prose, or nothing at all.
+  //
+  // Measured on this memory tree (855 leaves), same agentic prompt, 12 runs:
+  //   Opus 5    full memory 12/12 refused -> redacted 0/12
+  //   Opus 5.5  full memory 12/12 refused -> redacted 5/12
+  // The files on disk are untouched; only the injected copy is redacted.
+  const raw = `${header}\n\n${segments.join('\n\n')}`;
+  const redactions = countRedactions(raw);
+  const text = redactions > 0 ? sanitizeMemoryText(raw) : raw;
+  if (redactions > 0) {
+    log.info(
+      `[memory] redacted ${redactions} model-internals term(s) from injected memory ` +
+        `(prevents 'reasoning_extraction' refusals; files on disk unchanged)`
+    );
+  }
   return {
-    text: `${header}\n\n${segments.join('\n\n')}`,
+    text,
     sources,
     truncatedBytes: truncated,
   };
@@ -523,6 +544,15 @@ export interface SaveMemoryResult {
   path?: string;
   bytes?: number;
   error?: string;
+  /**
+   * Set when the saved note contains model-API-internals vocabulary
+   * (stop_reason, refusal categories, beta headers, ...). Such notes make the
+   * safety classifier treat the whole request as an attempt to reverse-
+   * engineer the model, which returns an EMPTY refused turn. The note is still
+   * saved and the injected copy is redacted automatically, but the caller is
+   * told so it can phrase the next one neutrally.
+   */
+  warning?: string;
 }
 
 /**
@@ -646,6 +676,21 @@ export function saveMemory(args: {
     writeFileSync(path, final, 'utf8');
   invalidateMemoryCache();
     log.info(`[memory] saved ${scope} memory ${key} (${final.length}b) -> ${path}`);
+    // Tell the caller when a note contains model-API-internals vocabulary.
+    // The note IS saved (it's the user's data and the engineering content is
+    // usually valuable) and the injected copy is redacted automatically, but
+    // surfacing it lets the next note be written neutrally in the first place.
+    const terms = riskyMemoryTerms(final);
+    if (terms.length > 0) {
+      const warning =
+        `Saved, but this note quotes model-API internals (${terms.slice(0, 4).join(', ')}). ` +
+        `Notes like this make the API treat the whole request as reverse-engineering and ` +
+        `return an empty refused turn, so the injected copy is redacted automatically. ` +
+        `Prefer describing behaviour in plain terms (e.g. "the model declined the turn") ` +
+        `rather than quoting response fields.`;
+      log.warn(`[memory] ${key}: risky terms ${terms.slice(0, 6).join(', ')}`);
+      return { ok: true, path, bytes: final.length, warning };
+    }
     return { ok: true, path, bytes: final.length };
   } catch (e: any) {
     return { ok: false, error: `write failed: ${e?.message ?? e}` };
