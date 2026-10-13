@@ -76,21 +76,25 @@ void getApiKey;
 // Without this header the API caps inputs at 200K, which is too small for
 // agentic work on real codebases (e.g. reading several large files per
 // turn quickly hits the limit and forces aggressive compaction).
-// Claude Opus 5 is the default.
+// Claude Opus 5.5 is the default: cheaper on every dimension ($4/$20 vs
+// $5/$25, and $0.20 vs $0.50 per MTok on cache hits) and more capable.
 //
-// ⚠ Opus 5.5 is cheaper ($4/$20 vs $5/$25, and $0.20 vs $0.50 on cache hits)
-// and was briefly the default, but its safety classifier REFUSES ordinary
-// agentic work. Measured against real workloads: it declined 3 of 3 prompts
-// involving ssh / scp / remote scripting with
-//   stop_reason 'refusal', stop_details.category 'cyber'
-// and ZERO content blocks, while Opus 5 handled all three. A refusal produces
-// an empty turn, so the user sees tool calls with no prose - the symptom that
-// made 1.5.x unusable.
+// It declines a NARROW class of prompt that the older models accept. Measured
+// with the real memory bundle, 8 representative prompts x 3 runs:
+//   Opus 5.5  21/24   (all 3 failures were ONE prompt shape: a terse
+//                      "check whether <file> exists on host X over ssh")
+//   Opus 5    24/24
+//   Opus 4.8  24/24
+// The failure is deterministic for that shape and NOT caused by memory - it
+// reproduces with no memory at all - so it cannot be prompt-engineered away
+// from our side. (Measured: adding an "the user is authorised" framing line
+// made it strictly WORSE, 16/16 refused, because asserting permission reads
+// like a jailbreak preamble.)
 //
-// Opus 5.5 stays selectable per-session (right-click a session) for work that
-// doesn't touch remote hosts, where it is cheaper and just as capable. If it
-// refuses there, the refusal fallback retries on Opus 5 automatically.
-export const DEFAULT_MODEL = 'claude-opus-5[1m]';
+// It is still the right default because a declined turn is retried
+// automatically on Opus 5 and then Opus 4.8, both of which take that prompt.
+// End-to-end that is a 100% user-visible success rate at the lower price.
+export const DEFAULT_MODEL = 'claude-opus-5-5[1m]';
 
 // When a model ends a turn with stop_reason 'refusal' (empty content from its
 // safety classifier), the agent transparently retries that turn on this

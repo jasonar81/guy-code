@@ -79,4 +79,29 @@ describe('redacting before injection', () => {
     const once = sanitizeMemoryText('stop_reason and anthropic-beta and output_config');
     expect(sanitizeMemoryText(once)).toBe(once);
   });
+
+  /**
+   * A real leaf had the quoted phrase split across a markdown line break
+   * ("...REVERSE ENGINEERING OR DUPLICATING MODEL ## OUTPUTS..."), which the
+   * exact-phrase pattern missed - so the term survived on disk.
+   */
+  it('matches the quoted phrase despite case and markdown line-wrapping', () => {
+    const wrapped = 'restrictions on REVERSE ENGINEERING OR DUPLICATING MODEL ## OUTPUTS here';
+    expect(hasRiskyMemoryContent(wrapped)).toBe(true);
+    expect(sanitizeMemoryText(wrapped)).not.toMatch(/reverse\s+engineering\s+or\s+duplicating/i);
+  });
+});
+
+describe('notes are written clean, not just redacted at injection', () => {
+  it('saveMemory sanitizes before writing to disk', async () => {
+    const src = await import('node:fs').then((fs) =>
+      fs.readFileSync(
+        new URL('../electron/memory.ts', import.meta.url).pathname.replace(/^\//, ''),
+        'utf8'
+      )
+    );
+    // The write must use the sanitized text, not the raw text.
+    expect(src).toMatch(/const cleaned = sanitizeMemoryText\(final\)/);
+    expect(src).toMatch(/writeFileSync\(path, cleaned, 'utf8'\)/);
+  });
 });

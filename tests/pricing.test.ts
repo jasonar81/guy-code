@@ -270,7 +270,7 @@ describe('Claude Fable 5 pricing + default', () => {
 
   it('DEFAULT_MODEL is claude-opus-5[1m] and DEFAULT_EFFORT is xhigh', async () => {
     const { DEFAULT_MODEL, DEFAULT_EFFORT } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5-5[1m]');
     expect(DEFAULT_EFFORT).toBe('xhigh');
   });
 });
@@ -278,7 +278,7 @@ describe('Claude Fable 5 pricing + default', () => {
 describe('refusal fallback config', () => {
   it('the refusal fallback is a DIFFERENT model from the default', async () => {
     const { DEFAULT_MODEL, REFUSAL_FALLBACK_MODEL } = await import('../electron/anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-opus-5[1m]');
+    expect(DEFAULT_MODEL).toBe('claude-opus-5-5[1m]');
     // Opus 5 measured 20/20 clean on real agentic turns, so it is the safety
     // net that makes the cheaper Opus 5.5 usable.
     expect(REFUSAL_FALLBACK_MODEL).toBe('claude-opus-5[1m]');

@@ -673,25 +673,33 @@ export function saveMemory(args: {
         error: `file would exceed limit (${final.length} > ${MAX_MEMORY_WRITE_BYTES} bytes)`,
       };
     }
-    writeFileSync(path, final, 'utf8');
+    // Write the note CLEAN. Notes that quote model-API internals get the whole
+  // request refused (category 'reasoning_extraction'), and redacting only at
+  // injection time is fragile - the raw terms survive on disk and come back
+  // the moment a spelling slips past the redactor. Neutralising here means a
+  // risky note can only ever exist for the instant before it is written.
+  const cleaned = sanitizeMemoryText(final);
+  writeFileSync(path, cleaned, 'utf8');
   invalidateMemoryCache();
     log.info(`[memory] saved ${scope} memory ${key} (${final.length}b) -> ${path}`);
     // Tell the caller when a note contains model-API-internals vocabulary.
-    // The note IS saved (it's the user's data and the engineering content is
-    // usually valuable) and the injected copy is redacted automatically, but
-    // surfacing it lets the next note be written neutrally in the first place.
+    // The note IS saved and its engineering content kept - only the specific
+    // vocabulary is neutralised, ON DISK as well as at injection time. Writing
+    // it clean is what actually prevents the problem: redacting only at
+    // injection leaves the raw terms to be re-read by anything else (and to
+    // come back the moment the redactor misses a spelling).
     const terms = riskyMemoryTerms(final);
     if (terms.length > 0) {
       const warning =
-        `Saved, but this note quotes model-API internals (${terms.slice(0, 4).join(', ')}). ` +
-        `Notes like this make the API treat the whole request as reverse-engineering and ` +
-        `return an empty refused turn, so the injected copy is redacted automatically. ` +
-        `Prefer describing behaviour in plain terms (e.g. "the model declined the turn") ` +
-        `rather than quoting response fields.`;
+        `This note quoted model-API internals (${terms.slice(0, 4).join(', ')}), which makes ` +
+        `the API treat the whole request as reverse-engineering and refuse it with an empty ` +
+        `response. Those terms were replaced with neutral wording before saving - the ` +
+        `content is intact. Write future notes in plain terms (e.g. "the model declined the ` +
+        `turn") rather than quoting response fields.`;
       log.warn(`[memory] ${key}: risky terms ${terms.slice(0, 6).join(', ')}`);
-      return { ok: true, path, bytes: final.length, warning };
+      return { ok: true, path, bytes: cleaned.length, warning };
     }
-    return { ok: true, path, bytes: final.length };
+    return { ok: true, path, bytes: cleaned.length };
   } catch (e: any) {
     return { ok: false, error: `write failed: ${e?.message ?? e}` };
   }

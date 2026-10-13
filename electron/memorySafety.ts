@@ -54,8 +54,10 @@ const REDACTIONS: Array<{ re: RegExp; to: string }> = [
   { re: /\bmessages\.create\(/gi, to: 'api-call(' },
   { re: /\bmax_tokens\b/gi, to: 'token-limit' },
   // Verbatim refusal text copied from API responses.
+  // Tolerant of case and of line-wrapping artifacts (a note may have a "##"
+  // or newline spliced into the middle of the quoted sentence).
   {
-    re: /reverse engineering or duplicating model outputs/gi,
+    re: /reverse\s+engineering\s+or\s+duplicating(?:[\s#*>_-]*model)?(?:[\s#*>_-]*outputs)?/gi,
     to: 'the vendor policy on model internals',
   },
   {

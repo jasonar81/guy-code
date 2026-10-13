@@ -752,6 +752,18 @@ function migrateSettings() {
     }
     setSetting('migrated.revert_opus5_5_refusals', '1');
   }
+
+  // ...and forward again, now that it is safe. Opus 5.5 is cheaper on every
+  // dimension, and the measured failure is one narrow prompt shape that the
+  // automatic retry (Opus 5, then Opus 4.8) covers - 100% user-visible success
+  // end to end. The earlier revert existed because the retry was accidentally
+  // disabled, not because 5.5 was unusable.
+  if (!getSetting('migrated.opus5_5_with_chain')) {
+    if (getSetting('model') === 'claude-opus-5[1m]') {
+      setSetting('model', 'claude-opus-5-5[1m]');
+    }
+    setSetting('migrated.opus5_5_with_chain', '1');
+  }
 }
 
 // ---- Schema migrations ----
