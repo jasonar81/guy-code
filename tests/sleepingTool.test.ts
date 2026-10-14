@@ -438,15 +438,17 @@ describe('WaitForCondition', () => {
     vi.useRealTimers(); // runConditionCheck spawns real subprocesses
   });
 
-  // Spawns TWO real shells, each allowed 10s internally, so vitest's default
-  // 5s per-test budget is too small - it timed out on the Windows CI runner
-  // (and only there) while passing locally. Give it room for both spawns.
+  // Spawns TWO real shells. Both the vitest budget AND the per-check
+  // allowance have to be generous: on the Windows CI runner a shell spawn
+  // that takes ~0.5s locally took over 10s, which tripped the check's own
+  // timeout and reported launched=false - a CI-only failure that looked like
+  // a real bug. The numbers are about machine speed, not behaviour.
   it('runConditionCheck reports launched+code 0 for a passing command, launched+non-zero for a failing one', { timeout: 30_000 }, async () => {
     const { runConditionCheck } = await import('../electron/tools');
-    const ok = await runConditionCheck(exit0, process.cwd(), sh, 10_000);
+    const ok = await runConditionCheck(exit0, process.cwd(), sh, 60_000);
     expect(ok.launched).toBe(true);
     expect(ok.code).toBe(0);
-    const bad = await runConditionCheck(exit1, process.cwd(), sh, 10_000);
+    const bad = await runConditionCheck(exit1, process.cwd(), sh, 60_000);
     expect(bad.launched).toBe(true);
     expect(bad.code).not.toBe(0);
   });
@@ -455,7 +457,7 @@ describe('WaitForCondition', () => {
   it('runConditionCheck reports launched=false when the command runs but exits non-zero is distinct from a real failure to launch', { timeout: 30_000 }, async () => {
     const { runConditionCheck } = await import('../electron/tools');
     // A command that runs but exits non-zero LAUNCHED (it's just "not met").
-    const ran = await runConditionCheck(exit1, process.cwd(), sh, 10_000);
+    const ran = await runConditionCheck(exit1, process.cwd(), sh, 60_000);
     expect(ran.launched).toBe(true);
   });
 
