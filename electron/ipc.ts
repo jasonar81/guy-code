@@ -43,6 +43,7 @@ import { importClaudeProjects } from './claudeImport';
 import { listMcpServers, signInMcp, signOutMcp } from './mcp';
 import { startSlackBridge } from './slackBridge';
 import { instrument } from './lagMonitor';
+import { sendToSubagent, activeSubagent, peekSubagentInbox } from './subagentInbox';
 import {
   hasApiKey,
   setApiKey,
@@ -66,6 +67,7 @@ import {
   cancelRun,
   isRunning,
   queueInterrupt,
+  // (subagent inbox imported separately below)
   removeInterrupt,
 } from './agent';
 import { deleteSessionAttachments } from './attachments';
@@ -775,6 +777,32 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     // search for `drainInterrupts` in agent.ts.
     const pending = queueInterrupt(sessionId, text);
     return { ok: true, pending };
+  });
+
+  /**
+   * Send text to the SUBAGENT currently running in this session, rather than
+   * queueing it for the parent. The subagent drains this between its rounds,
+   * so steering actually reaches the thing doing the work instead of waiting
+   * for it to finish.
+   *
+   * Returns ok:false when no subagent is running, so the renderer can fall
+   * back to the normal interrupt queue instead of losing the text.
+   */
+  ipcMain.handle('agent:sendToSubagent', (_e, sessionId: string, text: string) => {
+    const pending = sendToSubagent(sessionId, text);
+    if (pending < 0) return { ok: false, pending: 0, reason: 'no subagent running' };
+    return { ok: true, pending };
+  });
+
+  /** What subagent (if any) is running, plus how many messages are queued. */
+  ipcMain.handle('agent:subagentStatus', (_e, sessionId: string) => {
+    const active = activeSubagent(sessionId);
+    return {
+      active: active
+        ? { runId: active.runId, role: active.role, description: active.description }
+        : null,
+      pending: peekSubagentInbox(sessionId),
+    };
   });
 
   ipcMain.handle(

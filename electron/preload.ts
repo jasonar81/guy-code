@@ -172,6 +172,12 @@ const api = {
       ipcRenderer.invoke('agent:interrupt', sessionId, text),
     removeInterrupt: (sessionId: string, text: string) =>
       ipcRenderer.invoke('agent:removeInterrupt', sessionId, text),
+    /** Send text to the subagent running right now (not the parent). */
+    sendToSubagent: (sessionId: string, text: string) =>
+      ipcRenderer.invoke('agent:sendToSubagent', sessionId, text),
+    /** Which subagent is running here, and how many messages are queued for it. */
+    subagentStatus: (sessionId: string) =>
+      ipcRenderer.invoke('agent:subagentStatus', sessionId),
     isRunning: (sessionId: string) => ipcRenderer.invoke('agent:isRunning', sessionId),
     onEvent: (cb: (e: any) => void) => {
       const listener = (_: unknown, e: any) => cb(e);

@@ -37,6 +37,11 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import log from 'electron-log';
+import {
+  markSubagentActive,
+  markSubagentDone,
+  drainSubagentInbox,
+} from './subagentInbox';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { getClient, DEFAULT_MODEL, DEFAULT_EFFORT, parseExtendedContext } from './anthropic';
@@ -355,6 +360,35 @@ export async function runSubagent(
   parent: SubagentParent,
   input: SubagentInput
 ): Promise<string> {
+  try {
+    return await runSubagentInner(parent, input);
+  } finally {
+    // However this ended - success, cap hit, abort, budget error - clear the
+    // active marker and make sure nothing the user typed is lost. A message
+    // that arrived a moment too late is handed to the PARENT's queue so it is
+    // still read on the next parent round, rather than silently dropped.
+    const leftovers = markSubagentDone(parent.sessionId);
+    if (leftovers.length > 0) {
+      log.info(
+        `[subagent] ${leftovers.length} late message(s) for the subagent; handing to the parent`
+      );
+      // Dynamic import: a static one would close the agent -> tools ->
+      // subagent -> agent cycle this module already avoids elsewhere.
+      void import('./agent')
+        .then(({ queueInterrupt }) => {
+          for (const t of leftovers) queueInterrupt(parent.sessionId, t);
+        })
+        .catch(() => {
+          /* never let this break the run */
+        });
+    }
+  }
+}
+
+async function runSubagentInner(
+  parent: SubagentParent,
+  input: SubagentInput
+): Promise<string> {
   const runId = randomUUID().slice(0, 8);
   const tag = `subagent:${runId}:${input.role}`;
   log.info(`[${tag}] start description=${JSON.stringify(input.description)}`);
@@ -389,6 +423,13 @@ export async function runSubagent(
     }
   };
   emit({ type: 'subagent_start', role: input.role, description: input.description });
+  // Let the UI offer "send this to the subagent" while it runs, and give the
+  // user somewhere to put mid-run steering.
+  markSubagentActive(parent.sessionId, {
+    runId,
+    role: input.role,
+    description: input.description,
+  });
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -407,6 +448,23 @@ export async function runSubagent(
     if (parent.signal?.aborted) {
       log.info(`[${tag}] aborted by parent before round ${round}`);
       throw new Error('subagent aborted by parent');
+    }
+
+    // Anything the user sent TO THIS SUBAGENT since the last round. Injected
+    // as a user message so it steers the work in progress - the whole point
+    // of the feature. Marked so the child knows it came from the human
+    // mid-run rather than from its parent's original instructions.
+    const steering = drainSubagentInbox(parent.sessionId);
+    if (steering.length > 0) {
+      const body = steering.map((s) => s.trim()).filter(Boolean).join('\n\n');
+      log.info(`[${tag}] injecting ${steering.length} message(s) from the user`);
+      messages.push({
+        role: 'user',
+        content:
+          `[Message from the user, sent while you are working. Take it into ` +
+          `account from here on; it supersedes earlier instructions where they conflict.]\n\n${body}`,
+      });
+      emit({ type: 'subagent_user_message', text: body });
     }
 
     // Pre-flight budget check. Subagents share the parent's bucket; if

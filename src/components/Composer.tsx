@@ -394,7 +394,24 @@ export function Composer({ sessionId, visible }: Props) {
   const liveError = errorMessage;
   const liveCost = liveTurnCostMicros;
   const interruptTurn = useApp((s) => s.interruptTurn);
+  const sendToSubagentAction = useApp((s) => s.sendToSubagent);
   const queuedCount = pendingInterruptsLen;
+
+  // A subagent runs INSIDE the parent's turn, so anything typed meanwhile
+  // normally waits for it to finish. When one is active we let the user pick
+  // where the message goes: to the subagent (it reads it between its own
+  // rounds) or queued for the main agent as before.
+  //
+  // Subscribe to a PRIMITIVE (the runId) rather than the object, so this
+  // doesn't re-render on every streamed token.
+  const subagentRunId = useApp((s) => s.activeSubagent(sessionId)?.runId ?? null);
+  const subagentRole = useApp((s) => s.activeSubagent(sessionId)?.role ?? null);
+  const [sendTo, setSendTo] = useState<'subagent' | 'agent'>('subagent');
+  // When a subagent ends, fall back to the normal destination so the next
+  // message can't be aimed at something that no longer exists.
+  useEffect(() => {
+    if (!subagentRunId) setSendTo('subagent');
+  }, [subagentRunId]);
   const awaiting = awaitingResponse;
   const retryNotice = retryNoticeVal;
   // Pull the matching session row so we can detect sleeping-budget state and
@@ -696,7 +713,13 @@ export function Composer({ sessionId, visible }: Props) {
       // sees no-op and skips.
       lastSavedDraftRef.current = null;
       window.api.sessions.setDraft(sessionId, null).catch(() => {});
-      await interruptTurn(sessionId, t);
+      // Route to the subagent when one is running and the user hasn't opted
+      // out; otherwise queue for the main agent exactly as before.
+      if (subagentRunId && sendTo === 'subagent') {
+        await sendToSubagentAction(sessionId, t);
+      } else {
+        await interruptTurn(sessionId, t);
+      }
       return;
     }
     if (!t && attachments.length === 0) return;
@@ -913,10 +936,48 @@ export function Composer({ sessionId, visible }: Props) {
             queued: {queuedCount}
           </span>
         )}
+        {subagentRunId && (
+          <span className="flex items-center gap-1">
+            <span className="text-text-muted">send to:</span>
+            <button
+              type="button"
+              onClick={() => setSendTo('subagent')}
+              className={
+                'px-1.5 py-0.5 rounded border ' +
+                (sendTo === 'subagent'
+                  ? 'border-state-attention text-state-attention'
+                  : 'border-transparent text-text-muted hover:text-text')
+              }
+              title={
+                'Deliver to the running ' +
+                (subagentRole ?? 'subagent') +
+                ' subagent. It reads your message between its rounds, so you can steer work ' +
+                'that is already in progress.'
+              }
+            >
+              {subagentRole ?? 'subagent'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSendTo('agent')}
+              className={
+                'px-1.5 py-0.5 rounded border ' +
+                (sendTo === 'agent'
+                  ? 'border-state-attention text-state-attention'
+                  : 'border-transparent text-text-muted hover:text-text')
+              }
+              title="Queue for the main agent. It reads your message once the subagent has finished."
+            >
+              main agent
+            </button>
+          </span>
+        )}
         <div className="flex-1" />
         <span>
           {streaming
-            ? 'Enter = queue for agent · Shift+Enter = newline'
+            ? subagentRunId && sendTo === 'subagent'
+              ? `Enter = send to the ${subagentRole ?? 'subagent'} subagent · Shift+Enter = newline`
+              : 'Enter = queue for agent · Shift+Enter = newline'
             : 'Enter = send · Shift+Enter = newline · paste / drop / 📎 to attach'}
         </span>
       </div>

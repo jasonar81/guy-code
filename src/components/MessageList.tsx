@@ -87,7 +87,7 @@ function filterDisplayMessages(messages: ChatMessage[]): ChatMessage[] {
  */
 type VirtItem =
   | { kind: 'message'; key: string; message: ChatMessage; isStreamingTail: boolean }
-  | { kind: 'queued'; key: string; localId: string; text: string }
+  | { kind: 'queued'; key: string; localId: string; text: string; toSubagent?: boolean }
   | { kind: 'budget-queued'; key: string; text: string; sleepingSince: number | null };
 
 /**
@@ -235,6 +235,7 @@ export function MessageList({ sessionId, visible }: Props) {
     for (const q of queued) {
       list.push({
         kind: 'queued',
+        toSubagent: q.toSubagent,
         key: `q-${q.localId}`,
         localId: q.localId,
         text: q.text,
@@ -750,7 +751,11 @@ export function MessageList({ sessionId, visible }: Props) {
           <div className="flex flex-col items-end gap-0.5 group">
             <div
               className="relative max-w-[85%] rounded-lg bg-bg-elevated/50 border border-state-attention/40 px-3 py-2 text-[13px] text-text-muted italic whitespace-pre-wrap break-words select-text"
-              title="Queued — the agent will pick this up between tool rounds"
+              title={
+                item.toSubagent
+                  ? 'Sent to the running subagent — it reads this between its rounds'
+                  : 'Queued — the agent will pick this up between tool rounds'
+              }
             >
               {item.text}
               <button
@@ -763,7 +768,9 @@ export function MessageList({ sessionId, visible }: Props) {
               </button>
             </div>
             <span className="text-[10px] text-state-attention font-mono">
-              ⏳ queued · click × to remove
+              {item.toSubagent
+                ? '→ to subagent · click × to remove'
+                : '⏳ queued · click × to remove'}
             </span>
           </div>
         </div>

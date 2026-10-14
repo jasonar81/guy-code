@@ -67,7 +67,13 @@ interface SessionChat {
    * track them locally so the composer can show "queued: 2" feedback and
    * so messages are visible to the user even before the agent picks them up.
    */
-  pendingInterrupts: Array<{ localId: string; text: string; ts: number }>;
+  pendingInterrupts: Array<{
+    localId: string;
+    text: string;
+    ts: number;
+    /** Sent to the running subagent rather than queued for the parent. */
+    toSubagent?: boolean;
+  }>;
   /**
    * When non-null, the agent is between rounds: it's flushed a tool batch
    * and is now waiting on Anthropic's API to respond. With huge contexts
@@ -324,6 +330,14 @@ interface AppState {
    * the next iteration and inlines it into the conversation.
    */
   interruptTurn: (sessionId: string, text: string) => Promise<void>;
+  /** Send text to the subagent running in this session (see the action). */
+  sendToSubagent: (sessionId: string, text: string) => Promise<void>;
+  /**
+   * The subagent currently running in this session, or null. Derived from the
+   * live message blocks (a `subagent` block with done:false), so it needs no
+   * extra state or polling.
+   */
+  activeSubagent: (sessionId: string) => { runId: string; role: string; description: string } | null;
   /**
    * Remove a queued (not-yet-picked-up) interrupt by its localId. Used by
    * the X button on a queued bubble. We delete from local state first
@@ -805,6 +819,66 @@ export const useApp = create<AppState>((set, get) => ({
       };
     });
     await window.api.agent.interrupt(sessionId, t);
+  },
+
+  /**
+   * Send text to the SUBAGENT running in this session instead of queueing it
+   * for the parent. The subagent reads it between its own rounds, so you can
+   * steer work that is already in flight rather than waiting for it to end.
+   *
+   * Falls back to the normal interrupt queue if no subagent is running (it
+   * may have finished between the UI rendering the option and the click), so
+   * the text is never lost.
+   */
+  activeSubagent: (sessionId) => {
+    const chat = get().chats[sessionId];
+    if (!chat) return null;
+    // Walk back from the newest message; a running subagent lives on the
+    // streaming assistant message, so this stops almost immediately.
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+      const m = chat.messages[i];
+      if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+      for (const b of m.content) {
+        if (b && (b as { type?: string }).type === 'subagent') {
+          const sb = b as unknown as {
+            runId: string;
+            role: string;
+            description: string;
+            done: boolean;
+          };
+          if (!sb.done) return { runId: sb.runId, role: sb.role, description: sb.description };
+        }
+      }
+      // Only the most recent assistant message can hold a RUNNING subagent.
+      if (m.role === 'assistant') break;
+    }
+    return null;
+  },
+
+  sendToSubagent: async (sessionId, text) => {
+    const t = text.trim();
+    if (!t) return;
+    const pid = localId();
+    set((s) => {
+      const cur = s.chats[sessionId] ?? emptyChat();
+      return {
+        chats: {
+          ...s.chats,
+          [sessionId]: {
+            ...cur,
+            pendingInterrupts: [
+              ...cur.pendingInterrupts,
+              { localId: pid, text: t, ts: Date.now(), toSubagent: true },
+            ],
+          },
+        },
+      };
+    });
+    const r = await window.api.agent.sendToSubagent(sessionId, t);
+    if (!r?.ok) {
+      // Subagent finished first - hand it to the parent rather than drop it.
+      await window.api.agent.interrupt(sessionId, t);
+    }
   },
 
   removeInterrupt: async (sessionId, localIdToRemove) => {

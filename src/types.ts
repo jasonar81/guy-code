@@ -635,6 +635,20 @@ declare global {
           sessionId: string,
           text: string
         ) => Promise<{ ok: boolean; removed: boolean }>;
+        /**
+         * Send text to the subagent running in this session, rather than
+         * queueing it for the parent. ok:false means no subagent is running
+         * (it may have just finished) - fall back to `interrupt`.
+         */
+        sendToSubagent: (
+          sessionId: string,
+          text: string
+        ) => Promise<{ ok: boolean; pending: number; reason?: string }>;
+        /** Which subagent is running here, and how many messages are queued. */
+        subagentStatus: (sessionId: string) => Promise<{
+          active: { runId: string; role: string; description: string } | null;
+          pending: number;
+        }>;
         isRunning: (sessionId: string) => Promise<boolean>;
         onEvent: (cb: (e: AgentEvent) => void) => () => void;
       };
