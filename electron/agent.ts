@@ -1165,6 +1165,19 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       );
     }
 
+    // Answer-before-wait guard state (see the guard after each response).
+    // A reply is owed when this turn carries a REAL message from the user -
+    // not a wake-up from a wait (empty text, or a "[WaitForCondition] ..." /
+    // "[WaitForTime] ..." resume note the wait machinery passes in).
+    const isWakeNote = /^\s*\[(WaitFor\w+|wake|resume)/i.test(effectiveText);
+    let answerOwedToUser =
+      (effectiveText.trim().length > 0 || attachments.length > 0) && !isWakeNote;
+    let textSinceLastToolResult = '';
+    let answerGuardUsed = 0;
+    // When true, the next request is sent with tool_choice none so the model
+    // has to write its reply. One-shot: cleared as soon as a response lands.
+    let forceReplyNext = false;
+
     // Per-session model override (set from the session's right-click menu)
     // takes precedence over the global default, so you can try a different
     // model on a specific session without changing your global setting.
@@ -1349,6 +1362,19 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // bounds the worst case so a genuinely confused model doesn't
     // get pummeled forever.
     const MAX_MONITORING_NUDGES = 4;
+
+    // Waits that SUSPEND the session (minutes to days). WaitForUser is not
+    // here - it asks the user something, which is itself a reply.
+    const SUSPENDING_TOOLS = new Set([
+      'WaitForCondition',
+      'WaitForTime',
+      'WaitForFile',
+      'WaitForProcess',
+      'WaitForHttp',
+    ]);
+    // Bounded so a model that keeps trying to wait can't loop forever; the
+    // guard resets whenever a new user message arrives.
+    const MAX_ANSWER_GUARDS = 2;
 
     // ---- Context-bail WaitForUser runtime guardrail -------------------
     //
@@ -1573,6 +1599,9 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
             system: refreshedSystemBlocks,
             tools,
             messages: messagesToSend,
+            // Set for exactly one request after the answer-before-wait guard
+            // fires: the model must write its reply and cannot call a tool.
+            toolChoiceNone: forceReplyNext,
             signal: ctrl.signal,
             apiKeyId: resolvedApiKeyId,
             onEvent: (sev) => {
@@ -1998,6 +2027,110 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         (b: any) => b.type === 'tool_use'
       ) as Anthropic.ToolUseBlock[];
 
+      // The forced-reply request (if any) has now been answered.
+      const wasForcedReply = forceReplyNext;
+      forceReplyNext = false;
+      if (wasForcedReply) {
+        // The user has their answer; nothing more is owed for this message.
+        answerOwedToUser = false;
+        // A tool-less reply would otherwise END the turn and drop the
+        // monitoring the model was in the middle of. Give it one round, with
+        // tools back, to re-issue its wait (or to stop, if it is done).
+        if (toolUses.length === 0) {
+          const resumeText =
+            'Thanks - the user has your reply. If you were monitoring, call the wait ' +
+            'again now to resume it. If there is nothing left to watch, just stop.';
+          messages.push({ role: 'user', content: resumeText } as Anthropic.MessageParam);
+          appendJsonlEvent(ourPath, {
+            type: 'user',
+            uuid: randomUUID(),
+            sessionId,
+            cwd,
+            message: { role: 'user', content: resumeText },
+          });
+          log.info(`[agent] answer-before-wait: reply delivered for ${sessionId}; letting it resume`);
+          continue;
+        }
+      }
+
+      // ---- Answer-before-wait guard -------------------------------------
+      //
+      // THE BUG: the user asks something ("is it done yet?", "give me an
+      // estimate"), the model runs a check, gets the data, and then calls a
+      // suspending WaitFor* with NO reply text. The wait suspends the session
+      // for minutes or hours, so the answer is simply never written - the
+      // user sees a tool card and silence. Measured across real transcripts:
+      // 30-50% of user turns that ended in a wait had no reply on Opus 5, and
+      // 71-83% on Opus 5.5, which does this far more readily.
+      //
+      // The fix is mechanical, not a prompt plea: if this turn is answering a
+      // real user message, nothing has been said to them since the last tool
+      // result, and the model is about to suspend, DON'T execute the wait.
+      // Give every tool_use a well-formed result, tell the model to answer
+      // first, and loop. It can call the wait again right after replying.
+      if (
+        answerOwedToUser &&
+        answerGuardUsed < MAX_ANSWER_GUARDS &&
+        textSinceLastToolResult.trim().length === 0 &&
+        response.content
+          .filter((b: any) => b.type === 'text')
+          .map((b: any) => String(b.text || ''))
+          .join('')
+          .trim().length === 0 &&
+        toolUses.some((tu) => SUSPENDING_TOOLS.has(tu.name))
+      ) {
+        answerGuardUsed++;
+        const skipped = toolUses.map((tu) => ({
+          type: 'tool_result' as const,
+          tool_use_id: tu.id,
+          content: SUSPENDING_TOOLS.has(tu.name)
+            ? '(not run - answer the user first; you can call this again right after)'
+            : '(not run - answer the user first, then re-run this if still needed)',
+        }));
+        for (const tu of toolUses) {
+          onEv({
+            type: 'tool_result',
+            sessionId,
+            id: tu.id,
+            content: '(held - replying to you first)',
+            isError: false,
+            ms: 0,
+          });
+        }
+        // A message alone does NOT work: replayed against the real failing
+        // moment, Opus 5.5 ignored "reply first" 9/9 times and called the wait
+        // again. So the next request also forbids tool calls (tool_choice
+        // none), which made it write the answer 5/5. The wait is re-issued on
+        // the request after that, once the reply is on screen.
+        forceReplyNext = true;
+        const guardText =
+          "Your wait was held so you can reply to the user's message first - a wait " +
+          'suspends this session, so they would get no answer until it finishes. Reply now ' +
+          'in plain text using what you have already found (the number, estimate, or status ' +
+          'they asked for). Tools are unavailable for this one reply; call the wait again ' +
+          'afterwards if monitoring should continue.';
+        const userContent: any[] = [...skipped, { type: 'text', text: guardText }];
+        messages.push({ role: 'user', content: userContent } as Anthropic.MessageParam);
+        appendJsonlEvent(ourPath, {
+          type: 'user',
+          uuid: randomUUID(),
+          sessionId,
+          cwd,
+          message: { role: 'user', content: userContent },
+        });
+        log.warn(
+          `[agent] answer-before-wait guard fired for ${sessionId} (${answerGuardUsed}/${MAX_ANSWER_GUARDS}): ` +
+            `model tried ${toolUses.map((t) => t.name).join(',')} with no reply to the user`
+        );
+        continue;
+      }
+      // Track whether the user has been told anything since the last tool
+      // result. Reset when tool results come back (below); text here counts.
+      textSinceLastToolResult += response.content
+        .filter((b: any) => b.type === 'text')
+        .map((b: any) => String(b.text || ''))
+        .join('');
+
       if (toolUses.length === 0) {
         // Monitoring-bail guardrail: scan the assistant's last text for
         // patterns that strongly imply "I'm going to keep monitoring
@@ -2123,6 +2256,10 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         // message stranded, forcing them to type AGAIN to make it pick up.)
         if (peekInterrupts(sessionId) > 0) {
           const queued = drainInterrupts(sessionId);
+          // A new user question is being picked up - a reply is owed.
+          answerOwedToUser = true;
+          answerGuardUsed = 0;
+          textSinceLastToolResult = '';
           const noteText =
             queued.length === 1
               ? queued[0]
@@ -2305,6 +2442,9 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
           //     to the next streamMessage iteration.
           if (peekInterrupts(sessionId) > 0) {
             const drained = drainInterrupts(sessionId);
+            // The user answered a WaitForUser question - reply owed.
+            answerOwedToUser = true;
+            answerGuardUsed = 0;
             const answer =
               drained.length === 1
                 ? drained[0]
@@ -2519,7 +2659,15 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // new instruction in one logical user turn.
       const interrupts = drainInterrupts(sessionId);
       const userBlocks: any[] = [...toolResultBlocks];
+      // New tool output arrived: whatever the model said earlier was said
+      // BEFORE it had these results, so it owes the user a fresh word before
+      // it may suspend.
+      textSinceLastToolResult = '';
       if (interrupts.length > 0) {
+        // The user typed something mid-turn - that is a new question, so a
+        // reply is owed even if this turn started from a wake-up.
+        answerOwedToUser = true;
+        answerGuardUsed = 0;
         // Concatenate snippets; FIFO order means earlier interrupts appear
         // first, which is what users expect when they typed multiple lines.
         const noteText =

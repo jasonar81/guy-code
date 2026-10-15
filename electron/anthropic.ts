@@ -282,6 +282,7 @@ export function buildSystemBlocks(args: {
         `Narration discipline (visibility for the user):`,
         `  • ★ ABSOLUTE RULE - ALWAYS WRITE TEXT. The user ONLY sees the plain text you write plus the tool-call cards; your thinking is invisible to them. So: (1) Before EVERY tool call, you MUST first write at least one sentence of plain text saying what you are about to do and why. NEVER emit a tool call with no preceding text - a bare tool card with no narration leaves the user with no idea what is happening, and they have explicitly flagged this as broken. (2) When you need something from the user - a decision, an answer, permission, clarification, or you are blocked - you MUST state it as plain text (then use WaitForUser). NEVER go silent or jump straight to a tool when you actually need the human; if your text doesn't appear, the user cannot even tell what you need. (3) When you finish or give an answer, write it as text. This rule is non-negotiable and overrides any instinct to be terse: a turn that is nothing but tool calls with zero text is a bug. Err toward a short sentence of narration before each tool call rather than silence.`,
         `  • The user watches a transcript of your text + tool calls in real time. They CANNOT see your reasoning, only what you output. If you write nothing between tool calls, they have no idea what you're doing.`,
+        `  • ★ ANSWER BEFORE YOU WAIT. When the user asks you something while you are monitoring (e.g. "is it done?", "how long left?", "what's the status?"), gather what you need, then WRITE THE ANSWER as text - the number, estimate, or status - and only AFTER that call WaitForCondition / WaitForTime / WaitForFile / WaitForProcess / WaitForHttp to resume monitoring. A wait suspends the session, so a wait called before you reply means the user gets no answer until it finishes, possibly hours later. Checking data and then going straight back to waiting is not answering.`,
         `  • For ANY task that takes more than 2 tool calls, START by calling \`TodoWrite\` with a plan (3-8 items, each one a concrete checkpoint). The user has a persistent plan panel that surfaces the latest TodoWrite — keeping it current is your primary way to show progress on long autonomous work.`,
         `  • Plan currency is MANDATORY, not optional. Every TodoWrite call FULLY REPLACES the visible plan — there is no partial-update mode, the entire array is the new plan. Update it whenever ANY of the following happens:`,
         `       (a) An item moves from pending → in_progress, or in_progress → completed. Mark it the same turn you actually start/finish the work, not later.`,
@@ -482,6 +483,14 @@ export interface StreamArgs {
   system: ReturnType<typeof buildSystemBlocks>;
   tools: Anthropic.Tool[];
   messages: Anthropic.MessageParam[];
+  /**
+   * Forbid tool calls for this one request (tool_choice: none). Used by the
+   * answer-before-wait guard: asking the model to "reply first" in a message
+   * does not work - measured on Opus 5.5, it ignored the instruction 9 times
+   * out of 9 and called the wait again. Removing the option to call a tool
+   * makes it write the reply every time (5 out of 5).
+   */
+  toolChoiceNone?: boolean;
   signal?: AbortSignal;
   onEvent: (e: Anthropic.MessageStreamEvent) => void;
   /**
@@ -593,6 +602,9 @@ export async function streamMessage(args: StreamArgs): Promise<Anthropic.Message
     messages,
     context_management: contextManagement,
   };
+  // Keep `tools` in the request (the history contains tool_use blocks, so
+  // they must stay defined) but forbid NEW tool calls for this one request.
+  if (args.toolChoiceNone) requestBody.tool_choice = { type: 'none' };
   // Effort (output_config.effort) controls token spend on supported models
   // (Fable 5, Mythos 5, Opus 4.5-4.8, Sonnet 4.6). Send it when set; an empty
   // string omits it (for models that don't accept output_config). Sending an
