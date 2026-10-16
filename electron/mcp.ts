@@ -135,6 +135,18 @@ interface DiscoveredConfig {
   source: string;
 }
 
+/**
+ * Read a JSON config file, tolerating a leading UTF-8 byte-order mark.
+ *
+ * Windows PowerShell 5.1's `Set-Content -Encoding UTF8` (and `Out-File`)
+ * writes a BOM. JSON.parse rejects it, and the caller skips the whole file on
+ * a parse error - so one hand edit of mcp.json in PowerShell silently removes
+ * EVERY server it defines on the next start. Strip it instead.
+ */
+export function readJsonConfig(p: string): any {
+  return JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
+}
+
 /** Walk the Claude Code marketplace plugins directory for installed plugins. */
 function discoverMarketplacePlugins(): Record<string, DiscoveredConfig> {
   const root = join(homedir(), '.claude', 'plugins', 'marketplaces');
@@ -161,7 +173,7 @@ function discoverMarketplacePlugins(): Record<string, DiscoveredConfig> {
       try {
         const st = statSync(mcpFile);
         if (!st.isFile()) continue;
-        const raw = JSON.parse(readFileSync(mcpFile, 'utf8'));
+        const raw = readJsonConfig(mcpFile);
         // Plugin `.mcp.json` shape is { <serverName>: <spec>, ... } — usually
         // just one server per plugin, but support multi.
         for (const [name, spec] of Object.entries(raw ?? {})) {
@@ -191,7 +203,7 @@ function loadConfigs(): {
   for (const p of configPaths()) {
     if (!existsSync(p)) continue;
     try {
-      const raw = JSON.parse(readFileSync(p, 'utf8'));
+      const raw = readJsonConfig(p);
       const ms = raw?.mcpServers;
       if (ms && typeof ms === 'object') {
         for (const [name, spec] of Object.entries(ms)) {
