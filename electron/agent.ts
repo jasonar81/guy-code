@@ -54,7 +54,7 @@ import {
 } from './db';
 import { getDefaultApiKeyId } from './secret';
 import { computeCostMicros } from './pricing';
-import { loadMemory } from './memory';
+import { loadMemoryAsync } from './memory';
 import { loadRelevantMemory } from './memoryRetrieval';
 import { precheckCall } from './budget';
 import {
@@ -1190,7 +1190,11 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // doesn't accept output_config) gets it omitted.
     const effortSetting = getSetting('effort');
     const effort = effortSetting === undefined ? DEFAULT_EFFORT : (effortSetting as string);
-    const memory = instrument('agent: loadMemory', () => loadMemory({ cwd, projectId }));
+    // Async: on a cache miss the memory tree is read in a WORKER THREAD, so a
+    // slow disk delays this one turn instead of freezing the whole app.
+    const memory = await instrumentAsync('agent: loadMemory', () =>
+      loadMemoryAsync({ cwd, projectId })
+    );
     if (memory.sources.length > 0) {
       log.info(
         `[agent] loaded memory: ${memory.sources.length} files, ${memory.text.length}b (truncated ${memory.truncatedBytes}b)`

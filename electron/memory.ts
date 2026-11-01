@@ -361,6 +361,131 @@ export function loadMemory(args: {
   return bundle;
 }
 
+/**
+ * Async variant used at turn start. Same cache and same result as
+ * loadMemory(), but a cache MISS is computed in a worker thread so the
+ * Electron main process keeps handling input and painting.
+ *
+ * WHY: measured over a day of real use, 61 of 71 turn starts (86%) missed the
+ * cache - a session's turns are usually more than 60s apart, and Claude Code
+ * touches ~/.claude every few minutes, which is part of the stamp. Each miss
+ * read the memory tree synchronously: median 11s, worst 64s, while several
+ * sessions streamed and ran tools against the same disk. That was the freeze
+ * "almost every time I try to do something". Making misses cheaper helped
+ * (1.8.3); taking them off the main thread removes the freeze entirely.
+ *
+ * Falls back to the synchronous path if the worker can't be started (e.g.
+ * under the test runner), so behaviour never depends on the worker.
+ */
+export async function loadMemoryAsync(args: { cwd: string; projectId: string }): Promise<MemoryBundle> {
+  const key = `${args.projectId}\u0000${args.cwd}`;
+  const cached = _bundleCache.get(key);
+  if (cached) {
+    const fresh = Date.now() - cached.at < MEMORY_CACHE_MS;
+    if (fresh && cached.stamp === memoryTreeStamp(args.cwd, args.projectId)) {
+      return cached.bundle;
+    }
+  }
+  // Collapse concurrent misses for the same key into one worker job.
+  const pending = _inflight.get(key);
+  if (pending) return pending;
+  const stamp = memoryTreeStamp(args.cwd, args.projectId);
+  const job = (async () => {
+    let bundle: MemoryBundle;
+    try {
+      bundle = await runInMemoryWorker(args);
+    } catch (e) {
+      log.warn(`[memory] worker load failed (${(e as Error)?.message ?? e}); loading inline`);
+      bundle = loadMemoryUncached(args);
+    }
+    _bundleCache.set(key, { at: Date.now(), stamp, bundle });
+    if (_bundleCache.size > 64) {
+      const oldest = [..._bundleCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (oldest) _bundleCache.delete(oldest[0]);
+    }
+    return bundle;
+  })();
+  _inflight.set(key, job);
+  try {
+    return await job;
+  } finally {
+    _inflight.delete(key);
+  }
+}
+
+/** Entry point the worker calls - the same pure computation, no cache. */
+export function loadMemoryUncachedForWorker(args: { cwd: string; projectId: string }): MemoryBundle {
+  return loadMemoryUncached(args);
+}
+
+const _inflight = new Map<string, Promise<MemoryBundle>>();
+
+let _worker: import('node:worker_threads').Worker | null = null;
+let _workerBroken = false;
+let _nextJobId = 1;
+const _jobs = new Map<number, { resolve: (b: MemoryBundle) => void; reject: (e: Error) => void }>();
+
+/** Hard ceiling on one worker load; past this, fall back to inline. */
+const WORKER_TIMEOUT_MS = 120_000;
+
+function getMemoryWorker(): import('node:worker_threads').Worker | null {
+  if (_workerBroken) return null;
+  if (_worker) return _worker;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { Worker } = require('node:worker_threads') as typeof import('node:worker_threads');
+    const script = join(__dirname, 'memoryWorker.js');
+    if (!existsSync(script)) {
+      _workerBroken = true;
+      return null;
+    }
+    const w = new Worker(script);
+    w.unref();
+    w.on('message', (m: { id: number; ok: boolean; bundle?: MemoryBundle; error?: string }) => {
+      const j = _jobs.get(m.id);
+      if (!j) return;
+      _jobs.delete(m.id);
+      if (m.ok && m.bundle) j.resolve(m.bundle);
+      else j.reject(new Error(m.error || 'memory worker failed'));
+    });
+    const failAll = (why: string) => {
+      for (const [, j] of _jobs) j.reject(new Error(why));
+      _jobs.clear();
+      _worker = null;
+    };
+    w.on('error', (e) => failAll(`memory worker error: ${e?.message ?? e}`));
+    w.on('exit', (code) => failAll(`memory worker exited (${code})`));
+    _worker = w;
+    return w;
+  } catch (e) {
+    log.warn(`[memory] could not start memory worker: ${(e as Error)?.message ?? e}`);
+    _workerBroken = true;
+    return null;
+  }
+}
+
+function runInMemoryWorker(args: { cwd: string; projectId: string }): Promise<MemoryBundle> {
+  const w = getMemoryWorker();
+  if (!w) return Promise.reject(new Error('worker unavailable'));
+  const id = _nextJobId++;
+  return new Promise<MemoryBundle>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (_jobs.delete(id)) reject(new Error('memory worker timed out'));
+    }, WORKER_TIMEOUT_MS);
+    _jobs.set(id, {
+      resolve: (b) => {
+        clearTimeout(timer);
+        resolve(b);
+      },
+      reject: (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    });
+    w.postMessage({ id, cwd: args.cwd, projectId: args.projectId });
+  });
+}
+
 /** How long a memory bundle may be reused before we re-check the tree. */
 const MEMORY_CACHE_MS = 60_000;
 

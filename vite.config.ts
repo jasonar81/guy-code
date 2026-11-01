@@ -8,7 +8,10 @@ export default defineConfig({
     react(),
     electron({
       main: {
-        entry: 'electron/main.ts',
+        // memoryWorker.ts is a second entry so it is emitted as
+        // dist-electron/memoryWorker.js next to main.js - memory.ts starts it
+        // as a worker thread to read the memory tree off the main process.
+        entry: ['electron/main.ts', 'electron/memoryWorker.ts'],
         vite: {
           build: {
             outDir: 'dist-electron',
