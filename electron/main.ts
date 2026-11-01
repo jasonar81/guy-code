@@ -24,6 +24,28 @@ log.transports.file.level = 'info';
 
 let mainWindow: BrowserWindow | null = null;
 
+// ONE instance only. Guy Code keeps its whole database in memory and writes
+// the file back periodically, so two copies running at once each overwrite
+// the other's changes (last writer wins) and race on the same temp file -
+// seen in the wild as dozens of "async flush failed ENOENT rename
+// guycode.db.tmp" errors, with a second copy started from the taskbar while
+// the first was still running behind other windows. A second launch now
+// just brings the existing window forward and exits before touching anything.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  log.info('[main] another Guy Code is already running - focusing it and exiting');
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    log.info('[main] second launch detected - focusing the existing window');
+    const w = mainWindow ?? BrowserWindow.getAllWindows()[0];
+    if (!w) return;
+    if (w.isMinimized()) w.restore();
+    if (!w.isVisible()) w.show();
+    w.focus();
+  });
+}
+
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 
 function createWindow() {
@@ -91,6 +113,10 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  // A second instance is on its way out (see requestSingleInstanceLock
+  // above). app.quit() is asynchronous, so without this it would still open
+  // the database and start writing before it exits.
+  if (!gotTheLock) return;
   try {
     await initDb();
   } catch (e) {

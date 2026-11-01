@@ -35,7 +35,7 @@ import {
 // Async file APIs for the periodic flush - see flushAsync(). Writing the
 // database synchronously froze the UI for ~1.7s every 5s on a large DB.
 import * as fsp from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
 
@@ -121,12 +121,25 @@ export async function initDb(): Promise<void> {
   // We don't try to use the temp as a recovery source because it
   // could be partially-written; the safer move is to fall back to
   // the backups dir if the user needs an older copy.
-  const tmpPath = _dbPath + '.tmp';
-  if (existsSync(tmpPath)) {
+  // Temp files are now named guycode.db.<pid>.<ms>.tmp (unique per write),
+  // plus the legacy fixed guycode.db.tmp - clean up any of them. Safe because
+  // the single-instance lock guarantees no other copy is mid-write.
+  const dbDir = dirname(_dbPath);
+  const dbBase = basename(_dbPath);
+  let leftovers: string[] = [];
+  try {
+    leftovers = readdirSync(dbDir).filter(
+      (n) => n.startsWith(dbBase + '.') && n.endsWith('.tmp')
+    );
+  } catch {
+    /* ignore */
+  }
+  for (const n of leftovers) {
+    const tmpPath = join(dbDir, n);
     try {
       const tStat = statSync(tmpPath);
       log.warn(
-        `[db] orphan ${tmpPath} present (${tStat.size} bytes) — removing. ` +
+        `[db] orphan ${tmpPath} present (${tStat.size} bytes) - removing. ` +
           `Likely from an interrupted flush; the real DB should be intact.`
       );
       unlinkSync(tmpPath);
@@ -276,11 +289,21 @@ async function flushAsync(): Promise<void> {
   try {
     // Unavoidably synchronous (sql.js API), but it is the fast half.
     const data = _db.export();
-    const tmpPath = _dbPath + '.tmp';
+    // A temp name unique to THIS write. A shared ".tmp" let two writers - a
+    // second running copy of the app, or this async flush overlapping the
+    // synchronous one at quit - delete or rename each other's file mid-write
+    // ("ENOENT rename guycode.db.tmp"). With a unique name the worst case is
+    // an orphan temp file, which startup already cleans up.
+    const tmpPath = `${_dbPath}.${process.pid}.${Date.now()}.tmp`;
     // ...whereas the write is the expensive half, and it can be awaited so
     // the event loop keeps pumping input, IPC and paint while it happens.
     await fsp.writeFile(tmpPath, Buffer.from(data));
-    await fsp.rename(tmpPath, _dbPath);
+    try {
+      await fsp.rename(tmpPath, _dbPath);
+    } catch (e) {
+      await fsp.unlink(tmpPath).catch(() => {});
+      throw e;
+    }
   } catch (e) {
     _dirty = true; // try again next tick
     log.error('[db] async flush failed', e);
@@ -439,9 +462,20 @@ function flush() {
     // settings table including the encrypted API key, all live
     // usage events).
     const data = _db.export();
-    const tmpPath = _dbPath + '.tmp';
+    // Unique per write, same reason as flushAsync: the quit-time flush must
+    // not share a temp file with an async flush that may still be in flight.
+    const tmpPath = `${_dbPath}.${process.pid}.${Date.now()}.sync.tmp`;
     writeFileSync(tmpPath, Buffer.from(data));
-    renameSync(tmpPath, _dbPath);
+    try {
+      renameSync(tmpPath, _dbPath);
+    } catch (e) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    }
     _dirty = false;
   } catch (e) {
     log.error('[db] flush failed', e);
