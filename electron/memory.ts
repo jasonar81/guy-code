@@ -15,8 +15,11 @@
 //   • We NEVER write to ~/.claude. That tree is treated as read-only import.
 
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
+  readSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -68,9 +71,40 @@ export type MemoryTier = 'pinned' | 'normal' | 'archived';
  * line (the common case for older leaves) — callers then fall back to the
  * staleness rule. Tolerant of unreadable / malformed files.
  */
-export function readExplicitTier(path: string): MemoryTier | null {
+export function readExplicitTier(path: string, mtimeMs?: number): MemoryTier | null {
+  // PERF: this used to readFileSync the WHOLE leaf just to look at its first
+  // few lines, for EVERY leaf, on every uncached memory load. Measured on a
+  // real tree: 1,312 full file reads totalling 18.9 MB per load. On an idle
+  // disk that is ~150ms; with several sessions streaming and running tools it
+  // was 30-58 SECONDS of blocked main process ("Not Responding"). Now: read
+  // only the head of the file, and cache the answer keyed on mtime so an
+  // unchanged leaf is never opened again.
+  if (mtimeMs !== undefined) {
+    const hit = _tierCache.get(path);
+    if (hit && hit.mtimeMs === mtimeMs) return hit.tier;
+  }
+  const tier = readExplicitTierUncached(path);
+  if (mtimeMs !== undefined) _tierCache.set(path, { mtimeMs, tier });
+  return tier;
+}
+
+/** path -> explicit tier, valid while the file's mtime is unchanged. */
+const _tierCache = new Map<string, { mtimeMs: number; tier: MemoryTier | null }>();
+
+/** Frontmatter is a handful of lines; never read more than this to find it. */
+const FRONTMATTER_PEEK_BYTES = 4096;
+
+function readExplicitTierUncached(path: string): MemoryTier | null {
   try {
-    const text = readFileSync(path, 'utf8');
+    let text: string;
+    const fd = openSync(path, 'r');
+    try {
+      const buf = Buffer.alloc(FRONTMATTER_PEEK_BYTES);
+      const n = readSync(fd, buf, 0, FRONTMATTER_PEEK_BYTES, 0);
+      text = buf.subarray(0, n).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
     if (!text.startsWith('---')) return null;
     const end = text.indexOf('\n---', 3);
     if (end === -1) return null;
@@ -95,7 +129,7 @@ export function readExplicitTier(path: string): MemoryTier | null {
  *   normal    → otherwise.
  */
 export function getEffectiveTier(path: string, mtimeMs: number): MemoryTier {
-  const explicit = readExplicitTier(path);
+  const explicit = readExplicitTier(path, mtimeMs);
   if (explicit === 'pinned') return 'pinned';
   if (explicit === 'archived') return 'archived';
   const ageDays = (Date.now() - mtimeMs) / (1000 * 60 * 60 * 24);

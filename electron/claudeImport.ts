@@ -486,6 +486,20 @@ function setTitleScanIndex(idx: Record<string, string>): void {
  *
  * Returns the count of rows whose title actually changed.
  */
+/** Read bytes [from, to) of a file as UTF-8, without loading the rest. */
+function readTail(path: string, from: number, to: number): string {
+  const len = Math.max(0, to - from);
+  if (len === 0) return '';
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    const n = readSync(fd, buf, 0, len, from);
+    return buf.subarray(0, n).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function backfillTitles(): number {
   const targets = listSessionsForTitleBackfill();
   let count = 0;
@@ -501,12 +515,16 @@ export function backfillTitles(): number {
   const seen = getTitleScanIndex();
   const nextIndex: Record<string, string> = {};
   let skipped = 0;
+  let incremental = 0;
+  let bytesRead = 0;
   const t0 = Date.now();
   for (const t of targets) {
     if (!existsSync(t.jsonl_path)) continue;
     let stamp = '';
+    let size = 0;
     try {
       const st = statSync(t.jsonl_path);
+      size = st.size;
       stamp = `${st.size}:${st.mtimeMs}`;
       nextIndex[t.id] = stamp;
       if (seen[t.id] === stamp) {
@@ -517,9 +535,28 @@ export function backfillTitles(): number {
       /* fall through and scan it */
     }
     try {
-      // Read whole file as text so we can pick up `custom-title` / `ai-title`
-      // events which may appear anywhere (the user can rename mid-conversation).
-      const text = readFileSync(t.jsonl_path, 'utf8');
+      // PERF: transcripts are APPEND-ONLY, so when one has merely grown we
+      // only need to look at the bytes added since the last scan - a new
+      // `custom-title` / `ai-title` event can only be in the new tail. Before
+      // this, any change re-read and re-parsed the WHOLE file: active
+      // sessions are the ones that change, and they are also the biggest
+      // (169MB, 37MB, 35MB on a real install), so startup still blocked the
+      // main process for ~29s. The first-user-message preview is only needed
+      // for a session that has no title yet, so the full read is kept for
+      // those (and for files that shrank, i.e. were rewritten).
+      const prevSize = Number(String(seen[t.id] ?? '').split(':')[0]) || 0;
+      const canTail = prevSize > 0 && size > prevSize && !!t.title;
+      let text: string;
+      if (canTail) {
+        text = readTail(t.jsonl_path, prevSize, size);
+        // The first chunk may start mid-line; drop the partial line.
+        const nl = text.indexOf('\n');
+        text = nl >= 0 ? text.slice(nl + 1) : '';
+        incremental++;
+      } else {
+        text = readFileSync(t.jsonl_path, 'utf8');
+      }
+      bytesRead += text.length;
       const lines = text.split('\n');
       let firstUserPreview: string | undefined;
       let aiTitle: string | undefined;
@@ -550,7 +587,13 @@ export function backfillTitles(): number {
         const p = previewFromContent(c);
         if (p) firstUserPreview = p;
       }
-      const title = bestTitle({ customTitle, aiTitle, firstUserPreview });
+      // Tail scan with no new title events: nothing to change.
+      if (canTail && !customTitle && !aiTitle) continue;
+      // Tail scan that DID find one: it outranks any preview, and the
+      // existing title stands in for a preview we didn't read.
+      const title = canTail
+        ? bestTitle({ customTitle, aiTitle, firstUserPreview: t.title ?? undefined })
+        : bestTitle({ customTitle, aiTitle, firstUserPreview });
       if (title && title !== t.title) {
         setSessionTitle(t.id, title);
         count += 1;
@@ -562,7 +605,8 @@ export function backfillTitles(): number {
   setTitleScanIndex(nextIndex);
   log.info(
     `[backfillTitles] scanned ${targets.length - skipped} of ${targets.length} session(s) ` +
-      `(${skipped} unchanged, skipped) in ${Date.now() - t0}ms`
+      `(${skipped} unchanged, skipped; ${incremental} read from where they left off) ` +
+      `in ${Date.now() - t0}ms, ${(bytesRead / 1048576).toFixed(1)}MB read`
   );
   return count;
 }
