@@ -423,7 +423,7 @@ const _inflight = new Map<string, Promise<MemoryBundle>>();
 let _worker: import('node:worker_threads').Worker | null = null;
 let _workerBroken = false;
 let _nextJobId = 1;
-const _jobs = new Map<number, { resolve: (b: MemoryBundle) => void; reject: (e: Error) => void }>();
+const _jobs = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
 
 /** Hard ceiling on one worker load; past this, fall back to inline. */
 const WORKER_TIMEOUT_MS = 120_000;
@@ -441,11 +441,11 @@ function getMemoryWorker(): import('node:worker_threads').Worker | null {
     }
     const w = new Worker(script);
     w.unref();
-    w.on('message', (m: { id: number; ok: boolean; bundle?: MemoryBundle; error?: string }) => {
+    w.on('message', (m: { id: number; ok: boolean; result?: unknown; error?: string }) => {
       const j = _jobs.get(m.id);
       if (!j) return;
       _jobs.delete(m.id);
-      if (m.ok && m.bundle) j.resolve(m.bundle);
+      if (m.ok && m.result !== undefined) j.resolve(m.result);
       else j.reject(new Error(m.error || 'memory worker failed'));
     });
     const failAll = (why: string) => {
@@ -464,26 +464,62 @@ function getMemoryWorker(): import('node:worker_threads').Worker | null {
   }
 }
 
-function runInMemoryWorker(args: { cwd: string; projectId: string }): Promise<MemoryBundle> {
+/** Post one job to the memory worker and wait for its result. */
+function runWorkerJob<T>(payload: Record<string, unknown>): Promise<T> {
   const w = getMemoryWorker();
   if (!w) return Promise.reject(new Error('worker unavailable'));
   const id = _nextJobId++;
-  return new Promise<MemoryBundle>((resolve, reject) => {
+  return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
       if (_jobs.delete(id)) reject(new Error('memory worker timed out'));
     }, WORKER_TIMEOUT_MS);
     _jobs.set(id, {
-      resolve: (b) => {
+      resolve: (r) => {
         clearTimeout(timer);
-        resolve(b);
+        resolve(r as T);
       },
       reject: (e) => {
         clearTimeout(timer);
         reject(e);
       },
     });
-    w.postMessage({ id, cwd: args.cwd, projectId: args.projectId });
+    w.postMessage({ id, ...payload });
   });
+}
+
+function runInMemoryWorker(args: { cwd: string; projectId: string }): Promise<MemoryBundle> {
+  return runWorkerJob<MemoryBundle>({ kind: 'load', cwd: args.cwd, projectId: args.projectId });
+}
+
+/**
+ * recall_memory, off the main process.
+ *
+ * A search for a term that matches little or nothing reads EVERY memory leaf
+ * in full: 2,495 files / 36.9 MB on a real install (1,479 of them under
+ * ~/.guycode/projects/__guy_default__). That's ~360ms on an idle disk, but it
+ * ran synchronously on the Electron main process, so with several sessions and
+ * subagents using the same disk it froze the whole app - 18s at 13:39 and 62s
+ * at 16:17 on 2026-11-07, each spanning exactly a recall_memory call. Run it in
+ * the memory worker; fall back to inline only if the worker can't be used.
+ */
+export async function recallFromDiskAsync(args: {
+  cwd: string;
+  projectId?: string;
+  query: string;
+  maxResults?: number;
+}): Promise<string> {
+  try {
+    return await runWorkerJob<string>({
+      kind: 'recall',
+      cwd: args.cwd,
+      projectId: args.projectId,
+      query: args.query,
+      maxResults: args.maxResults,
+    });
+  } catch (e) {
+    log.warn(`[memory] recall worker failed (${(e as Error)?.message ?? e}); searching inline`);
+    return recallFromDisk(args);
+  }
 }
 
 /** How long a memory bundle may be reused before we re-check the tree. */
@@ -1244,10 +1280,43 @@ function walkSkills(
 
 export function parseMdFrontmatter(path: string): { name: string | null; description: string | null } {
   try {
-    const text = readFileSync(path, 'utf8');
-    if (!text.startsWith('---')) {
-      const firstLine = text.split('\n').find((l) => l.trim() && !l.trim().startsWith('#'));
-      return { name: null, description: firstLine ? firstLine.slice(0, 200) : null };
+    // The name/description live in the frontmatter or the first content line,
+    // so only the head is read - this runs for every leaf in list_memory and
+    // the memory-retrieval gate, where full reads cost ~48 MB per call.
+    // Read 4KB, widen to 64KB, then the whole file - stopping as soon as the
+    // answer is certain, so the result is always what a full read gives.
+    let text = '';
+    for (const limit of [FRONTMATTER_PEEK_BYTES, 65536, Infinity]) {
+      let reachedEnd: boolean;
+      if (limit === Infinity) {
+        text = readFileSync(path, 'utf8');
+        reachedEnd = true;
+      } else {
+        const fd = openSync(path, 'r');
+        try {
+          const buf = Buffer.alloc(limit);
+          const got = readSync(fd, buf, 0, limit, 0);
+          text = buf.subarray(0, got).toString('utf8');
+          // Compare BYTES, not characters: multi-byte UTF-8 decodes a full
+          // read into fewer characters than bytes.
+          reachedEnd = got < limit;
+        } finally {
+          closeSync(fd);
+        }
+      }
+      // A partial read may end mid-line; only whole lines count.
+      const lines = text.split('\n');
+      const whole = reachedEnd ? lines : lines.slice(0, -1);
+      if (!text.startsWith('---')) {
+        const first = whole.find((l) => l.trim() && !l.trim().startsWith('#'));
+        if (first !== undefined || reachedEnd) {
+          return { name: null, description: first ? first.slice(0, 200) : null };
+        }
+        continue;
+      }
+      const closeAt = text.indexOf('\n---', 3);
+      if (closeAt === -1 && !reachedEnd) continue;
+      break;
     }
     const end = text.indexOf('\n---', 3);
     if (end === -1) return { name: null, description: null };

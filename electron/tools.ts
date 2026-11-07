@@ -25,7 +25,7 @@ import {
 } from './db';
 import {
   listClaudeSkills,
-  recallFromDisk,
+  recallFromDiskAsync,
   saveMemory,
   setMemoryPriority,
   listGuyMemory,
@@ -1494,7 +1494,10 @@ const RECALL_MEMORY: ToolDef = {
     },
   },
   async execute(input, ctx) {
-    return recallFromDisk({
+    // Runs in the memory worker: a search with few matches reads every leaf
+    // in full (~37 MB), which froze the whole app for up to 62s when done on
+    // the main process.
+    return recallFromDiskAsync({
       cwd: ctx.cwd,
       projectId: ctx.projectId,
       query: String(input.query),

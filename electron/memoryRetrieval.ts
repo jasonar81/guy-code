@@ -23,7 +23,7 @@
 // failure just means the tail isn't added that turn; recent/active state is
 // always present, so a failure can never make the agent forgetful.
 
-import { readFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync } from 'node:fs';
 import { basename } from 'node:path';
 import log from 'electron-log';
 import {
@@ -113,11 +113,42 @@ export function gatherLeafMeta(args: { cwd: string; projectId?: string }): LeafM
 
 function firstLine(path: string): string {
   try {
+    // Only the head of the file is needed for a one-line description. Reading
+    // whole files here made gatherLeafMeta read 48.7 MB (3,507 files) per call.
+    // 4KB normally holds the first content line; a leaf whose first several KB
+    // are headings (or that opens with a long frontmatter block) needs more,
+    // so widen once before falling back to a full read - the description must
+    // be identical to what a full read would give.
+    for (const n of [4096, 65536]) {
+      const { text: head, bytes } = readHead(path, n);
+      // Compare BYTES read, not string length: multi-byte UTF-8 makes a full
+      // 4KB read decode to fewer than 4096 characters, which would wrongly
+      // look like end-of-file.
+      const reachedEnd = bytes < n;
+      const t = head.replace(/^---[\s\S]*?\n---\n/, '');
+      const lines = t.split('\n');
+      // The last line of a partial read may be cut off, so don't trust it.
+      const complete = reachedEnd ? lines : lines.slice(0, -1);
+      const line = complete.find((l) => l.trim() && !l.startsWith('#'));
+      if (line !== undefined || reachedEnd) return (line || '').trim().slice(0, 140);
+    }
     const t = readFileSync(path, 'utf8').replace(/^---[\s\S]*?\n---\n/, '');
     const line = t.split('\n').find((l) => l.trim() && !l.startsWith('#'));
     return (line || '').trim().slice(0, 140);
   } catch {
     return '';
+  }
+}
+
+/** Read at most `n` bytes from the start of a file; returns the text and the byte count. */
+function readHead(path: string, n: number): { text: string; bytes: number } {
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(n);
+    const got = readSync(fd, buf, 0, n, 0);
+    return { text: buf.subarray(0, got).toString('utf8'), bytes: got };
+  } finally {
+    closeSync(fd);
   }
 }
 
