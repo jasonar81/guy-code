@@ -70,6 +70,19 @@ export function SubagentActivity({ block }: { block: SubagentBlock }) {
                 </div>
               );
             }
+            if (it.kind === 'user_message') {
+              // A message the user sent to this subagent mid-run - shown at the
+              // point the subagent picked it up.
+              return (
+                <div
+                  key={idx}
+                  className="text-[13px] text-text rounded border border-state-attention/40 bg-state-attention/5 px-2 py-1"
+                >
+                  <span className="text-[10px] font-mono text-state-attention mr-1.5">you →</span>
+                  <RichText text={it.text} />
+                </div>
+              );
+            }
             // tool_result
             return (
               <div

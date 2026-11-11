@@ -464,7 +464,15 @@ async function runSubagentInner(
           `[Message from the user, sent while you are working. Take it into ` +
           `account from here on; it supersedes earlier instructions where they conflict.]\n\n${body}`,
       });
-      emit({ type: 'subagent_user_message', text: body });
+      // One event PER message: the renderer shows one "queued" bubble per
+      // message and clears it by matching this text. (A single joined event
+      // matched none of them when two were queued, and before the renderer
+      // handled this event at all, every bubble stayed "queued" forever even
+      // though the subagent had already received the message.)
+      for (const s of steering) {
+        const t = s.trim();
+        if (t) emit({ type: 'subagent_user_message', text: t });
+      }
     }
 
     // Pre-flight budget check. Subagents share the parent's bucket; if

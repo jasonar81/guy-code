@@ -1187,6 +1187,33 @@ export const useApp = create<AppState>((set, get) => ({
           next.messages = msgs;
           break;
         }
+        case 'subagent_user_message': {
+          // The running subagent picked up something the user sent it.
+          // Without this case the event was ignored, so the "-> to subagent"
+          // bubble sat there as if still queued, even though the subagent had
+          // already received it and acted on it.
+          const idx = next.pendingInterrupts.findIndex(
+            (p) => p.toSubagent && p.text === e.text
+          );
+          if (idx >= 0) {
+            next.pendingInterrupts = [
+              ...next.pendingInterrupts.slice(0, idx),
+              ...next.pendingInterrupts.slice(idx + 1),
+            ];
+          }
+          // Show it inside the subagent's activity, where it took effect.
+          const msgs = ensureStreamingAssistant(next.messages);
+          const last = msgs[msgs.length - 1];
+          if (last && last.role === 'assistant') {
+            last.content = last.content.map((b) =>
+              b.type === 'subagent' && b.runId === e.runId
+                ? { ...b, items: [...b.items, { kind: 'user_message' as const, text: e.text }] }
+                : b
+            );
+          }
+          next.messages = msgs;
+          break;
+        }
         case 'subagent_text':
         case 'subagent_tool':
         case 'subagent_tool_result':

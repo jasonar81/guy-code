@@ -152,7 +152,9 @@ export type ContentBlock =
 export type SubagentItem =
   | { kind: 'text'; text: string }
   | { kind: 'tool'; toolId: string; name: string; input: unknown }
-  | { kind: 'tool_result'; toolId: string; content: string; isError: boolean };
+  | { kind: 'tool_result'; toolId: string; content: string; isError: boolean }
+  /** A message the user sent to this subagent while it was working. */
+  | { kind: 'user_message'; text: string };
 
 /**
  * Attachment shape used by the composer/IPC. Distinct from `ContentBlock`
@@ -287,6 +289,13 @@ export type AgentEvent =
       isError: boolean;
     }
   | { type: 'subagent_done'; sessionId: string; runId: string; ok: boolean }
+  /**
+   * The running subagent picked up text the user sent it (send-to-subagent).
+   * `text` is the queued messages joined with blank lines, exactly as they
+   * were injected - the renderer uses it to clear the matching "queued"
+   * bubbles and to show the message inside the subagent's activity block.
+   */
+  | { type: 'subagent_user_message'; sessionId: string; runId: string; text: string }
   | { type: 'interrupt_picked_up'; sessionId: string; text: string }
   | { type: 'state_changed'; sessionId: string; state: ProjectState }
   | {

@@ -151,6 +151,8 @@ export type AgentEvent =
       isError: boolean;
     }
   | { type: 'subagent_done'; sessionId: string; runId: string; ok: boolean }
+  /** The running subagent picked up text the user sent it (see subagentInbox). */
+  | { type: 'subagent_user_message'; sessionId: string; runId: string; text: string }
   | {
       /**
        * The agent loop drained a user-typed-while-running interrupt off the
