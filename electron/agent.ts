@@ -76,6 +76,7 @@ import {
 import { maybeSummarize } from './toolSummarizer';
 import { loadSkills, renderSkillsBlock, parseSlashCommand, rewriteSlashCommand } from './skills';
 import { renderActivePlanBlock } from './planManager';
+import { stalePlanReminder } from './planReminder';
 import { broadcastAgentEvent, broadcastStateChanged } from './agentEvents';
 // Server-side `clear_tool_uses_20250919` micro-compaction handles the
 // common case of old tool_results bloating context. But it has two
@@ -1176,6 +1177,14 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       (effectiveText.trim().length > 0 || attachments.length > 0) && !isWakeNote;
     let textSinceLastToolResult = '';
     let answerGuardUsed = 0;
+    // ---- Plan-panel currency ----
+    // The system prompt already says, at length, to keep the plan panel
+    // current. Measured over 7 days of real transcripts it does not stick:
+    // 55% of turns with 6+ tool calls never touched the plan, and 805 turns
+    // ended 20+ tool calls after their last update. Like answer-before-wait,
+    // wording alone isn't enough, so the loop now notices and reminds.
+    let toolCallsSincePlanUpdate = 0;
+    let planRemindersSent = 0;
     // When true, the next request is sent with tool_choice none so the model
     // has to write its reply. One-shot: cleared as soon as a response lands.
     let forceReplyNext = false;
@@ -2665,6 +2674,24 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       // new instruction in one logical user turn.
       const interrupts = drainInterrupts(sessionId);
       const userBlocks: any[] = [...toolResultBlocks];
+
+      // Plan-panel currency: count this round's tool calls, reset on a plan
+      // update, and if work has run on well past the last update, remind.
+      for (const tu of toolUses) {
+        if (tu.name === 'TodoWrite' || tu.name === 'PlanState') toolCallsSincePlanUpdate = 0;
+        else toolCallsSincePlanUpdate++;
+      }
+      const planReminder = stalePlanReminder({
+        toolCallsSincePlanUpdate,
+        hasActivePlan: !!renderActivePlanBlock(sessionId),
+        remindersSent: planRemindersSent,
+      });
+      if (planReminder) {
+        planRemindersSent++;
+        toolCallsSincePlanUpdate = 0; // give it a fresh window before the next one
+        userBlocks.push({ type: 'text', text: planReminder });
+        log.info(`[agent] plan-currency reminder ${planRemindersSent} for ${sessionId}`);
+      }
       // New tool output arrived: whatever the model said earlier was said
       // BEFORE it had these results, so it owes the user a fresh word before
       // it may suspend.
