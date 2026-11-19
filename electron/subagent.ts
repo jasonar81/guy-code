@@ -44,7 +44,14 @@ import {
 } from './subagentInbox';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { getClient, DEFAULT_MODEL, DEFAULT_EFFORT, parseExtendedContext } from './anthropic';
+import {
+  getClient,
+  DEFAULT_MODEL,
+  DEFAULT_EFFORT,
+  parseExtendedContext,
+  CACHE_1H,
+  withConversationCacheBreakpoint,
+} from './anthropic';
 import { stripThinkingBlocks } from './sessionRuntime';
 import { TOOLS, executeTool, type ToolContext } from './tools';
 import { maybeSummarize } from './toolSummarizer';
@@ -196,9 +203,30 @@ const ROLE_HAS_SHELL: Record<SubagentRole, boolean> = {
 };
 
 /**
- * Build the role-specific system prompt. Kept terse and deterministic
- * so it caches well across many subagent invocations within a session.
+ * Build the role-specific system prompt as a CACHEABLE block.
+ *
+ * ⚠ This used to return a bare string, which meant no `cache_control` could
+ * be attached - and the subagent loop never added a conversation breakpoint
+ * either. So EVERY subagent round re-paid full input price for the entire
+ * prompt. Measured over 30 days: 48,216 subagent calls with zero cache reads
+ * AND zero cache writes, 8.57B input tokens, $36,908 - 54% of all spend, on
+ * prompts that grew to 600K tokens and were re-sent from scratch every round.
  */
+function buildRoleSystemBlocks(
+  role: SubagentRole,
+  parentCwd: string
+): { type: 'text'; text: string; cache_control?: unknown }[] {
+  return [
+    {
+      type: 'text' as const,
+      text: buildRoleSystemPrompt(role, parentCwd),
+      // Identical for every round of every subagent with this role+cwd, so
+      // one write serves the whole session (and later sessions within the TTL).
+      cache_control: CACHE_1H,
+    },
+  ];
+}
+
 function buildRoleSystemPrompt(role: SubagentRole, parentCwd: string): string {
   const cwdLine = parentCwd
     ? `Working directory: ${parentCwd}`
@@ -393,7 +421,7 @@ async function runSubagentInner(
   const tag = `subagent:${runId}:${input.role}`;
   log.info(`[${tag}] start description=${JSON.stringify(input.description)}`);
 
-  const system = buildRoleSystemPrompt(input.role, parent.cwd);
+  const system = buildRoleSystemBlocks(input.role, parent.cwd);
   const tools = buildToolSchemas(input.role);
   const model = parent.model || DEFAULT_MODEL;
   const effortSetting = getSetting('effort');
@@ -511,7 +539,11 @@ async function runSubagentInner(
           ...(effort ? { output_config: { effort } } : {}),
           system,
           tools,
-          messages,
+          // Cache the conversation prefix too, exactly as the main agent
+          // does. Without this the subagent's history - which grows every
+          // round and reached 600K tokens in real sessions - was re-sent at
+          // full input price on every single round.
+          messages: withConversationCacheBreakpoint(messages),
           // Server-side micro-compaction: same shape the main agent uses,
           // tuned slightly tighter because subagents have shorter
           // expected lifespans.

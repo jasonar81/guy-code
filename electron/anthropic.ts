@@ -125,6 +125,18 @@ export const REFUSAL_FALLBACK_MODEL = 'claude-opus-5[1m]';
  */
 export const SECONDARY_FALLBACK_MODEL = 'claude-opus-4-8[1m]';
 
+/**
+ * How long a session stays pinned to the fallback after a refusal.
+ *
+ * Refusals are prompt-specific, not session-specific: the same session will
+ * happily run the next ten turns on the preferred model. A refused call also
+ * costs nothing - the API bills no tokens for it - so retrying is free, while
+ * staying pinned is not. Measured over 30 days, 19 sessions pinned by a
+ * single refusal each accounted for 100% of Opus 5 spend ($10,342), roughly
+ * 20% more than the same work on Opus 5.5.
+ */
+export const REFUSAL_PIN_MS = 15 * 60 * 1000;
+
 /** The model to retry `model` on, or null if there is nowhere sensible to go. */
 export function fallbackFor(model: string): string | null {
   const bare = model.replace(/\[.*?\]$/, '');
@@ -179,7 +191,7 @@ export function parseExtendedContext(model: string): { id: string; want1m: boole
  * The `ttl` field exists in the Anthropic API but isn't in this SDK
  * version's typings; we cast through `any` to avoid a typing-only error.
  */
-const CACHE_1H = { type: 'ephemeral' as const, ttl: '1h' } as any;
+export const CACHE_1H = { type: 'ephemeral' as const, ttl: '1h' } as any;
 
 export function buildSystemBlocks(args: {
   sessionId: string;

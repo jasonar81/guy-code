@@ -15,6 +15,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
   REFUSAL_FALLBACK_MODEL,
+  REFUSAL_PIN_MS,
   fallbackFor,
 } from './anthropic';
 import {
@@ -1301,7 +1302,25 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
     // scripting => category 'cyber'), so an Opus 5.5 session would refuse on
     // EVERY turn and never switch. The rule is now about the REFUSAL, not the
     // model family.
+    // ⚠ The pin EXPIRES. It used to be permanent for the session's life: one
+    // refusal and every later turn went to the more expensive fallback, even
+    // though refusals are prompt-specific and most turns would have been
+    // fine. Measured over 30 days: 19 pinned sessions accounted for 100% of
+    // Opus 5 spend ($10,342) - all of it downstream of a single refusal each.
+    // A rejected call costs nothing, so it is cheaper to re-try the preferred
+    // model periodically than to stay pinned.
+    const pinnedAtRaw = getSetting(`session_refused_at_${sessionId}`);
+    const pinnedAt = pinnedAtRaw ? Number(pinnedAtRaw) : 0;
+    const pinExpired = pinnedAt > 0 && Date.now() - pinnedAt > REFUSAL_PIN_MS;
+    if (pinExpired) {
+      setSetting(`session_refused_${sessionId}`, '0');
+      setSetting(`session_refused_at_${sessionId}`, '');
+      log.info(
+        `[agent] session ${sessionId}: refusal pin expired, retrying ${model} (a refusal costs nothing)`
+      );
+    }
     if (
+      !pinExpired &&
       getSetting(`session_refused_${sessionId}`) === '1' &&
       model !== REFUSAL_FALLBACK_MODEL
     ) {
@@ -1866,6 +1885,9 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         // survives restarts and avoids any module-instance ambiguity that a
         // module-level Set could have).
         setSetting(`session_refused_${sessionId}`, '1');
+        // Timestamp it so the pin can expire (see REFUSAL_PIN_MS). Without
+        // this the session stayed on the costlier fallback forever.
+        setSetting(`session_refused_at_${sessionId}`, String(Date.now()));
         // Name the models involved DYNAMICALLY. This used to hardcode
         // "Fable 5.1 -> Opus 5.5", which was wrong the moment any other model
         // refused - and actively confusing once Opus 5.5 became the default

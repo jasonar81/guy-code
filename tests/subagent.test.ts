@@ -75,6 +75,9 @@ function buildStream(resp: { content: any[]; usage?: any; model?: string; id?: s
 
 vi.mock('../electron/anthropic', () => ({
   DEFAULT_MODEL: 'claude-opus-4-7[1m]',
+  // Caching helpers the subagent uses (real ones live in anthropic.ts).
+  CACHE_1H: { type: 'ephemeral', ttl: '1h' },
+  withConversationCacheBreakpoint: (m: any[]) => m,
   DEFAULT_EFFORT: 'xhigh',
   parseExtendedContext: (model: string) => ({
     id: model.replace(/\[1m\]$/, ''),
@@ -527,8 +530,14 @@ describe('runSubagent', () => {
   it('passes the role-specific system prompt to the model', async () => {
     _responses.push({ content: [{ type: 'text', text: 'done' }] });
     await runSubagent(PARENT, { role: 'plan', description: 't', prompt: 'p' });
-    expect(_lastStreamArgs.system).toMatch(/Role: PLANNER/);
-    expect(_lastStreamArgs.system).toMatch(/CANNOT spawn further subagents/);
+    // `system` is an ARRAY of blocks so the prompt can carry cache_control -
+    // as a bare string it could not be cached, and every subagent round
+    // re-paid full input price (48,216 such calls / $36,908 over 30 days).
+    expect(Array.isArray(_lastStreamArgs.system)).toBe(true);
+    const sysText = _lastStreamArgs.system.map((b: any) => b.text).join('\n');
+    expect(sysText).toMatch(/Role: PLANNER/);
+    expect(sysText).toMatch(/CANNOT spawn further subagents/);
+    expect(_lastStreamArgs.system[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
   });
 
   it('passes server-side context_management config (clear_tool_uses_20250919)', async () => {
