@@ -26,6 +26,12 @@ const MODEL_CHOICES: { id: string; label: string }[] = [
   { id: 'claude-opus-5-5[1m]', label: 'Claude Opus 5.5' },
   { id: 'claude-opus-5[1m]', label: 'Claude Opus 5' },
   { id: 'claude-fable-5-1[1m]', label: 'Claude Fable 5.1' },
+  // Newer models, priced correctly but not the default - Opus stays the
+  // default for agentic work. Sonnet/Haiku are far cheaper per token and
+  // are worth picking for a session that is mostly reading and summarising.
+  { id: 'claude-fable-5-2[1m]', label: 'Claude Fable 5.2' },
+  { id: 'claude-sonnet-5-5[1m]', label: 'Claude Sonnet 5.5 (cheaper)' },
+  { id: 'claude-haiku-5-5[1m]', label: 'Claude Haiku 5.5 (cheapest)' },
 ];
 
 interface Props {

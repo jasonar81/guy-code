@@ -246,6 +246,66 @@ describe('computeCostMicros', () => {
   });
 });
 
+/**
+ * Models newer than the ones Guy Code shipped with. Opus stays the default,
+ * but these are selectable per session, and without an explicit entry their
+ * cost would be guessed by family fallback and reported wrong.
+ *
+ * Rates are from Anthropic's published table. Its footnote - "All other
+ * models use the standard 0.1x multiplier" - is what fixes the cache-read
+ * price for the rows that omit it.
+ */
+describe('newer models are priced explicitly', () => {
+  const M = 1_000_000;
+
+  it('Fable/Mythos 5.2: $8 in / $40 out, standard cache multipliers', () => {
+    for (const id of ['claude-fable-5-2', 'claude-mythos-5-2']) {
+      const p = getPricing(id);
+      expect(p.inputUsdPerMillion).toBe(8 * M);
+      expect(p.outputUsdPerMillion).toBe(40 * M);
+      expect(p.cacheReadUsdPerMillion).toBe(0.8 * M); // 0.1x
+      expect(p.cacheWrite5mUsdPerMillion).toBe(10 * M); // 1.25x
+      expect(p.cacheWrite1hUsdPerMillion).toBe(16 * M); // 2x
+    }
+  });
+
+  it('Fable 5.2 does NOT inherit 5.1\'s unusually cheap $0.25 cache read', () => {
+    // 5.1 is 0.025x; 5.2 is back to the standard 0.1x. Getting this wrong
+    // would under-bill cached tokens by ~3x.
+    expect(getPricing('claude-fable-5-2').cacheReadUsdPerMillion).toBe(0.8 * M);
+    expect(getPricing('claude-fable-5-1').cacheReadUsdPerMillion).toBe(0.25 * M);
+  });
+
+  it('Sonnet 5.5: $2 in / $10 out', () => {
+    const p = getPricing('claude-sonnet-5-5');
+    expect(p.inputUsdPerMillion).toBe(2 * M);
+    expect(p.outputUsdPerMillion).toBe(10 * M);
+    expect(p.cacheReadUsdPerMillion).toBe(0.2 * M);
+  });
+
+  it('Haiku 5.5 uses the LARGE-prompt tier, because our prompts are large', () => {
+    // Tiered: $0.10/$0.50 up to 100K tokens, $0.50/$2.50 above. The memory
+    // bundle alone is ~260KB, so pricing the small tier would understate
+    // real cost fivefold.
+    const p = getPricing('claude-haiku-5-5');
+    expect(p.inputUsdPerMillion).toBe(0.5 * M);
+    expect(p.outputUsdPerMillion).toBe(2.5 * M);
+    expect(p.cacheReadUsdPerMillion).toBe(0.05 * M);
+  });
+
+  it('none of them fall back to the $5/$25 Opus default', () => {
+    for (const id of ['claude-fable-5-2', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+      expect(getPricing(id).inputUsdPerMillion).not.toBe(5 * M);
+    }
+  });
+
+  it('[1m] variants price the same as their base model', () => {
+    for (const id of ['claude-fable-5-2', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+      expect(getPricing(`${id}[1m]`)).toEqual(getPricing(id));
+    }
+  });
+});
+
 describe('Claude Fable 5 pricing + default', () => {
   it('prices claude-fable-5 at $10 input / $50 output with standard cache multipliers', () => {
     const p = getPricing('claude-fable-5');

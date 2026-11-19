@@ -63,6 +63,17 @@ const TABLE: Record<string, ModelPricing> = {
   // cache hits dropped to $0.25/MTok - 0.025x the input price, a QUARTER of the
   // standard 0.1x. Stated explicitly; the derived value ($1) would bill cached
   // tokens at 4x their real cost.
+  // Claude Fable 5.2 / Mythos 5.2 (2026-11-09): $8 input / $40 output, down
+  // from 5.1's $10/$50. Cache rates follow the standard multipliers (read
+  // $0.80, 5m write $10, 1h write $16) - the published table lists no
+  // special read rate for them, and its footnote says "All other models use
+  // the standard 0.1x multiplier". Note that is a RISE from 5.1's unusually
+  // cheap $0.25 read, so a 5.1 -> 5.2 move is only cheaper when most input
+  // is uncached.
+  'claude-fable-5-2': pricing(8, 40),
+  'claude-fable-5-2-1m': pricing(8, 40),
+  'claude-mythos-5-2': pricing(8, 40),
+  'claude-mythos-5-2-1m': pricing(8, 40),
   'claude-fable-5-1': pricing(10, 50, { cacheRead: 0.25 }),
   'claude-fable-5-1-1m': pricing(10, 50, { cacheRead: 0.25 }),
   'claude-mythos-5-1': pricing(10, 50, { cacheRead: 0.25 }),
@@ -79,6 +90,18 @@ const TABLE: Record<string, ModelPricing> = {
   'claude-opus-5-5-1m': pricing(4, 20, { cacheRead: 0.2, cacheWrite5m: 5, cacheWrite1h: 8 }),
   'claude-opus-5': pricing(5, 25),
   'claude-opus-5-1m': pricing(5, 25),
+  // Claude Sonnet 5.5 (2026-09-28): $2 input / $10 output, same headline as
+  // Sonnet 5, with standard cache multipliers (read $0.20, 5m $2.50, 1h $4).
+  'claude-sonnet-5-5': pricing(2, 10),
+  'claude-sonnet-5-5-1m': pricing(2, 10),
+  // Claude Haiku 5.5 (2026-10-07): the first TIERED model in this table -
+  // prompts up to 100K tokens are billed at $0.10/$0.50, and anything larger
+  // at 5x that ($0.50/$2.50). We price the LARGE tier, because Guy Code's
+  // prompts are routinely 100K+ (the memory bundle alone is ~260KB); using
+  // the small-tier rate would understate real cost fivefold. A short
+  // Haiku-only session is therefore over-reported rather than under.
+  'claude-haiku-5-5': pricing(0.5, 2.5),
+  'claude-haiku-5-5-1m': pricing(0.5, 2.5),
   'claude-opus-4-8': pricing(5, 25),
   'claude-opus-4-8-1m': pricing(5, 25),
   'claude-opus-4-7': pricing(5, 25),
