@@ -511,6 +511,9 @@ declare global {
       slackBridge: {
         test: () => Promise<{ ok: boolean; message: string }>;
       };
+      a2a: {
+        status: () => Promise<{ running: boolean; url: string | null; fingerprint: string | null; peers: number }>;
+      };
       settings: {
         get: (key: string) => Promise<string | null>;
         set: (key: string, value: string) => Promise<void>;

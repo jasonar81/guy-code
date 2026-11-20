@@ -294,6 +294,12 @@ app.whenReady().then(async () => {
         log.error('[main] Slack bridge start failed', e);
       }
     });
+  // Agent-to-agent endpoint. A no-op unless the user enabled it (off by
+  // default because it opens a network port). Loaded lazily so a disabled
+  // install never pays for the module graph.
+  import('./a2a/index')
+    .then((m) => m.startA2A())
+    .catch((e) => log.error('[main] A2A start failed', e));
   // Initialize the auto-updater. In dev (`!app.isPackaged`) this is a
   // no-op — the renderer's update banner just never fires. In a
   // packaged build it kicks off the initial update check after a 30 s
@@ -377,6 +383,11 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   stopGovernor();
   stopSlackBridge();
+  import('./a2a/index')
+    .then((m) => m.stopA2A())
+    .catch(() => {
+      /* best effort */
+    });
   stopLagMonitor();
   shutdownAutoUpdater();
   shutdownMcp().catch(() => {

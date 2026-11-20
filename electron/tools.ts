@@ -36,6 +36,7 @@ import type { MemoryBundle, MemoryTier } from './memory';
 import { broadcastStateChanged } from './agentEvents';
 import { getMcpToolSchemas, invokeMcpTool } from './mcp';
 import { loadMessagesWithTsFromJsonl, ourJsonlPath } from './sessionRuntime';
+import { A2A_TOOLS } from './a2aTools';
 
 export interface ToolContext {
   sessionId: string;
@@ -3097,6 +3098,10 @@ export const TOOLS: Record<string, ToolDef> = {
   Plan: PLAN,
   Execute: EXECUTE,
   Review: REVIEW,
+  // Agent-to-agent (A2A): A2ASend / A2APeers / A2APair. Only offered to the
+  // model while A2A is enabled (see getToolSchemas), but always registered so
+  // a tool_use from an earlier turn still executes and returns a clear error.
+  ...A2A_TOOLS,
 };
 
 export function getToolSchemas(): Anthropic.Tool[] {
@@ -3107,8 +3112,19 @@ export function getToolSchemas(): Anthropic.Tool[] {
   // Cache stability matters here: the order must be deterministic
   // across turns within a session. We sort each group individually
   // then concat.
-  const native = Object.values(TOOLS)
-    .map((t) => t.schema)
+  // A2A tools are hidden while A2A is off (the default): three schemas the
+  // model can never use successfully would cost tokens on every call and
+  // invite it to try. Toggling the setting changes the tool list once, which
+  // costs one cache miss.
+  let a2aOn = false;
+  try {
+    a2aOn = getSetting('a2a.enabled') === '1';
+  } catch {
+    /* DB not ready (tests): treat as off */
+  }
+  const native = Object.entries(TOOLS)
+    .filter(([name]) => a2aOn || !(name in A2A_TOOLS))
+    .map(([, t]) => t.schema)
     .sort((a, b) => a.name.localeCompare(b.name));
   const mcp = getMcpToolSchemas().sort((a, b) => a.name.localeCompare(b.name));
   return [...native, ...mcp];

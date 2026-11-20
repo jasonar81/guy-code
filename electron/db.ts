@@ -38,6 +38,7 @@ import * as fsp from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
+import { A2A_SCHEMA_SQL } from './a2a/schema';
 
 let SQL: SqlJsStatic | null = null;
 let _db: Database | null = null;
@@ -1172,6 +1173,17 @@ function migrate(d: Database) {
         CREATE INDEX IF NOT EXISTS usage_rollup_day ON usage_rollup(day);
         CREATE INDEX IF NOT EXISTS usage_rollup_session ON usage_rollup(session_id);
       `,
+    },
+    {
+      version: 14,
+      // Agent-to-agent (A2A) coordination, P1: paired peers, inbound/outbound
+      // tasks, context -> session mapping, messageId dedup and pairing invites.
+      // The DDL lives in a2a/schema.ts so the A2A tests apply exactly the same
+      // SQL to their throwaway databases. Every statement is IF NOT EXISTS.
+      // Peer tokens are NOT stored here in plaintext: a2a_peers keeps a
+      // secret.ts reference for the outbound token and a SHA-256 of the
+      // inbound one (docs/a2a/DESIGN.md 6.2).
+      up: A2A_SCHEMA_SQL,
     },
   ];
 

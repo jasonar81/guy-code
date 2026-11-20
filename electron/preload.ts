@@ -68,6 +68,10 @@ const api = {
     test: (): Promise<{ ok: boolean; message: string }> =>
       ipcRenderer.invoke('slackBridge:test'),
   },
+  a2a: {
+    status: (): Promise<{ running: boolean; url: string | null; fingerprint: string | null; peers: number }> =>
+      ipcRenderer.invoke('a2a:status'),
+  },
   settings: {
     get: (key: string) => ipcRenderer.invoke('settings:get', key),
     set: (key: string, value: string) => ipcRenderer.invoke('settings:set', key, value),

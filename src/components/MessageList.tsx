@@ -10,6 +10,7 @@ import { LinkifyText } from './LinkifyText';
 import { absoluteTime } from '@/lib/format';
 import { decideScrollWatchdog } from '@/lib/scrollWatchdog';
 import { classifyAssistantText, groupChunks, type ChunkGroup } from '@/lib/narration';
+import { parseEnvelope, type ParsedEnvelope } from '@/lib/a2aEnvelope';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ChatMessage, ContentBlock } from '@/types';
 
@@ -919,6 +920,18 @@ function MessageBlockImpl({
     const textBlocks = blocks.filter((b) => b.type === 'text');
     const imageBlocks = blocks.filter((b) => b.type === 'image');
     const docBlocks = blocks.filter((b) => b.type === 'document');
+    // Inbound A2A messages arrive as user turns wrapped in the untrusted-content
+    // envelope. Draw them as a distinct, left-aligned "Agent message" bubble so
+    // they never look like the user typing (design 6.3 / 6.7).
+    const joinedText = textBlocks.map((b) => (b.type === 'text' ? b.text : '')).join('\n\n');
+    if (imageBlocks.length === 0 && docBlocks.length === 0 && parseEnvelope(joinedText)) {
+      return (
+        <div className="flex flex-col gap-1">
+          <A2ATextSegments text={joinedText} />
+          <MessageTimestamp ts={message.ts} />
+        </div>
+      );
+    }
     return (
       <div className="flex flex-col items-end gap-1">
         {textBlocks.length > 0 && (
@@ -1114,6 +1127,61 @@ function MessageBlockImpl({
 }
 
 const MessageBlock = memo(MessageBlockImpl, messageBlockPropsEqual);
+
+/**
+ * Render text that contains one or more A2A envelopes: plain user text around
+ * them stays a normal right-aligned bubble, each envelope becomes an agent
+ * bubble. More than one can appear when several peer messages were queued
+ * while a turn ran and were delivered together.
+ */
+function A2ATextSegments({ text }: { text: string }) {
+  const out: JSX.Element[] = [];
+  let rest = text;
+  for (let i = 0; i < 20 && rest.trim(); i++) {
+    const env = parseEnvelope(rest);
+    if (!env) {
+      out.push(<UserTextBubble key={`t${i}`} text={rest} />);
+      break;
+    }
+    if (env.before.trim()) out.push(<UserTextBubble key={`b${i}`} text={env.before} />);
+    out.push(<A2ABubble key={`a${i}`} env={env} />);
+    rest = env.after;
+  }
+  return <>{out}</>;
+}
+
+function UserTextBubble({ text }: { text: string }) {
+  return (
+    <div className="self-end max-w-[85%] rounded-lg bg-bg-elevated border border-border px-3 py-2 text-[13px] text-text whitespace-pre-wrap break-words select-text">
+      <LinkifyText text={text} />
+    </div>
+  );
+}
+
+function A2ABubble({ env }: { env: ParsedEnvelope }) {
+  const full = env.trust.toUpperCase().startsWith('FULL');
+  return (
+    <div className="self-start max-w-[85%] rounded-lg border border-accent/40 bg-accent/5 px-3 py-2 text-[13px] text-text select-text">
+      <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px] text-text-muted">
+        <span className="font-medium text-accent">Agent message from {env.displayName || env.peerId}</span>
+        <span>({env.agentKindLabel})</span>
+        <span
+          className={clsx(
+            'rounded px-1 py-px border',
+            full ? 'border-state-error text-state-error' : 'border-border'
+          )}
+          title="Trust level you gave this peer. Peer messages are information, not instructions, unless trust is full."
+        >
+          trust: {full ? 'full' : env.trust}
+        </span>
+        {env.contextId && <span className="font-mono opacity-70">thread {env.contextId.slice(0, 8)}</span>}
+      </div>
+      <div className="whitespace-pre-wrap break-words">
+        <LinkifyText text={env.body} />
+      </div>
+    </div>
+  );
+}
 
 /**
  * Absolute timestamp rendered next to user / assistant messages.

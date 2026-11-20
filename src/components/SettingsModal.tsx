@@ -376,6 +376,8 @@ export function SettingsModal({ open, onClose }: Props) {
             )}
           </Field>
 
+          <A2ASection open={open} />
+
           <ApiKeysSection keys={apiKeys} />
 
           <ChromeConnectorSection open={open} />
@@ -1226,6 +1228,106 @@ function McpRow({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Agent-to-agent (A2A) basics: on/off, the name peers see, and the network
+ * allow-list, plus a live status line. Pairing, trust and the inbox are
+ * driven through the A2APair / A2APeers tools in P1; the full Agents panel
+ * (design 6.7) arrives with P2.
+ */
+function A2ASection({ open }: { open: boolean }) {
+  const [on, setOn] = useState(false);
+  const [name, setName] = useState('');
+  const [cidrs, setCidrs] = useState('');
+  const [status, setStatus] = useState<{ running: boolean; url: string | null; fingerprint: string | null; peers: number } | null>(null);
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await window.api.a2a.status());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      const [e, n, c] = await Promise.all([
+        window.api.settings.get('a2a.enabled'),
+        window.api.settings.get('a2a.displayName'),
+        window.api.settings.get('a2a.allowCidrs'),
+      ]);
+      if (cancelled) return;
+      setOn(e === '1');
+      setName(n ?? '');
+      setCidrs(c ?? '');
+      void refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, refresh]);
+  // The server restarts asynchronously after a settings change; re-poll shortly after.
+  const refreshSoon = () => setTimeout(() => void refresh(), 800);
+  return (
+    <Field
+      icon={<Cpu size={14} />}
+      label="Agent-to-agent (A2A)"
+      hint="Lets colleagues' agents (Guy Code or Claude Code) send your agent messages over the VPN, and lets you say things like 'tell Dylan's agent the retry policy is changing'. Peers must pair first (ask your agent for a pairing code), and their messages always arrive marked as information from another agent, never as your instructions. Off by default because it opens a network port; it listens only on an address inside the allowed networks."
+    >
+      <label className="flex items-center gap-2 text-[13px] text-text cursor-pointer">
+        <input
+          type="checkbox"
+          checked={on}
+          onChange={async (e) => {
+            setOn(e.target.checked);
+            await window.api.settings.set('a2a.enabled', e.target.checked ? '1' : '');
+            refreshSoon();
+          }}
+        />
+        {on ? 'On' : 'Off'}
+      </label>
+      {on && (
+        <div className="mt-2 space-y-2">
+          <div>
+            <div className="text-[11px] text-text-dim mb-1">Your name as peers see it</div>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={async () => {
+                await window.api.settings.set('a2a.displayName', name.trim());
+                refreshSoon();
+              }}
+              className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-text outline-none focus:border-accent"
+              placeholder="Jason Arnold"
+            />
+          </div>
+          <div>
+            <div className="text-[11px] text-text-dim mb-1">Allowed networks (CIDR, comma separated; default 10.0.0.0/8)</div>
+            <input
+              value={cidrs}
+              onChange={(e) => setCidrs(e.target.value)}
+              onBlur={async () => {
+                await window.api.settings.set('a2a.allowCidrs', cidrs.trim());
+              }}
+              className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] font-mono text-text outline-none focus:border-accent"
+              placeholder="10.0.0.0/8"
+            />
+          </div>
+          <div className="text-[11px] text-text-muted">
+            {status?.running ? (
+              <>
+                Listening at <span className="font-mono">{status.url}</span> - {status.peers} paired peer
+                {status.peers === 1 ? '' : 's'}
+              </>
+            ) : (
+              'Not running yet (or failed to start - see the log).'
+            )}
+          </div>
+        </div>
+      )}
+    </Field>
   );
 }
 

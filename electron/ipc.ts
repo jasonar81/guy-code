@@ -330,7 +330,21 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
         log.error('[ipc] restarting Slack bridge failed', e);
       }
     }
+    // A2A binds a port from enabled/port/bind/insecureHttp/displayName, so
+    // those need a restart. allowCidrs and paused are read live per request,
+    // and the cert / inbox keys are written by A2A itself.
+    if (['a2a.enabled', 'a2a.port', 'a2a.bind', 'a2a.insecureHttp', 'a2a.displayName'].includes(key)) {
+      import('./a2a/index')
+        .then((m) => m.startA2A())
+        .catch((e) => log.error('[ipc] restarting A2A failed', e));
+    }
     return r;
+  });
+
+  /** A2A endpoint status for Settings. Never includes tokens. */
+  ipcMain.handle('a2a:status', async () => {
+    const { a2aStatus } = await import('./a2a/index');
+    return a2aStatus();
   });
 
   /** Post a test message to the configured Slack channel (Settings button). */
