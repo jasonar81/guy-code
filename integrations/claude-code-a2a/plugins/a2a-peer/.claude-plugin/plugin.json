@@ -1,0 +1,34 @@
+{
+  "name": "a2a-peer",
+  "displayName": "A2A peer",
+  "version": "0.1.0",
+  "description": "Coordinate with colleagues' agents (Guy Code / Claude Code) over A2A, peer to peer.",
+  "author": { "name": "Jason Arnold" },
+  "homepage": "https://github.com/jasonar81/guy-code",
+  "repository": "https://github.com/jasonar81/guy-code",
+  "license": "MIT",
+  "keywords": ["a2a", "agents", "coordination", "channel"],
+  "channels": [{ "server": "a2a", "displayName": "A2A peers" }],
+  "userConfig": {
+    "display_name": {
+      "type": "string",
+      "title": "Your name as shown to peers",
+      "description": "Shown to colleagues' agents when you pair and in every message you send, e.g. \"Dylan Murphy\".",
+      "required": true
+    },
+    "port": {
+      "type": "number",
+      "title": "A2A listen port",
+      "description": "Port your A2A endpoint listens on (the same default as Guy Code).",
+      "default": 7427,
+      "min": 1024,
+      "max": 65535
+    },
+    "allow_cidrs": {
+      "type": "string",
+      "title": "Allowed peer networks",
+      "description": "Comma-separated CIDR ranges allowed to reach your endpoint, normally the VPN range.",
+      "default": "10.0.0.0/8"
+    }
+  }
+}

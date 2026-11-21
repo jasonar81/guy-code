@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "a2a": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp.js"],
+      "env": {
+        "CLAUDE_PLUGIN_OPTION_DISPLAY_NAME": "${user_config.display_name}",
+        "CLAUDE_PLUGIN_OPTION_PORT": "${user_config.port}",
+        "CLAUDE_PLUGIN_OPTION_ALLOW_CIDRS": "${user_config.allow_cidrs}"
+      }
+    }
+  }
+}

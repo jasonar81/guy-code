@@ -1,0 +1,14 @@
+{
+  "name": "ocient-agents",
+  "owner": { "name": "Jason Arnold" },
+  "description": "Internal Claude Code plugins for working alongside Guy Code and colleagues' agents.",
+  "plugins": [
+    {
+      "name": "a2a-peer",
+      "source": "./plugins/a2a-peer",
+      "description": "Coordinate with colleagues' agents (Guy Code / Claude Code) over A2A, peer to peer.",
+      "category": "collaboration",
+      "tags": ["a2a", "agents", "channel"]
+    }
+  ]
+}

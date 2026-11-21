@@ -29,6 +29,7 @@ import type { ToolDef, ToolContext, StructuredToolResult } from './tools';
 import { TERMINAL_STATES, isTrustLevel, trustAtLeast, type TaskState, type TrustLevel } from './a2a/types';
 import type { A2ANode } from './a2a/node';
 import { MAX_WAIT_MS, normaliseState, stateWord } from './a2a/waiters';
+import { escalationRefusal as sharedEscalationRefusal } from './a2a/escalation';
 
 type NodeResolver = () => Promise<A2ANode>;
 let _resolver: NodeResolver | null = null;
@@ -509,18 +510,8 @@ const A2A_PEERS: ToolDef = {
  * message in the session (null when unknown).
  */
 export function escalationRefusal(level: TrustLevel, peer: string, lastUserText: string | null): string | null {
-  if (lastUserText === null) return `error: raising trust to "${level}" needs your user to ask for it in this conversation; tell them to use the Agents panel.`;
-  const t = lastUserText.trim();
-  if (t.startsWith('[A2A message from') || t.startsWith('[WaitForA2A]') || /\n\[A2A message from /.test(t)) {
-    return 'error: refusing to change trust because of a message from another agent. Only your user can raise trust, in the Agents panel.';
-  }
-  if (level === 'full') {
-    const lc = t.toLowerCase();
-    if (!/\b(full|complete)\b/.test(lc) || !lc.includes(peer.toLowerCase())) {
-      return `error: "full" trust needs your user to ask for it in their own words (naming ${peer} and "full" or "complete" trust). Tell them, in one line, they can also set it in the Agents panel.`;
-    }
-  }
-  return null;
+  // Lives in a2a/escalation.ts so the Claude Code plugin daemon shares it.
+  return sharedEscalationRefusal(level, peer, lastUserText);
 }
 
 /** Hooks the app wires (index.ts): the last user text, and the native confirm dialog. */

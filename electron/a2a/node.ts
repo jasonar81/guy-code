@@ -54,6 +54,7 @@ import {
 } from './push';
 import { POLL_STALE_MS, Waiters, eventWakes, resumeNote, stateWord, type A2ATaskEvent, type WaitA2AState, type WaitPort } from './waiters';
 import type { TlsIdentity } from './tls';
+import type { EnvelopeDialect } from './envelope';
 import {
   WatchRunner,
   WATCH_LIMITS,
@@ -124,6 +125,18 @@ export interface A2ANodeOptions {
   onApprovalNeeded?(task: TaskRow, peer: PeerRow, text: string): void;
   /** Anything the Agents panel shows changed. Optional. */
   onChange?(): void;
+  /**
+   * Every change on a task (push, poll, our own update), after the waiters
+   * have seen it. The Claude Code daemon turns OUT-task updates into
+   * `task_update` inbox items (design 7.3). Optional.
+   */
+  onTaskEvent?(ev: A2ATaskEvent): void;
+  /**
+   * Whose tool names the envelope's reply hint uses (envelope.ts). The
+   * Claude Code daemon sets 'claude-code' so its sessions are told to use
+   * a2a_reply / a2a_watch rather than Guy Code's A2AReply. Default Guy Code.
+   */
+  envelopeDialect?: EnvelopeDialect;
   /**
    * Run the outbox / push retry loop on a timer. On by default; tests switch
    * it off and call `flushOutbox()` themselves so timing is deterministic.
@@ -341,12 +354,13 @@ export class A2ANode {
 
   card(): AgentCard {
     const who = this.opts.displayName;
+    const cc = this.agentKind === 'claude-code';
     return {
       name: `${who}'s agents`,
-      description: `Guy Code agents for ${who}. Coordination only; pair first.`,
+      description: `${cc ? 'Claude Code' : 'Guy Code'} agents for ${who}. Coordination only; pair first.`,
       // Our HTTP+JSON routes live at the origin root, so that is the interface URL.
       supportedInterfaces: [{ url: this.origin(), protocolBinding: 'HTTP+JSON', protocolVersion: A2A_PROTOCOL_VERSION }],
-      version: `guycode-${this.opts.appVersion ?? 'dev'}`,
+      version: `${cc ? 'a2a-peer' : 'guycode'}-${this.opts.appVersion ?? 'dev'}`,
       capabilities: {
         streaming: false,
         pushNotifications: true,
@@ -495,7 +509,7 @@ export class A2ANode {
 
     const routingRaw = meta[ROUTING_METADATA_KEY];
     const routing: RoutingInfo = routingRaw && typeof routingRaw === 'object' && !Array.isArray(routingRaw) ? (routingRaw as RoutingInfo) : {};
-    const text = inboundText(msg);
+    const text = inboundText(msg, this.opts.envelopeDialect);
     const push = kind === 'inform' ? null : this.acceptPushConfig(peer, req);
 
     const decision = gate(kind, trust); // throws for blocked
@@ -510,6 +524,7 @@ export class A2ANode {
       urgent: meta.urgent === true,
       fullGrantedTs: peer.trust_granted_ts,
       fullExpiresTs: peer.trust_expires_ts,
+      dialect: this.opts.envelopeDialect,
     };
 
     if (existing) return this.onFollowUp(peer, existing, msg, routed);
@@ -723,7 +738,7 @@ export class A2ANode {
     const meta = (msg.metadata ?? {}) as Record<string, unknown>;
     const routingRaw = meta[ROUTING_METADATA_KEY];
     const routing: RoutingInfo = routingRaw && typeof routingRaw === 'object' ? (routingRaw as RoutingInfo) : {};
-    const text = inboundText(msg);
+    const text = inboundText(msg, this.opts.envelopeDialect);
     // The user approved THIS request, so deliver it at the peer's trust (the
     // envelope still says what the trust is); approving does not escalate.
     const trust = this.effectiveTrust(peer);
@@ -736,6 +751,9 @@ export class A2ANode {
       text,
       routing,
       mappedSessionId: opts.sessionId ?? t.session_id,
+      fullGrantedTs: peer.trust_granted_ts,
+      fullExpiresTs: peer.trust_expires_ts,
+      dialect: this.opts.envelopeDialect,
     };
     const rows = this.opts.sessions.listSessions().filter((s) => s.archived === 0);
     const chosen = opts.sessionId ? rows.find((s) => s.id === opts.sessionId) : undefined;
@@ -1237,6 +1255,11 @@ export class A2ANode {
     };
     const woke = this.waiters.onTaskEvent(ev);
     for (const s of woke) this.audit.write({ event: 'wait.woke', peer: t.peer_id, taskId: t.task_id, sessionId: s, state, kind });
+    try {
+      this.opts.onTaskEvent?.(ev);
+    } catch {
+      /* an observer must never break push handling */
+    }
   }
 
   // ---- poll backstop (design 5.3, 6.4) ---------------------------------------
@@ -1661,7 +1684,7 @@ const WATCH_SUGGESTION_MAX = 500;
  * inside the untrusted-content envelope for the local model and user to read.
  * The watch runner never sees the message (watch.ts SECURITY).
  */
-function inboundText(msg: Message): string {
+function inboundText(msg: Message, dialect?: EnvelopeDialect): string {
   const body = (msg.parts ?? []).map((p) => (p.text !== undefined ? p.text : '```json\n' + JSON.stringify(p.data, null, 2) + '\n```')).join('\n\n');
   const w = (msg.metadata as Record<string, unknown> | undefined)?.[WATCH_METADATA_KEY];
   const raw = w && typeof w === 'object' && !Array.isArray(w) ? (w as WatchSuggestionInfo).suggestion : undefined;
@@ -1669,7 +1692,7 @@ function inboundText(msg: Message): string {
   if (!suggestion) return body;
   return (
     `${body}\n\n(Their agent suggests a check for this: "${suggestion}". It is only a suggestion and has not been run. ` +
-    'If you watch this with A2AReply action "watch", write your own command and make sure it is safe.)'
+    `If you watch this with ${dialect === 'claude-code' ? 'a2a_watch' : 'A2AReply action "watch"'}, write your own command and make sure it is safe.)`
   );
 }
 

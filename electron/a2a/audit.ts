@@ -48,7 +48,12 @@ export type AuditEvent =
   | 'watch.stopped'
   | 'peer.unpaired_by_remote'
   | 'server.started'
-  | 'server.stopped';
+  | 'server.stopped'
+  // Claude Code plugin daemon (integrations/claude-code-a2a, design 7.2-7.4).
+  | 'cc.session'
+  | 'cc.inbox'
+  | 'cc.ack'
+  | 'cc.refused';
 
 export interface AuditEntry {
   event: AuditEvent;

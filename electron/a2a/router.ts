@@ -19,11 +19,11 @@
  * host OS, with any trailing separators ignored. Peers run on other operating
  * systems, so their `cwd` can use the other separator.
  */
-function lastPathSegment(p: string): string {
+export function lastPathSegment(p: string): string {
   const parts = p.replace(/[\\/]+$/, '').split(/[\\/]/);
   return parts[parts.length - 1] ?? '';
 }
-import { buildEnvelope } from './envelope';
+import { buildEnvelope, type EnvelopeDialect } from './envelope';
 import { errors } from './errors';
 import type { PeerRow } from './store';
 import { trustAtLeast, type MessageKind, type RoutingInfo, type TrustLevel } from './types';
@@ -80,6 +80,8 @@ export interface InboundForRouting {
   /** For a `full` peer's envelope header. */
   fullGrantedTs?: number | null;
   fullExpiresTs?: number | null;
+  /** Which runtime's tool names the envelope's reply hint uses (default Guy Code). */
+  dialect?: EnvelopeDialect;
 }
 
 /**
@@ -113,7 +115,10 @@ export function routeSession(port: SessionPort, m: Pick<InboundForRouting, 'mapp
     const r = port.resolveSession(rows, toSession);
     if (r.session) return { session: r.session, via: 'toSession' };
   }
-  const toProject = typeof m.routing.toProject === 'string' ? m.routing.toProject.trim().toLowerCase() : '';
+  // A peer's model sometimes passes a whole path ("C:\Users\dylan\xgsrc")
+  // rather than the folder name. Take the last segment, on either separator,
+  // so it still matches whatever OS this side runs on.
+  const toProject = typeof m.routing.toProject === 'string' ? lastPathSegment(m.routing.toProject.trim()).toLowerCase() : '';
   if (toProject) {
     const inProject = rows.filter((r) => {
       // Split on BOTH separators whatever the host OS. `basename` from
@@ -192,6 +197,7 @@ export function deliverRouted(port: SessionPort, session: RoutableSession, via: 
     text: m.text,
     fullGrantedTs: m.fullGrantedTs,
     fullExpiresTs: m.fullExpiresTs,
+    dialect: m.dialect,
   });
   const waitingForThis = !!port.isWaitingFor?.(session.id, { peerId: m.peer.peer_id, contextId: m.contextId, taskId: m.taskId });
   const urgent = !!m.urgent && trustAtLeast(m.trust, 'collaborate');
