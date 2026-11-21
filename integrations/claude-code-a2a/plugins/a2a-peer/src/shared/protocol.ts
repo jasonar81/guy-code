@@ -22,7 +22,18 @@ export { type SecretPort, type SqlHandle, type PeerRow, type TaskRow } from '../
 export { lastPathSegment, type RoutableSession, type SessionPort } from '../../../../../../electron/a2a/router';
 export { buildEnvelope, parseEnvelope, HEADER_PREFIX } from '../../../../../../electron/a2a/envelope';
 export { generateSelfSignedCert, fingerprintOfPem, type TlsIdentity } from '../../../../../../electron/a2a/tls';
-export { DEFAULT_ALLOW_CIDRS, DEFAULT_PORT, parseCidr, resolveAdvertiseHost, resolveBindAddress } from '../../../../../../electron/a2a/config';
+// CLAUDE_CODE_DEFAULT_PORT (7428) is what this plugin listens on. DEFAULT_PORT
+// (7427) is Guy Code's and is re-exported only so the two can be named in
+// error messages - the daemon must never fall back to it, or both would fight
+// over one port on a machine running both.
+export {
+  DEFAULT_ALLOW_CIDRS,
+  DEFAULT_PORT,
+  CLAUDE_CODE_DEFAULT_PORT,
+  parseCidr,
+  resolveAdvertiseHost,
+  resolveBindAddress,
+} from '../../../../../../electron/a2a/config';
 export { stateWord, stateWakes, type A2ATaskEvent } from '../../../../../../electron/a2a/waiters';
 export { fmtDuration, type WatchCheckFn } from '../../../../../../electron/a2a/watch';
 export { taskOutcomeText, partsText } from '../../../../../../electron/a2a/push';

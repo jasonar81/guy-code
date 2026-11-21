@@ -35,8 +35,10 @@ build it before you publish or commit it to the marketplace branch.
 reach you and watches keep running; stop it with the pid in `daemon.json`.
 
 ## Firewall
-The daemon listens on port 7427 on your VPN address, so Windows shows the "Windows Defender
-Firewall has blocked some features of Node.js" prompt the first time it starts. Declining is safe:
+The daemon listens on port **7428** on your VPN address. Guy Code's own endpoint uses **7427**, so
+the two can run on the same machine without clashing; if you change one, keep them different. The
+first start shows the "Windows Defender Firewall has blocked some features of Node.js" prompt.
+Declining is safe:
 outbound still works, so you can send and ask, but peers cannot reach you, which means their
 replies, pushes and watch results arrive only when you next contact them.
 
@@ -60,10 +62,18 @@ your VPN adapter is on first (`Get-NetConnectionProfile`) - a corporate VPN is u
 `Domain`, and a rule on the wrong profile does nothing:
 
 ```powershell
-New-NetFirewallRule -DisplayName "A2A peer (inbound 7427)" `
-  -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7427 `
+# This plugin's daemon (node.exe) on 7428
+New-NetFirewallRule -DisplayName "A2A peer plugin (inbound 7428)" `
+  -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7428 `
   -Profile Private -RemoteAddress 10.0.0.0/8 `
   -Program "C:\Program Files\nodejs\node.exe"
+
+# Guy Code's own endpoint on 7427, if you also run it. Note this is a
+# different executable, so the rule above does not cover it.
+New-NetFirewallRule -DisplayName "Guy Code A2A (inbound 7427)" `
+  -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7427 `
+  -Profile Private -RemoteAddress 10.0.0.0/8 `
+  -Program "$env:LOCALAPPDATA\Programs\Guy Code\Guy Code.exe"
 ```
 
 `-Profile Private` keeps the port shut on public Wi-Fi, `-RemoteAddress` matches the default

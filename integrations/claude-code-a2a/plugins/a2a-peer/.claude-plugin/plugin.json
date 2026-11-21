@@ -19,8 +19,8 @@
     "port": {
       "type": "number",
       "title": "A2A listen port",
-      "description": "Port your A2A endpoint listens on (the same default as Guy Code).",
-      "default": 7427,
+      "description": "Port your A2A endpoint listens on. Defaults to 7428 so it does not clash with Guy Code, which uses 7427, if you run both on this machine.",
+      "default": 7428,
       "min": 1024,
       "max": 65535
     },

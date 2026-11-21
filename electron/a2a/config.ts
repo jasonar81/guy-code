@@ -31,7 +31,25 @@ export const A2A_SETTING = {
 /** Secret name (secret.ts) for our TLS private key. */
 export const A2A_TLS_KEY_SECRET = 'a2a.tlsKey';
 
+/**
+ * Guy Code's own A2A port.
+ *
+ * The Claude Code plugin deliberately defaults to a DIFFERENT port
+ * (CLAUDE_CODE_DEFAULT_PORT below), because plenty of people run both on one
+ * machine. Sharing a default meant whichever started second failed to bind,
+ * and the firewall rule the user had already added pointed at the wrong
+ * executable. Two defaults means both work side by side with no
+ * configuration.
+ */
 export const DEFAULT_PORT = 7427;
+
+/**
+ * The Claude Code plugin's default, kept here next to Guy Code's so the two
+ * cannot silently drift back into collision. The plugin imports this; nothing
+ * in Guy Code itself listens on it.
+ */
+export const CLAUDE_CODE_DEFAULT_PORT = 7428;
+
 export const DEFAULT_ALLOW_CIDRS = ['10.0.0.0/8'];
 
 /** Inbound limits from design 4.2.6. */

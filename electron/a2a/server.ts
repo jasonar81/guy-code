@@ -152,6 +152,23 @@ class A2AServerImpl implements A2AServer {
       const onError = (e: Error) => {
         server.removeListener('listening', onListening);
         this.server = null;
+        // A bare EADDRINUSE here is baffling: the usual cause is running Guy
+        // Code and the Claude Code a2a-peer plugin on one machine, and the
+        // two used to share a default port. They now default to 7427 and
+        // 7428, but someone who set both to the same number by hand still
+        // needs to be told what to do about it.
+        if ((e as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+          const where = this.opts.host ? `${this.opts.host}:${this.opts.port}` : `port ${this.opts.port}`;
+          reject(
+            new Error(
+              `A2A could not start: ${where} is already in use. Another A2A endpoint is ` +
+                `probably running - Guy Code defaults to 7427 and the Claude Code a2a-peer ` +
+                `plugin to 7428, so give one of them a different port in its settings. ` +
+                `Original error: ${e.message}`
+            )
+          );
+          return;
+        }
         reject(e);
       };
       const onListening = () => {

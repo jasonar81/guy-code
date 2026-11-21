@@ -33,7 +33,7 @@ import { DAEMON_JSON, connectDaemon, readDaemonInfo } from './shared/local';
 import { isEntry } from './shared/entry';
 import {
   DEFAULT_ALLOW_CIDRS,
-  DEFAULT_PORT,
+  CLAUDE_CODE_DEFAULT_PORT,
   fingerprintOfPem,
   generateSelfSignedCert,
   parseCidr,
@@ -149,7 +149,12 @@ export function readConfig(dir: string, envIn: NodeJS.ProcessEnv = process.env):
   }
   return {
     displayName: name,
-    port: Number.isInteger(portRaw) && portRaw > 0 && portRaw < 65536 ? portRaw : DEFAULT_PORT,
+    // Defaults to 7428, NOT Guy Code's 7427, so both can run on one machine
+    // without the second one failing to bind.
+    port:
+      Number.isInteger(portRaw) && portRaw > 0 && portRaw < 65536
+        ? portRaw
+        : CLAUDE_CODE_DEFAULT_PORT,
     bind: String(file.bind ?? env.CLAUDE_PLUGIN_OPTION_BIND ?? '').trim(),
     allowCidrs: cidrs.length ? cidrs : [...DEFAULT_ALLOW_CIDRS],
     advertiseHost: typeof file.advertiseHost === 'string' ? file.advertiseHost : undefined,

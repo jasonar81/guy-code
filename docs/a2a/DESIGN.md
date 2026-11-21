@@ -916,6 +916,14 @@ only — there is no standalone `node:http` server — and Express is a peer dep
 in Electron. Decision: take the SDK's **types and client** where convenient, hand-roll the ~10
 routes on `node:https` following `chromeWsServer.ts`. Still gate on `a2a-tck` (§10 P5).
 
+### Ports — Guy Code 7427, Claude Code plugin **7428** (supersedes §4.1 and §7.1)
+Both originally defaulted to 7427 and the plugin imported Guy Code's `DEFAULT_PORT`, so running
+both on one machine - which is common - meant the second to start died with a bare `EADDRINUSE`,
+and any firewall rule already added pointed at the wrong executable. The plugin now defaults to
+**7428**. Both constants live together in `electron/a2a/config.ts` (`DEFAULT_PORT` and
+`CLAUDE_CODE_DEFAULT_PORT`) so they cannot drift back into collision, and a test asserts they
+differ. `server.ts` turns `EADDRINUSE` into a message naming both defaults and what to change.
+
 ### TLS certs — **no new dependency** (supersedes §6.1's "use `selfsigned`")
 `selfsigned@5.5.0` pulls in `@peculiar/x509` + `pkijs`. Not needed. Node can generate the keypair
 (`crypto.generateKeyPairSync('ec', {namedCurve:'prime256v1'})`) and parse certs
