@@ -90,8 +90,9 @@ export interface AuthenticationInfo {
  * url / token / authentication live directly on it, not on a nested
  * `pushNotificationConfig`. `tenant` stays unset (we are single-tenant).
  *
- * P1 only needs the type to exist and round-trip; sending and receiving push
- * is P2.
+ * The requester sends it inline in SendMessageConfiguration. We leave
+ * uthentication.credentials unset: see push.ts for why the receiver uses
+ * the peer bearer token it already holds instead.
  */
 export interface TaskPushNotificationConfig {
   tenant?: string;
@@ -140,6 +141,29 @@ export interface Task {
   history?: Message[];
   metadata?: Record<string, unknown>;
 }
+
+/**
+ * proto `StreamResponse`: the body of a push notification. Exactly one field
+ * is set. We send `task` (a full snapshot) for state changes and `message`
+ * for a new agent message on a task; we accept all four.
+ */
+export interface StreamResponse {
+  task?: Task;
+  message?: Message;
+  statusUpdate?: { taskId: string; contextId?: string; status: TaskStatus; metadata?: Record<string, unknown> };
+  artifactUpdate?: { taskId: string; contextId?: string; artifact: Artifact; append?: boolean; lastChunk?: boolean };
+}
+
+/** proto `ListTasksResponse` (GET /tasks). */
+export interface ListTasksResponse {
+  tasks: Task[];
+  nextPageToken: string;
+  pageSize: number;
+  totalSize: number;
+}
+
+/** Header carrying the per-task push token (A2A push notification spec). */
+export const PUSH_TOKEN_HEADER = 'X-A2A-Notification-Token';
 
 /** proto `SendMessageResponse`: a oneof of task or message. We always return a task. */
 export interface SendMessageResponse {
@@ -215,7 +239,7 @@ export interface RoutingInfo {
   replyContextId?: string;
 }
 
-/** `metadata.kind` (design 5.2). Advisory; P1 accepts only `inform`. */
+/** `metadata.kind` (design 5.2). Drives gating: request / notify from an inform peer wait for approval. */
 export type MessageKind = 'inform' | 'request' | 'notify';
 
 /** Trust levels, strictly ordered blocked < inform < collaborate < full (design 4.2.3). */

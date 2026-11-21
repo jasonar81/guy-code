@@ -20,10 +20,18 @@
  *   GET  /.well-known/agent-card.json  public card
  *   GET  /extendedAgentCard            authenticated card (+ shareable sessions, P2)
  *   POST /message:send                 SendMessage
+ *   GET  /tasks                        ListTasks (the caller's own tasks only)
  *   GET  /tasks/{id}                   GetTask
  *   POST /tasks/{id}:cancel            CancelTask
  *   POST /a2a-pair                     pairing extension (design 4.3)
- *   POST /a2a-push                     push receiver, 501 until P2
+ *   POST /a2a-unpair                   pairing extension: "they unpaired us" (4.3 step 5)
+ *   POST /a2a-push                     push receiver for tasks WE created on the caller
+ *
+ * /a2a-push is a normal authenticated route: the pushing peer presents the
+ * same bearer token it uses for everything else, so the gate above has
+ * already proved who it is. The handler then checks the per-task token from
+ * the X-A2A-Notification-Token header against the hash we stored when we
+ * created the task, and that the task is one we created on THAT peer.
  */
 import * as http from 'node:http';
 import * as https from 'node:https';
@@ -31,7 +39,7 @@ import type { AddressInfo } from 'node:net';
 import { A2AProtocolError, errors } from './errors';
 import { LIMITS, normaliseRemoteAddress, ipInCidrs } from './config';
 import type { PeerRow } from './store';
-import type { AgentCard, PairRequest, PairResponse, SendMessageRequest, Task } from './types';
+import type { AgentCard, ListTasksResponse, PairRequest, PairResponse, SendMessageRequest, StreamResponse, Task } from './types';
 import { A2A_CONTENT_TYPE, A2A_PROTOCOL_VERSION } from './types';
 
 export interface A2AServerHandlers {
@@ -45,6 +53,14 @@ export interface A2AServerHandlers {
   getTask(peer: PeerRow, taskId: string): Task;
   cancelTask(peer: PeerRow, taskId: string): Task;
   pair(req: PairRequest, remoteAddress: string): Promise<PairResponse>;
+  /** ListTasks: only tasks between us and this peer. */
+  listTasks(peer: PeerRow, query: URLSearchParams): ListTasksResponse;
+  /** Inbound push for a task we created on this peer. `pushToken` from X-A2A-Notification-Token. */
+  push(peer: PeerRow, body: StreamResponse, pushToken: string): { accepted: boolean; result: string };
+  /** The peer unpaired us. */
+  unpaired(peer: PeerRow): void;
+  /** Called once a request has passed auth and the gate (used to flush the outbox early). */
+  onPeerSeen?(peer: PeerRow): void;
   /** Called for every rejected request, for the audit log. Never given secrets. */
   onRejected?(info: { route: string; status: number; reason: string; peer?: string; remote: string }): void;
 }
@@ -199,6 +215,7 @@ class A2AServerImpl implements A2AServer {
     if (this.opts.handlers.effectiveTrust(p) === 'blocked') reject(errors.blocked(), p.peer_id);
     this.checkVersion(req, (e) => reject(e, p.peer_id));
     if (!this.peerLimiter.allow(p.peer_id)) reject(errors.rateLimited(), p.peer_id);
+    this.opts.handlers.onPeerSeen?.(p);
 
     if (method === 'POST' && path === '/message:send') {
       const body = (await this.readJson(req, (e) => reject(e, p.peer_id))) as SendMessageRequest;
@@ -219,14 +236,20 @@ class A2AServerImpl implements A2AServer {
       }
     }
     if (path === '/a2a-push') {
-      // TODO(P2): validate the per-task push token and the known task id, upsert
-      // a2a_tasks, then hand the event to waiters.ts (design 5.3 / 6.4). Until
-      // then we do not register push configs, so no peer should be calling this.
-      reject(errors.unimplemented('Push notifications are not supported by this agent yet.'), p.peer_id);
+      if (method !== 'POST') reject(errors.notFound(), p.peer_id);
+      const body = (await this.readJson(req, (e) => reject(e, p.peer_id))) as StreamResponse;
+      const tok = String(req.headers['x-a2a-notification-token'] ?? '');
+      const r = this.opts.handlers.push(p, body, tok);
+      return this.sendJson(res, 200, r);
+    }
+    if (path === '/a2a-unpair') {
+      if (method !== 'POST') reject(errors.notFound(), p.peer_id);
+      await this.drain(req, (e) => reject(e, p.peer_id));
+      this.opts.handlers.unpaired(p);
+      return this.sendJson(res, 200, {});
     }
     if (method === 'GET' && path === '/tasks') {
-      // TODO(P2): ListTasks for A2ATasks interop.
-      reject(errors.unimplemented('ListTasks is not supported by this agent yet.'), p.peer_id);
+      return this.sendJson(res, 200, this.opts.handlers.listTasks(p, url.searchParams));
     }
     reject(errors.notFound(`No route for ${method} ${path}.`), p.peer_id);
   }

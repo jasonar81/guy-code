@@ -63,4 +63,7 @@ export const errors = {
         : 'Missing A2A-Version header, which means 0.3 per the spec; this agent speaks 1.0 only. Send "A2A-Version: 1.0".'
     ),
   unimplemented: (msg: string) => new A2AProtocolError(501, 'UNIMPLEMENTED', msg),
+  /** Push carried the wrong (or no) per-task token for a task we did create on this peer. */
+  pushTokenMismatch: () => new A2AProtocolError(403, 'PUSH_TOKEN_MISMATCH', 'Push notification token does not match the one issued for this task.'),
+  tooManyTasks: (max: number) => new A2AProtocolError(429, 'TOO_MANY_TASKS', `This peer already has ${max} open tasks here; finish or cancel some first.`),
 };

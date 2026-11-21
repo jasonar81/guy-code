@@ -6,12 +6,13 @@ import { SessionListRow } from './ProjectRow';
 import { ThemeToggle } from './ThemeToggle';
 import { SettingsModal } from './SettingsModal';
 import { AuditPanel } from './AuditPanel';
+import { AgentsPanel } from './AgentsPanel';
 import {
   formatUsdMicros,
   dateGroupLabel,
   sessionLastTs,
 } from '@/lib/format';
-import { Loader2, RefreshCw, Plus, Settings, ScrollText, ChevronDown, Check, Star } from 'lucide-react';
+import { Loader2, RefreshCw, Plus, Settings, ScrollText, ChevronDown, Check, Star, Users } from 'lucide-react';
 import type { SessionRow, ProjectState, BudgetStatus, ApiKey } from '@/types';
 
 // PERF: how many idle/archived session rows to mount at once. This list is
@@ -64,6 +65,32 @@ export function Sidebar() {
   const setBudgetKeyFilter = useApp((s) => s.setBudgetKeyFilter);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [auditOpen, setAuditOpen] = useState(false);
+  const [agentsOpen, setAgentsOpen] = useState(false);
+  const setActive = useApp((s) => s.setActive);
+  // A2A: show the Agents button only while A2A runs, with a badge for
+  // requests waiting for the user's approval (design 6.7).
+  const [a2a, setA2a] = useState<{ running: boolean; pending: number }>({ running: false, pending: 0 });
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await window.api.a2a.status();
+        if (!cancelled) setA2a({ running: s.running, pending: s.pending ?? 0 });
+      } catch {
+        /* preload missing in tests */
+      }
+    };
+    void tick();
+    const t = setInterval(tick, 10_000);
+    const off = window.api.agent?.onEvent?.((e: any) => {
+      if (e?.type === 'a2a_changed') void tick();
+    });
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+      off?.();
+    };
+  }, []);
   const [budget, setBudget] = useState<BudgetStatus | null>(null);
 
   // Poll budget every 5s, scoped to whichever key the user picked in the
@@ -249,6 +276,21 @@ export function Sidebar() {
           <ScrollText size={12} />
           Audit
         </button>
+        {a2a.running && (
+          <button
+            className="flex items-center gap-1 hover:text-text"
+            onClick={() => setAgentsOpen(true)}
+            title="Agents (A2A): peers, trust, requests waiting for you, tasks"
+          >
+            <Users size={12} />
+            Agents
+            {a2a.pending > 0 && (
+              <span className="px-1 rounded-full bg-amber-500 text-white text-[10px]" title={`${a2a.pending} waiting for your approval`}>
+                {a2a.pending}
+              </span>
+            )}
+          </button>
+        )}
         <div className="flex-1" />
         <button
           className="p-1 rounded hover:bg-bg-hover hover:text-text"
@@ -261,6 +303,14 @@ export function Sidebar() {
         <ThemeToggle />
       </footer>
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <AgentsPanel
+        open={agentsOpen}
+        onClose={() => setAgentsOpen(false)}
+        onOpenSession={(id) => {
+          setAgentsOpen(false);
+          setActive(id);
+        }}
+      />
       <AuditPanel
         open={auditOpen}
         sessionId={activeSessionId}

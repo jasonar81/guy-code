@@ -38,7 +38,8 @@ import * as fsp from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
-import { A2A_SCHEMA_SQL } from './a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema } from './a2a/schema';
+import type { WaitA2AState } from './a2a/waiters';
 
 let SQL: SqlJsStatic | null = null;
 let _db: Database | null = null;
@@ -803,6 +804,14 @@ function migrateSettings() {
 
 // ---- Schema migrations ----
 
+/** Column names of `table`, or [] when it does not exist. */
+function tableColumns(d: Database, table: string): string[] {
+  const res = d.exec(`PRAGMA table_info(${table})`);
+  if (!res.length) return [];
+  const nameIdx = res[0].columns.indexOf('name');
+  return res[0].values.map((r) => String(r[nameIdx]));
+}
+
 function migrate(d: Database) {
   d.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
@@ -815,7 +824,7 @@ function migrate(d: Database) {
   versionStmt.free();
   const current = row?.v ?? 0;
 
-  const migrations: Array<{ version: number; up: string }> = [
+  const migrations: Array<{ version: number; up: string | ((d: Database) => void) }> = [
     {
       version: 1,
       up: `
@@ -1185,6 +1194,14 @@ function migrate(d: Database) {
       // inbound one (docs/a2a/DESIGN.md 6.2).
       up: A2A_SCHEMA_SQL,
     },
+    {
+      version: 15,
+      // A2A P2: tasks, push, outbox and WaitForA2A. Adds `sessions.wait_a2a`
+      // (the WaitForA2A state, parallel to wait_condition) plus a few a2a_*
+      // columns. ALTER TABLE ADD COLUMN is not idempotent in SQLite, so each
+      // one is guarded by PRAGMA table_info (see a2a/schema.ts).
+      up: (dd) => applyA2AP2Schema((sql) => dd.exec(sql), (table) => tableColumns(dd, table)),
+    },
   ];
 
   for (const m of migrations) {
@@ -1192,7 +1209,8 @@ function migrate(d: Database) {
       log.info(`[db] applying migration v${m.version}`);
       d.exec('BEGIN');
       try {
-        d.exec(m.up);
+        if (typeof m.up === 'function') m.up(d);
+        else d.exec(m.up);
         d.run('INSERT INTO schema_version (version) VALUES (?)', [m.version]);
         d.exec('COMMIT');
       } catch (e) {
@@ -1686,6 +1704,38 @@ export function getSessionWaitCondition(id: string): WaitConditionState | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Persist (or clear) a session's WaitForA2A state (`sessions.wait_a2a`,
+ * migration v15). Same lifecycle as wait_condition: set by the tool, read by
+ * the wake path and the push path, cleared on wake, cancel or a new user turn.
+ */
+export function setSessionWaitA2A(id: string, state: WaitA2AState | null) {
+  db()
+    .prepare('UPDATE sessions SET wait_a2a = ? WHERE id = ?')
+    .run(state ? JSON.stringify(state) : null, id);
+}
+
+/** Read + parse a session's WaitForA2A state, or null if none/invalid. */
+export function getSessionWaitA2A(id: string): WaitA2AState | null {
+  const row = db()
+    .prepare('SELECT wait_a2a FROM sessions WHERE id = ?')
+    .get<{ wait_a2a: string | null }>(id);
+  if (!row?.wait_a2a) return null;
+  try {
+    const s = JSON.parse(row.wait_a2a);
+    return s && typeof s.deadlineTs === 'number' ? (s as WaitA2AState) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Every session currently holding a WaitForA2A, for the push wake path. */
+export function listSessionsWaitingA2A(): Array<{ id: string; wait_a2a: string }> {
+  return db()
+    .prepare("SELECT id, wait_a2a FROM sessions WHERE wait_a2a IS NOT NULL AND wait_a2a != '' AND archived = 0")
+    .all<{ id: string; wait_a2a: string }>();
 }
 
 /**

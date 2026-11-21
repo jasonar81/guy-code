@@ -43,6 +43,8 @@ export const LIMITS = {
   pairAttemptsPerMinutePerIp: 10,
   /** Pairing invites are single use and expire after 15 minutes (design 4.3). */
   inviteTtlMs: 15 * 60_000,
+  /** Open (non-terminal) inbound tasks per peer (design 4.2.6). */
+  maxOpenTasksPerPeer: 1000,
 } as const;
 
 export interface A2AConfig {

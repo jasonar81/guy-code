@@ -9,14 +9,16 @@
  *   - sends `A2A-Version: 1.0` and `Content-Type: application/a2a+json`;
  *   - has a hard timeout, so a dead peer cannot hang a tool call.
  *
- * Retries and the offline outbox are P2 (design 6.6). P1 surfaces an
- * "offline" error to the tool, which tells the model plainly.
+ * This module makes exactly one attempt. Retries, backoff and the offline
+ * outbox live in node.ts / push.ts (design 6.6), which classify the errors
+ * thrown here: PeerOfflineError and 5xx / 408 / 429 are worth retrying; any
+ * other 4xx and a pin mismatch are not.
  */
 import * as http from 'node:http';
 import * as net from 'node:net';
 import { connectPinned, CertPinMismatchError } from './tls';
-import type { A2AErrorBody, AgentCard, PairRequest, PairResponse, SendMessageRequest, SendMessageResponse, Task } from './types';
-import { A2A_CONTENT_TYPE, A2A_PROTOCOL_VERSION } from './types';
+import type { A2AErrorBody, AgentCard, PairRequest, PairResponse, SendMessageRequest, SendMessageResponse, StreamResponse, Task } from './types';
+import { A2A_CONTENT_TYPE, A2A_PROTOCOL_VERSION, PUSH_TOKEN_HEADER } from './types';
 
 export { CertPinMismatchError };
 
@@ -64,7 +66,7 @@ export async function a2aRequest<T>(
   method: 'GET' | 'POST',
   path: string,
   body?: unknown,
-  opts: { timeoutMs?: number } = {}
+  opts: { timeoutMs?: number; headers?: Record<string, string> } = {}
 ): Promise<T> {
   const u = new URL(path, ep.baseUrl);
   const host = u.hostname.replace(/^\[|\]$/g, '');
@@ -89,6 +91,7 @@ export async function a2aRequest<T>(
     'A2A-Version': A2A_PROTOCOL_VERSION,
     Accept: `${A2A_CONTENT_TYPE}, application/json`,
   };
+  for (const [k, v] of Object.entries(opts.headers ?? {})) if (v) headers[k] = v;
   if (ep.token) headers.Authorization = `Bearer ${ep.token}`;
   if (payload) {
     headers['Content-Type'] = A2A_CONTENT_TYPE;
@@ -168,6 +171,29 @@ export function getTask(ep: PeerEndpoint, taskId: string): Promise<Task> {
 
 export function cancelTask(ep: PeerEndpoint, taskId: string): Promise<Task> {
   return a2aRequest<Task>(ep, 'POST', `/tasks/${encodeURIComponent(taskId)}:cancel`, {});
+}
+
+/**
+ * Deliver one push notification (a StreamResponse) to the peer that asked
+ * for it. `path` is the path of the URL they registered; the origin is always
+ * the peer's own pinned endpoint (node.ts refuses any other origin when the
+ * config is registered), so the token can only ever go to them.
+ */
+export function postPush(ep: PeerEndpoint, path: string, body: StreamResponse, pushToken: string | null, timeoutMs?: number): Promise<unknown> {
+  return a2aRequest(ep, 'POST', path, body, { timeoutMs, headers: pushToken ? { [PUSH_TOKEN_HEADER]: pushToken } : {} });
+}
+
+/** Best-effort "we unpaired you" (design 4.3 step 5), on our pairing extension. */
+export function notifyUnpair(ep: PeerEndpoint, timeoutMs = 3000): Promise<unknown> {
+  return a2aRequest(ep, 'POST', '/a2a-unpair', {}, { timeoutMs });
+}
+
+/** Retry-worthy failure? Offline, timeouts, 5xx, 408, 429. */
+export function isRetryable(e: unknown): boolean {
+  if (e instanceof PeerOfflineError) return true;
+  if (e instanceof CertPinMismatchError) return false;
+  if (e instanceof A2AClientError) return e.status >= 500 || e.status === 408 || e.status === 429 || e.status === 0;
+  return true; // socket-level oddities: try again
 }
 
 export function redeemPairing(ep: PeerEndpoint, req: PairRequest): Promise<PairResponse> {

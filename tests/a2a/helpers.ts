@@ -8,7 +8,7 @@ import initSqlJs, { type Database } from 'sql.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { A2A_SCHEMA_SQL } from '../../electron/a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema } from '../../electron/a2a/schema';
 import { A2ANode } from '../../electron/a2a/node';
 import { generateSelfSignedCert, type TlsIdentity } from '../../electron/a2a/tls';
 import type { SecretPort, SqlHandle } from '../../electron/a2a/store';
@@ -20,6 +20,15 @@ export async function makeSql(): Promise<{ sql: SqlHandle; raw: Database }> {
   SQL ??= await initSqlJs();
   const raw = new SQL.Database();
   raw.exec(A2A_SCHEMA_SQL);
+  // The same guarded P2 migration db.ts runs (v15). There is no sessions
+  // table here, so wait_a2a is skipped exactly as columnsOf() promises.
+  applyA2AP2Schema(
+    (q) => raw.exec(q),
+    (table) => {
+      const r = raw.exec(`PRAGMA table_info(${table})`);
+      return r.length ? r[0].values.map((v) => String(v[r[0].columns.indexOf('name')])) : [];
+    }
+  );
   const sql: SqlHandle = {
     prepare: (q: string) => ({
       run: (...p: unknown[]) => {
@@ -126,6 +135,8 @@ export interface TestNode {
   secrets: ReturnType<typeof memSecrets>;
   cidrs: string[];
   clock: { now: number };
+  /** Port it listened on, set by stopNode / restartNode. */
+  lastPort?: number;
 }
 
 export async function makeNode(opts: {
@@ -134,6 +145,8 @@ export async function makeNode(opts: {
   rows?: RoutableSession[];
   cidrs?: string[];
   tls?: TlsIdentity;
+  /** Extra A2ANode options (waits, isPaused, onApprovalNeeded, autoFlush, port...). */
+  extra?: Partial<ConstructorParameters<typeof A2ANode>[0]>;
 }): Promise<TestNode> {
   const { sql } = await makeSql();
   const secrets = memSecrets();
@@ -155,9 +168,49 @@ export async function makeNode(opts: {
     agentKind: 'guycode',
     appVersion: 'test',
     now: () => clock.now,
+    // Deterministic by default: tests drive retries with flushOutbox().
+    autoFlush: false,
+    ...(opts.extra ?? {}),
   });
   await node.start();
   return { node, port, sql, secrets, cidrs, clock };
+}
+
+/**
+ * "Restart" a node: stop it and bring up a fresh A2ANode on the SAME database,
+ * secrets, certificate and port, as the app would after a relaunch. The
+ * recording port and clock carry over unless `extra` overrides them.
+ */
+export async function restartNode(t: TestNode, name: string, certIndex: number, extra: Partial<ConstructorParameters<typeof A2ANode>[0]> = {}): Promise<TestNode> {
+  // A stopped node no longer knows its origin, so remember the port while it runs.
+  const port = t.node.isRunning() ? Number(new URL(t.node.origin()).port) : t.lastPort!;
+  await t.node.stop();
+  const dir = mkdtempSync(join(tmpdir(), 'a2a-test-'));
+  const node = new A2ANode({
+    sql: t.sql,
+    secrets: t.secrets,
+    sessions: t.port,
+    auditPath: join(dir, 'audit.jsonl'),
+    tls: cert(certIndex),
+    host: '127.0.0.1',
+    port,
+    allowCidrs: () => t.cidrs,
+    displayName: name,
+    userName: name.toLowerCase(),
+    agentKind: 'guycode',
+    appVersion: 'test',
+    now: () => t.clock.now,
+    autoFlush: false,
+    ...extra,
+  });
+  await node.start();
+  return { ...t, node, lastPort: port };
+}
+
+/** Take a node offline but keep everything needed to bring it back with restartNode. */
+export async function stopNode(t: TestNode): Promise<void> {
+  t.lastPort = Number(new URL(t.node.origin()).port);
+  await t.node.stop();
 }
 
 /** Pair b with a (a invites, b redeems). Returns each side's handle for the other. */

@@ -10,8 +10,8 @@
  *   - `a2a_invites`: pairing invites must survive an app restart (a code sent
  *     over Slack may be redeemed ten minutes later), and the invite secret is
  *     stored only as a SHA-256 so a DB copy cannot be used to pair.
- *   - `sessions.wait_a2a` is NOT added here. It belongs to WaitForA2A (P2) and
- *     needs an ALTER TABLE, which cannot be written idempotently.
+ *   - `sessions.wait_a2a` is NOT in this SQL. It is added by the P2 column
+ *     list below, through a guarded ALTER TABLE.
  */
 export const A2A_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS a2a_peers (
@@ -87,3 +87,52 @@ export const A2A_SCHEMA_SQL = `
     created_ts INTEGER
   );
 `;
+
+/**
+ * P2 columns (tasks, push, outbox, waiting). SQLite has no
+ * "ADD COLUMN IF NOT EXISTS", so each one is added only when PRAGMA
+ * table_info says it is missing (`applyA2AP2Schema`). That keeps the
+ * migration safe to re-run and lets the tests apply exactly the same change.
+ *
+ *   sessions.wait_a2a          JSON WaitForA2A state, parallel to wait_condition (design 6.4).
+ *   a2a_tasks.push_token_hash  OUT tasks: SHA-256 of the per-task push token we
+ *                              issued. An inbound push must present the token that
+ *                              hashes to this (design 4.2.5); the plaintext is never stored.
+ *   a2a_tasks.approval         IN tasks from an `inform` peer: 'pending' until the
+ *                              user accepts ('accepted') or declines ('declined').
+ *   a2a_outbox.task_id         The task a queued push is about (so a newer snapshot
+ *                              replaces an older one that has not gone out yet).
+ *   a2a_outbox.created_ts / expires_ts
+ *                              Retry window: 24 hours from the first attempt (design 6.6).
+ *
+ * a2a_push_configs needs no new column. Its `token` column stays NULL: the
+ * per-task push token we must present to a peer lives in secret storage, and
+ * `auth_json` records the scheme plus the secret's name.
+ */
+export const A2A_P2_COLUMNS: ReadonlyArray<readonly [table: string, column: string, type: string]> = [
+  ['sessions', 'wait_a2a', 'TEXT'],
+  ['a2a_tasks', 'push_token_hash', 'TEXT'],
+  ['a2a_tasks', 'approval', 'TEXT'],
+  ['a2a_outbox', 'task_id', 'TEXT'],
+  ['a2a_outbox', 'created_ts', 'INTEGER'],
+  ['a2a_outbox', 'expires_ts', 'INTEGER'],
+];
+
+export const A2A_P2_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS a2a_outbox_due ON a2a_outbox(next_try_ts);
+  CREATE INDEX IF NOT EXISTS a2a_push_configs_task ON a2a_push_configs(task_id);
+`;
+
+/**
+ * Apply the P2 columns and indexes. `columnsOf` returns the existing column
+ * names of a table, or [] when the table does not exist (the A2A tests have no
+ * `sessions` table; that column is then simply skipped).
+ */
+export function applyA2AP2Schema(exec: (sql: string) => void, columnsOf: (table: string) => string[]): void {
+  for (const [table, column, type] of A2A_P2_COLUMNS) {
+    const cols = columnsOf(table);
+    if (cols.length === 0 || cols.includes(column)) continue;
+    exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
+  }
+  exec(A2A_P2_INDEX_SQL);
+}

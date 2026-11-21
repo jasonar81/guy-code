@@ -99,6 +99,10 @@ vi.mock('../electron/db', () => {
       const row = _allSessions.find((r) => r.id === id);
       if (row) row.wait_condition = state ? JSON.stringify(state) : null;
     },
+    // WaitForA2A (A2A P2): same shape as wait_condition. None of these
+    // sessions hold one, so the wake path falls through to the plain wake.
+    setSessionWaitA2A: () => {},
+    getSessionWaitA2A: () => null,
     getSessionWaitCondition: (id: string) => {
       const row = _allSessions.find((r) => r.id === id);
       if (!row?.wait_condition) return null;

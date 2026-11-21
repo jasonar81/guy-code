@@ -126,6 +126,68 @@ export async function testSlackBridge(): Promise<{ ok: boolean; message: string 
   }
 }
 
+/**
+ * Post one unprompted line to the bridge channel (A2A approval requests,
+ * design 6.3). A no-op unless the bridge is on. The line starts with "*",
+ * never "Guy,", so the poller cannot mistake it for a command.
+ */
+export async function postSlackLine(text: string): Promise<void> {
+  const cfg = getSlackBridgeConfig();
+  if (!cfg.enabled || !cfg.channelId) return;
+  const ids = await slackPostAll(cfg.channelId, text);
+  // Remember it so a phone reply in its thread ("accept") is read as a command.
+  if (ids[0]) rememberThread(ids[0], ids);
+}
+
+// ---- A2A commands (design 6.8) ---------------------------------------------
+
+/**
+ * `a2a inbox`, `accept a2a <id>`, `decline a2a <id> [reason]`, `a2a tasks`.
+ * Returns null when the text is not an A2A command. The A2A module is loaded
+ * lazily, like everywhere else, to keep the import graph acyclic.
+ */
+export async function handleA2ACommand(cmd: string): Promise<string | null> {
+  const c = cmd.trim();
+  const inbox = /^(?:a2a\s+inbox|a2a\s+pending|inbox\s+a2a)$/i.test(c);
+  const tasks = /^a2a\s+tasks$/i.test(c);
+  const acc = c.match(/^(?:accept|approve)\s+a2a\s+(\S+)$/i);
+  const dec = c.match(/^(?:decline|reject|deny)\s+a2a\s+(\S+)(?:\s+([\s\S]+))?$/i);
+  if (!inbox && !tasks && !acc && !dec) return null;
+  const { getA2ANode } = await import('./a2a/index');
+  const n = getA2ANode();
+  if (!n || !n.isRunning()) return 'A2A is turned off on this machine.';
+  const short = (id: string) => id.slice(0, 8);
+  const word = (s: string) => s.replace(/^TASK_STATE_/, '');
+  if (inbox) {
+    const p = n.pendingApprovals();
+    if (!p.length) return 'No A2A requests are waiting for you.';
+    return (
+      `${p.length} A2A request${p.length === 1 ? '' : 's'} waiting for you:\n` +
+      p
+        .map((t) => `• \`${short(t.task_id)}\` *${t.peer_id}* (${t.kind}): ${(t.summary ?? '').replace(/\s+/g, ' ').slice(0, 140)}`)
+        .join('\n') +
+      '\nReply `Guy, accept a2a <id>` or `Guy, decline a2a <id> [reason]`.'
+    );
+  }
+  if (tasks) {
+    const all = n.store.listTasks({ limit: 15 });
+    if (!all.length) return 'No A2A tasks yet.';
+    return all
+      .map((t) => `• \`${short(t.task_id)}\` ${t.direction === 'out' ? 'to' : 'from'} *${t.peer_id}* ${t.kind ?? ''} - ${word(t.state)}${t.approval === 'pending' ? ' (needs your approval)' : ''}: ${(t.summary ?? '').replace(/\s+/g, ' ').slice(0, 100)}`)
+      .join('\n');
+  }
+  try {
+    if (acc) {
+      const r = n.accept(acc[1], { by: 'slack' });
+      return `Accepted \`${short(r.task.task_id)}\` from *${r.task.peer_id}*; delivered to the session (${r.delivery.mode}).`;
+    }
+    const t = n.decline(dec![1], { reason: dec![2], by: 'slack' });
+    return `Declined \`${short(t.task_id)}\` from *${t.peer_id}*; their agent has been told.`;
+  } catch (e) {
+    return `Error: ${(e as Error).message}`;
+  }
+}
+
 // ---- Slack I/O -----------------------------------------------------------
 
 async function slackRead(channelId: string, oldest: string): Promise<any[]> {
@@ -522,6 +584,8 @@ const HELP = [
   '• `archive <session>`',
   '• `api keys` - list your API keys',
   '• `unarchive <session>`',
+  '• `a2a inbox` / `a2a tasks` - agent-to-agent requests and tasks',
+  '• `accept a2a <id>` / `decline a2a <id> [reason]` - answer a peer agent\'s request',
   '• `help`',
   '',
   '`<session>` can be a name (or part of one) or an id prefix.',
@@ -662,6 +726,11 @@ export async function handleCommand(
   const cmd = command.trim();
   const lower = cmd.toLowerCase();
   if (!cmd || lower === 'help' || lower === '?') return HELP;
+
+  // ---- A2A (design 6.8): before session commands, so "accept a2a 7f3c"
+  // is never read as a session name. ----
+  const a2a = await handleA2ACommand(cmd);
+  if (a2a !== null) return a2a;
 
   const rows = listSessionsAll();
   const live = rows.filter((s) => s.archived === 0);

@@ -43,6 +43,8 @@ import {
   setSessionWakeAt,
   getSessionWaitCondition,
   setSessionWaitCondition,
+  getSessionWaitA2A,
+  setSessionWaitA2A,
   getSessionPending,
   getSessionApiKey,
   listSessionsAll,
@@ -235,6 +237,15 @@ function safeStringify(v: unknown): string {
   }
 }
 
+/** A2A on? Adds the short A2A guidance to the system prompt (design 6.5). */
+function a2aGuidanceOn(): boolean {
+  try {
+    return getSetting('a2a.enabled') === '1';
+  } catch {
+    return false;
+  }
+}
+
 export function isRunning(sessionId: string): boolean {
   return activeRuns.has(sessionId);
 }
@@ -268,6 +279,7 @@ export function cancelRun(sessionId: string) {
     if (row?.state === 'sleeping-tool') {
       setSessionWakeAt(sessionId, null);
       setSessionWaitCondition(sessionId, null); // cancel any pending WaitForCondition
+      setSessionWaitA2A(sessionId, null); // ... and any WaitForA2A
       setSessionState(sessionId, 'idle');
       broadcastStateChanged(sessionId, 'idle');
       broadcastAgentEvent({
@@ -478,6 +490,48 @@ export async function wakeSleepingTool(sessionId: string) {
       projectId: row.project_id,
       cwd: row.cwd ?? '',
       userText: resumeNote ?? '',
+      continueExisting: true,
+      seedFromJsonl: row.jsonl_path,
+    });
+    return;
+  }
+
+  // ---- WaitForA2A: poll the peer WITHOUT the AI (design 6.4) ------------
+  // The push path wakes these sessions directly (a2a/index.ts). This is the
+  // timer path: every pollStaleMs (10 min) or at the deadline, GET
+  // /tasks/{id} for anything with no news, then resume or sleep again. Like
+  // WaitForCondition it is reached by both the in-process timer and the
+  // governor sweep, so it survives a restart. No model call unless it resumes.
+  const waitA2A = getSessionWaitA2A(sessionId);
+  if (waitA2A) {
+    let decision: { note: string } | { sleepUntil: number };
+    try {
+      const { a2aTimerWake } = await import('./a2a/index');
+      decision = await a2aTimerWake(waitA2A);
+    } catch (e) {
+      log.warn(`[agent] WaitForA2A ${sessionId}: wake check failed`, e);
+      decision =
+        Date.now() >= waitA2A.deadlineTs
+          ? { note: `[WaitForA2A] timed out (and checking the peer failed: ${(e as Error).message}).` }
+          : { sleepUntil: Math.min(waitA2A.deadlineTs, Date.now() + (waitA2A.pollStaleMs || 600_000)) };
+    }
+    // A push may have resumed it while we were polling: then do nothing.
+    const after = getSessionById(sessionId);
+    if (!getSessionWaitA2A(sessionId) || after?.state !== 'sleeping-tool' || activeRuns.has(sessionId)) return;
+    if ('sleepUntil' in decision) {
+      setSessionWakeAt(sessionId, decision.sleepUntil);
+      armWakeTimer(sessionId, decision.sleepUntil);
+      log.info(`[agent] WaitForA2A ${sessionId}: nothing yet, re-sleeping until ${new Date(decision.sleepUntil).toISOString()}`);
+      return;
+    }
+    setSessionWaitA2A(sessionId, null);
+    setSessionWakeAt(sessionId, null);
+    log.info(`[agent] WaitForA2A ${sessionId}: resuming AI (${decision.note.slice(0, 160)})`);
+    await runUserTurn({
+      sessionId,
+      projectId: row.project_id,
+      cwd: row.cwd ?? '',
+      userText: decision.note,
       continueExisting: true,
       seedFromJsonl: row.jsonl_path,
     });
@@ -1019,6 +1073,12 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         setSessionWaitCondition(sessionId, null);
         log.info(`[agent] new turn for ${sessionId} cancelled a pending WaitForCondition`);
       }
+      // Same for WaitForA2A: a fresh user message supersedes the wait. (The
+      // A2A push / timer paths clear it themselves before resuming.)
+      if (getSessionWaitA2A(sessionId)) {
+        setSessionWaitA2A(sessionId, null);
+        log.info(`[agent] new turn for ${sessionId} cancelled a pending WaitForA2A`);
+      }
       setSessionWakeAt(sessionId, null);
     } catch (e) {
       log.warn(`[agent] failed to clear pending wait on new turn for ${sessionId}`, e);
@@ -1357,6 +1417,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
       cwd,
       date: new Date(),
       platform: platformShortName(),
+      a2aEnabled: a2aGuidanceOn(),
       memoryText: memText,
       retrievedMemoryText,
       skillsBlock: renderSkillsBlock(skillRegistry),
@@ -1598,6 +1659,7 @@ export async function runUserTurn(args: RunArgs): Promise<void> {
         cwd,
         date: new Date(),
         platform: platformShortName(),
+        a2aEnabled: a2aGuidanceOn(),
         memoryText: memText,
         retrievedMemoryText,
         skillsBlock: renderSkillsBlock(skillRegistry),

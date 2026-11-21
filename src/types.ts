@@ -323,6 +323,44 @@ export type AgentEvent =
     }
   | { type: 'error'; sessionId: string; message: string };
 
+/** A2A trust levels, ordered blocked < inform < collaborate < full. */
+export type A2ATrust = 'blocked' | 'inform' | 'collaborate' | 'full';
+
+export interface A2APanelPeer {
+  peerId: string;
+  displayName: string | null;
+  agentKind: string | null;
+  cardUrl: string;
+  trust: A2ATrust;
+  effectiveTrust: A2ATrust;
+  trustPrev: A2ATrust | null;
+  trustExpiresTs: number | null;
+  lastSeenTs: number | null;
+  /** Messages / pushes waiting in the outbox for this peer. */
+  queued: number;
+}
+
+export interface A2APanelTask {
+  taskId: string;
+  peerId: string;
+  direction: 'in' | 'out';
+  kind: string | null;
+  state: string;
+  approval: string | null;
+  summary: string | null;
+  sessionId: string | null;
+  lastText: string;
+  updatedTs: number | null;
+}
+
+export interface A2APanelSnapshot {
+  running: boolean;
+  paused: boolean;
+  peers: A2APanelPeer[];
+  pending: A2APanelTask[];
+  tasks: A2APanelTask[];
+}
+
 export interface AuditEventRow {
   id: number;
   ts: number;
@@ -512,7 +550,15 @@ declare global {
         test: () => Promise<{ ok: boolean; message: string }>;
       };
       a2a: {
-        status: () => Promise<{ running: boolean; url: string | null; fingerprint: string | null; peers: number }>;
+        status: () => Promise<{ running: boolean; url: string | null; fingerprint: string | null; peers: number; paused: boolean; pending: number }>;
+        snapshot: () => Promise<A2APanelSnapshot>;
+        setTrust: (peerId: string, trust: A2ATrust, expiresInMs: number | null) => Promise<{ ok: boolean; message: string }>;
+        accept: (taskId: string, sessionId?: string) => Promise<{ ok: boolean; message: string }>;
+        decline: (taskId: string, reason?: string) => Promise<{ ok: boolean; message: string }>;
+        setPaused: (paused: boolean) => Promise<void>;
+        invite: () => Promise<{ code: string; expires: number }>;
+        revoke: (peerId: string) => Promise<void>;
+        audit: (limit?: number) => Promise<Array<Record<string, unknown>>>;
       };
       settings: {
         get: (key: string) => Promise<string | null>;

@@ -347,6 +347,34 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
     return a2aStatus();
   });
 
+  // Agents panel (design 6.7). Every handler returns plain data, never a
+  // token. Trust escalation re-confirms in the main process (a2aPanelSetTrust).
+  ipcMain.handle('a2a:snapshot', async () => (await import('./a2a/index')).a2aPanelSnapshot());
+  ipcMain.handle('a2a:setTrust', async (_e, peerId: string, trust: string, expiresInMs: number | null) => {
+    const m = await import('./a2a/index');
+    const { isTrustLevel } = await import('./a2a/types');
+    if (!isTrustLevel(trust)) return { ok: false, message: 'Unknown trust level.' };
+    return m.a2aPanelSetTrust(String(peerId), trust, typeof expiresInMs === 'number' ? expiresInMs : null);
+  });
+  ipcMain.handle('a2a:accept', async (_e, taskId: string, sessionId?: string) => {
+    try {
+      return (await import('./a2a/index')).a2aPanelAccept(String(taskId), sessionId ? String(sessionId) : undefined);
+    } catch (e) {
+      return { ok: false, message: (e as Error).message };
+    }
+  });
+  ipcMain.handle('a2a:decline', async (_e, taskId: string, reason?: string) => {
+    try {
+      return (await import('./a2a/index')).a2aPanelDecline(String(taskId), reason ? String(reason) : undefined);
+    } catch (e) {
+      return { ok: false, message: (e as Error).message };
+    }
+  });
+  ipcMain.handle('a2a:setPaused', async (_e, paused: boolean) => (await import('./a2a/index')).a2aPanelSetPaused(!!paused));
+  ipcMain.handle('a2a:invite', async () => (await import('./a2a/index')).a2aPanelInvite());
+  ipcMain.handle('a2a:revoke', async (_e, peerId: string) => (await import('./a2a/index')).a2aPanelRevoke(String(peerId)));
+  ipcMain.handle('a2a:audit', async (_e, limit?: number) => (await import('./a2a/index')).a2aPanelAudit(Number(limit) || 300));
+
   /** Post a test message to the configured Slack channel (Settings button). */
   ipcMain.handle('slackBridge:test', async () => {
     const { testSlackBridge } = await import('./slackBridge');

@@ -1,8 +1,11 @@
 /**
- * Inbound message -> local session (design 6.3), P1: inform only.
+ * Inbound message -> local session (design 6.3).
  *
  * The router owns three decisions and nothing else:
- *   1. gate: is this kind of message from this peer allowed right now?
+ *   1. gate: deliver now, hold for the user's approval, or refuse (design
+ *      4.2.3 / 6.3 step 4). `inform` is delivered from any non-blocked peer;
+ *      `request` / `notify` from an `inform` peer wait for Accept; from
+ *      `collaborate` or `full` they are delivered now;
  *   2. route: which session gets it (order from design 5.4);
  *   3. deliver: interrupt a running turn, start a turn, or queue behind a wait
  *      (mirrors slackBridge.handleCommand "send").
@@ -11,11 +14,19 @@
  * `buildEnvelope` (design 4.2.4). Session access is injected (`SessionPort`)
  * so the router is testable without agent.ts and Electron.
  */
-import { basename } from 'node:path';
+/**
+ * The final segment of a path, accepting either separator regardless of the
+ * host OS, with any trailing separators ignored. Peers run on other operating
+ * systems, so their `cwd` can use the other separator.
+ */
+function lastPathSegment(p: string): string {
+  const parts = p.replace(/[\\/]+$/, '').split(/[\\/]/);
+  return parts[parts.length - 1] ?? '';
+}
 import { buildEnvelope } from './envelope';
 import { errors } from './errors';
 import type { PeerRow } from './store';
-import type { MessageKind, RoutingInfo, TrustLevel } from './types';
+import { trustAtLeast, type MessageKind, type RoutingInfo, type TrustLevel } from './types';
 
 /** The session fields routing needs. Structurally a subset of db.SessionFullRow. */
 export interface RoutableSession {
@@ -42,10 +53,17 @@ export interface SessionPort {
   getOrCreateInboxSession(): RoutableSession;
   /** Desktop / UI notification when a message is parked behind a wait. Optional. */
   notify?(title: string, body: string): void;
+  /**
+   * True when the session is sleeping in WaitForA2A on this peer, context or
+   * task (design 6.3 step 5): a message it is waiting for wakes it instead
+   * of queueing behind the wait. Optional; absent means "no".
+   */
+  isWaitingFor?(sessionId: string, on: { peerId: string; contextId: string; taskId: string }): boolean;
 }
 
 export type RouteVia = 'context' | 'toSession' | 'toProject' | 'inbox';
-export type DeliveryMode = 'interrupt' | 'turn' | 'queued';
+export type DeliveryMode = 'interrupt' | 'turn' | 'queued' | 'wake';
+export type GateDecision = 'deliver' | 'approve';
 
 export interface InboundForRouting {
   peer: PeerRow;
@@ -57,26 +75,28 @@ export interface InboundForRouting {
   routing: RoutingInfo;
   /** session_id already mapped to this contextId (for this peer), if any. */
   mappedSessionId: string | null;
+  /** `metadata.urgent === true`: honoured only from trust >= collaborate (design 6.3 step 5). */
+  urgent?: boolean;
+  /** For a `full` peer's envelope header. */
+  fullGrantedTs?: number | null;
+  fullExpiresTs?: number | null;
 }
 
 /**
- * Trust gate. Throws a protocol error for anything P1 does not deliver.
- * `blocked` peers are already stopped with 403 by the server before a body is
- * read; the check is repeated here so the router is safe on its own.
+ * Trust gate (design 4.2.3, 6.3 step 4). Throws for a blocked peer (the
+ * server already stopped it with 403 before reading a body; repeated here so
+ * the router is safe on its own). Otherwise:
+ *   - inform from anyone: deliver now, it is information only;
+ *   - request / notify from collaborate or full: deliver now;
+ *   - request / notify from inform: hold for the local user's approval.
+ * `trust` is the EFFECTIVE trust, so an expired escalation or the global
+ * pause has already been applied by the caller.
  */
-export function gate(kind: MessageKind, trust: TrustLevel): void {
+export function gate(kind: MessageKind, trust: TrustLevel): GateDecision {
   if (trust === 'blocked') throw errors.blocked();
-  if (kind === 'inform') return; // design 6.3 step 4: inform from any non-blocked peer is delivered now.
-  // TODO(P2): `request` and `notify` kinds. From an `inform` peer they are held
-  // as pending approval (task -> TASK_STATE_INPUT_REQUIRED, "Waiting for <user>
-  // to approve", desktop notification + Agents panel badge + Slack line); from
-  // `collaborate` / `full` they are delivered now (full with its own envelope).
-  // P1 has no tasks with a lifecycle, so refuse rather than pretend.
-  throw errors.unsupportedOperation(
-    `This agent accepts "inform" messages only for now; "${kind}" requests arrive in a later version. Send it as information instead.`
-  );
+  if (kind === 'inform') return 'deliver';
+  return trustAtLeast(trust, 'collaborate') ? 'deliver' : 'approve';
 }
-
 function liveRows(port: SessionPort): RoutableSession[] {
   return port.listSessions().filter((s) => s.archived === 0);
 }
@@ -96,7 +116,13 @@ export function routeSession(port: SessionPort, m: Pick<InboundForRouting, 'mapp
   const toProject = typeof m.routing.toProject === 'string' ? m.routing.toProject.trim().toLowerCase() : '';
   if (toProject) {
     const inProject = rows.filter((r) => {
-      const name = r.cwd ? basename(r.cwd.replace(/[\\/]+$/, '')).toLowerCase() : '';
+      // Split on BOTH separators whatever the host OS. `basename` from
+      // node:path is platform-specific: on POSIX it treats "C:\w\xgsrc" as a
+      // single filename, so a peer on Windows would never match a project
+      // here and we would silently route to an older session instead. CI
+      // caught exactly that - the test passed on Windows and failed on Linux
+      // and macOS.
+      const name = r.cwd ? lastPathSegment(r.cwd).toLowerCase() : '';
       return name === toProject || r.project_id.toLowerCase() === toProject;
     });
     if (inProject.length) {
@@ -111,14 +137,18 @@ export function routeSession(port: SessionPort, m: Pick<InboundForRouting, 'mapp
  * How to get text into a session without breaking what it is doing
  * (design 6.3 step 5).
  */
-export function deliveryMode(session: RoutableSession, running: boolean): DeliveryMode {
+export function deliveryMode(session: RoutableSession, running: boolean, opts: { waitingForThis?: boolean; urgent?: boolean } = {}): DeliveryMode {
   if (running) return 'interrupt';
+  // A session sleeping in WaitForA2A on exactly this peer / context / task is
+  // woken: the message is what it was waiting for. An `urgent` flag (only
+  // honoured from trust >= collaborate, checked by the caller) also wakes a
+  // tool sleep. Starting a turn cancels the wait (agent.ts runUserTurn).
+  if (session.state === 'sleeping-tool' && (opts.waitingForThis || opts.urgent)) return 'wake';
   switch (session.state) {
-    // Sleeping in WaitForTime / WaitForCondition, or parked by the budget
-    // governor: do not break the wait. The queued text is picked up by the
-    // next runUserTurn (agent.ts drains interrupts at turn start).
-    // TODO(P2): a session sleeping in WaitForA2A on this peer/context/task is
-    // woken instead, and an `urgent` flag from trust >= collaborate wakes too.
+    // Sleeping in WaitForTime / WaitForCondition / an unrelated WaitForA2A,
+    // or parked by the budget governor: do not break the wait. The queued
+    // text is picked up by the next runUserTurn (agent.ts drains interrupts
+    // at turn start).
     case 'sleeping-tool':
     case 'sleeping-budget':
     case 'waiting-on-system':
@@ -138,21 +168,35 @@ export interface DeliveryResult {
 }
 
 export function deliver(port: SessionPort, m: InboundForRouting): DeliveryResult {
-  gate(m.kind, m.trust);
+  if (gate(m.kind, m.trust) !== 'deliver') {
+    // The node holds these for approval and calls deliverRouted on Accept;
+    // reaching here would hand an unapproved request to a session.
+    throw new Error('router.deliver called for a message that needs approval');
+  }
   const { session, via } = routeSession(port, m);
+  return deliverRouted(port, session, via, m);
+}
+
+/** Wrap and hand over to a session that has already been chosen. No gate: the caller has decided. */
+export function deliverRouted(port: SessionPort, session: RoutableSession, via: RouteVia, m: InboundForRouting): DeliveryResult {
   const envelope = buildEnvelope({
     peerId: m.peer.peer_id,
     displayName: m.peer.display_name,
     agentKind: m.peer.agent_kind,
     trust: m.trust,
+    kind: m.kind,
     taskId: m.taskId,
     contextId: m.contextId,
     fromSessionLabel: m.routing.fromSessionLabel,
     fromProject: m.routing.fromProject,
     text: m.text,
+    fullGrantedTs: m.fullGrantedTs,
+    fullExpiresTs: m.fullExpiresTs,
   });
-  const mode = deliveryMode(session, port.isRunning(session.id));
-  if (mode === 'turn') {
+  const waitingForThis = !!port.isWaitingFor?.(session.id, { peerId: m.peer.peer_id, contextId: m.contextId, taskId: m.taskId });
+  const urgent = !!m.urgent && trustAtLeast(m.trust, 'collaborate');
+  const mode = deliveryMode(session, port.isRunning(session.id), { waitingForThis, urgent });
+  if (mode === 'turn' || mode === 'wake') {
     port.startTurn(session, envelope);
   } else {
     port.queueInterrupt(session.id, envelope);

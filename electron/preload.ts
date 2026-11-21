@@ -69,8 +69,17 @@ const api = {
       ipcRenderer.invoke('slackBridge:test'),
   },
   a2a: {
-    status: (): Promise<{ running: boolean; url: string | null; fingerprint: string | null; peers: number }> =>
+    status: (): Promise<{ running: boolean; url: string | null; fingerprint: string | null; peers: number; paused: boolean; pending: number }> =>
       ipcRenderer.invoke('a2a:status'),
+    snapshot: () => ipcRenderer.invoke('a2a:snapshot'),
+    setTrust: (peerId: string, trust: string, expiresInMs: number | null) =>
+      ipcRenderer.invoke('a2a:setTrust', peerId, trust, expiresInMs),
+    accept: (taskId: string, sessionId?: string) => ipcRenderer.invoke('a2a:accept', taskId, sessionId),
+    decline: (taskId: string, reason?: string) => ipcRenderer.invoke('a2a:decline', taskId, reason),
+    setPaused: (paused: boolean) => ipcRenderer.invoke('a2a:setPaused', paused),
+    invite: () => ipcRenderer.invoke('a2a:invite'),
+    revoke: (peerId: string) => ipcRenderer.invoke('a2a:revoke', peerId),
+    audit: (limit?: number) => ipcRenderer.invoke('a2a:audit', limit),
   },
   settings: {
     get: (key: string) => ipcRenderer.invoke('settings:get', key),

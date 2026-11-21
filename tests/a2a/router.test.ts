@@ -36,11 +36,13 @@ describe('gate', () => {
   it('inform is delivered from inform, collaborate and full', () => {
     for (const t of ['inform', 'collaborate', 'full'] as const) expect(() => gate('inform', t)).not.toThrow();
   });
-  it('request / notify are refused in P1 regardless of trust', () => {
-    for (const t of ['inform', 'collaborate', 'full'] as const) {
-      expect(() => gate('request', t)).toThrow(expect.objectContaining({ reason: 'UNSUPPORTED_OPERATION' }));
-      expect(() => gate('notify', t)).toThrow(expect.objectContaining({ reason: 'UNSUPPORTED_OPERATION' }));
+  it('request / notify from an inform peer wait for approval; from collaborate / full they are delivered', () => {
+    for (const k of ['request', 'notify'] as const) {
+      expect(gate(k, 'inform')).toBe('approve');
+      expect(gate(k, 'collaborate')).toBe('deliver');
+      expect(gate(k, 'full')).toBe('deliver');
     }
+    expect(gate('inform', 'inform')).toBe('deliver');
   });
 });
 
@@ -96,6 +98,22 @@ describe('deliveryMode', () => {
   it('idle, waiting-on-user, error -> start a turn', () => {
     for (const st of ['idle', 'waiting-on-user', 'error']) expect(deliveryMode(session({ state: st }), false)).toBe('turn');
   });
+  it('a tool sleep is woken only when it is a WaitForA2A on this message, or the message is urgent', () => {
+    expect(deliveryMode(session({ state: 'sleeping-tool' }), false, { waitingForThis: true })).toBe('wake');
+    expect(deliveryMode(session({ state: 'sleeping-tool' }), false, { urgent: true })).toBe('wake');
+    // never breaks a budget park or a waiting-on-system
+    expect(deliveryMode(session({ state: 'sleeping-budget' }), false, { waitingForThis: true, urgent: true })).toBe('queued');
+  });
+  it('urgent is honoured only from trust >= collaborate', () => {
+    const s = session({ id: 'z', state: 'sleeping-tool' });
+    const port = recordingPort([s]);
+    const base2 = { peer, kind: 'inform' as const, contextId: 'c', taskId: 't', routing: { toSession: 'z' }, mappedSessionId: null, urgent: true, text: 'x' };
+    deliver(port, { ...base2, trust: 'inform' });
+    expect(port.turns).toHaveLength(0);
+    expect(port.interrupts).toHaveLength(1);
+    deliver(port, { ...base2, trust: 'collaborate' });
+    expect(port.turns).toHaveLength(1);
+  });
 });
 
 describe('deliver', () => {
@@ -109,7 +127,7 @@ describe('deliver', () => {
     expect(r.envelope).not.toBe('raw words');
   });
 
-  it('a refused kind touches no session', () => {
+  it('deliver() refuses a message that needs approval, and touches no session', () => {
     const port = recordingPort([session({ id: 'a' })]);
     expect(() => deliver(port, { ...base, kind: 'request', text: 'x' })).toThrow();
     expect(port.delivered()).toHaveLength(0);

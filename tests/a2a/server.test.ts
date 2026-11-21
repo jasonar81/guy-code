@@ -96,7 +96,7 @@ describe('public card', () => {
     expect(r.body.securityRequirements).toEqual([{ schemes: { peerBearer: { list: [] } } }]);
     expect(r.body.security).toBeUndefined();
     expect(r.body.securitySchemes.peerBearer.httpAuthSecurityScheme.scheme).toBe('Bearer');
-    expect(r.body.capabilities.pushNotifications).toBe(false); // P2
+    expect(r.body.capabilities.pushNotifications).toBe(true); // P2: push in and out exist
   });
 });
 
@@ -270,9 +270,24 @@ describe('authentication', () => {
     const a = await node('Alice', 0);
     const b = await node('Bob', 1);
     await pair(a, b);
-    a.node.revoke('bob');
-    const err = await b.node.send({ peer: 'alice', text: 'hi' }).catch((e) => e);
-    expect(err.status).toBe(401);
+    const stale = tokenFor(b, 'alice');
+    await a.node.revoke('bob');
+    // The old token is dead on Alice's side...
+    const r = await raw(a, 'POST', '/message:send', { token: stale, body: msg() });
+    expect(r.status).toBe(401);
+    // ...and Bob was told (design 4.3 step 5), so he dropped Alice and his token too.
+    expect(b.node.store.listPeers()).toHaveLength(0);
+    expect(tokenFor(b, 'alice')).toBeNull();
+  });
+
+  it('revoke still works when the peer is offline (it just cannot be told)', async () => {
+    const a = await node('Alice', 0);
+    const b = await node('Bob', 1);
+    await pair(a, b);
+    await b.node.stop();
+    await a.node.revoke('bob');
+    expect(a.node.store.listPeers()).toHaveLength(0);
+    expect(a.node.audit.tail().some((e) => e.event === 'peer.revoked' && e.notified === false)).toBe(true);
   });
 });
 
@@ -431,21 +446,22 @@ describe('inbound messages', () => {
     });
   });
 
-  it('P1 accepts inform only: request / notify are refused and nothing is delivered', async () => {
+  it('request / notify from an inform peer are held for approval (INPUT_REQUIRED) and nothing is delivered', async () => {
     const { a, tok } = await paired();
     for (const kind of ['request', 'notify']) {
       const r = await raw(a, 'POST', '/message:send', { token: tok, body: msg({}, { kind }) });
-      expect(r.status).toBe(400);
-      expect(reason(r)).toBe('UNSUPPORTED_OPERATION');
+      expect(r.status).toBe(200);
+      expect(r.body.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      expect(r.body.task.status.message.parts[0].text).toMatch(/Waiting for Alice to approve/);
     }
     expect(a.port.delivered()).toHaveLength(0);
-    expect(a.sql.prepare('SELECT COUNT(*) AS n FROM a2a_tasks').get<{ n: number }>()!.n).toBe(0);
+    expect(a.node.pendingApprovals()).toHaveLength(2);
   });
 
-  it('/a2a-push is a 501 stub until P2', async () => {
+  it('/a2a-push with an empty body is a 400, not a crash', async () => {
     const { a, tok } = await paired();
     const r = await raw(a, 'POST', '/a2a-push', { token: tok, body: {} });
-    expect(r.status).toBe(501);
+    expect(r.status).toBe(400);
   });
 });
 

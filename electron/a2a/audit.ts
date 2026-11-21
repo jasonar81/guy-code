@@ -29,15 +29,28 @@ export type AuditEvent =
   | 'trust.changed'
   | 'trust.expired'
   | 'task.state'
+  | 'task.approval'
+  | 'task.reply'
+  | 'outbound.queued'
+  | 'outbound.expired'
+  | 'push.sent'
+  | 'push.failed'
+  | 'push.dropped'
+  | 'push.received'
+  | 'push.ignored'
+  | 'push.rejected'
+  | 'poll.result'
+  | 'wait.woke'
+  | 'peer.unpaired_by_remote'
   | 'server.started'
   | 'server.stopped';
 
 export interface AuditEntry {
   event: AuditEvent;
   peer?: string;
-  taskId?: string;
-  contextId?: string;
-  sessionId?: string;
+  taskId?: string | null;
+  contextId?: string | null;
+  sessionId?: string | null;
   [k: string]: unknown;
 }
 

@@ -69,7 +69,36 @@ export interface TaskRow {
   created_ts: number | null;
   updated_ts: number | null;
   last_push_ts: number | null;
+  /** OUT tasks: SHA-256 of the per-task push token we issued (P2). */
+  push_token_hash?: string | null;
+  /** IN tasks from an inform peer: 'pending' | 'accepted' | 'declined' (P2). */
+  approval?: string | null;
 }
+
+export interface PushConfigRow {
+  config_id: string;
+  task_id: string;
+  url: string;
+  /** Always NULL: the per-task token lives in secret storage (see auth_json.tokenRef). */
+  token: string | null;
+  auth_json: string | null;
+}
+
+export interface OutboxRow {
+  id: number;
+  peer_id: string;
+  kind: 'push' | 'send';
+  payload_json: string;
+  attempts: number;
+  next_try_ts: number;
+  last_error: string | null;
+  task_id: string | null;
+  created_ts: number | null;
+  expires_ts: number | null;
+}
+
+/** Open = not in a terminal state. Mirrors types.TERMINAL_STATES for SQL. */
+const TERMINAL_SQL = "('TASK_STATE_COMPLETED','TASK_STATE_FAILED','TASK_STATE_CANCELED','TASK_STATE_REJECTED')";
 
 export type InviteCheck = 'ok' | 'unknown' | 'expired' | 'used' | 'bad-secret';
 
@@ -78,6 +107,12 @@ const SEEN_PER_PEER = 10_000;
 
 export function sha256Hex(s: string): string {
   return createHash('sha256').update(s, 'utf8').digest('hex');
+}
+
+/** Constant-time check that `plain` hashes to `hashHex`. */
+export function hashMatches(hashHex: string | null | undefined, plain: string | null | undefined): boolean {
+  if (!hashHex || !plain) return false;
+  return hexEqual(hashHex, sha256Hex(plain));
 }
 
 /** 256-bit random token, base64url. Used for peer bearer tokens. */
@@ -295,14 +330,17 @@ export class A2AStore {
     summary: string | null;
     requestJson?: string | null;
     statusJson?: string | null;
+    artifactsJson?: string | null;
+    pushTokenHash?: string | null;
+    approval?: string | null;
     now?: number;
   }): void {
     const now = t.now ?? Date.now();
     this.db
       .prepare(
         `INSERT OR REPLACE INTO a2a_tasks (task_id, peer_id, direction, context_id, session_id, kind, state,
-           summary, request_json, last_status_json, created_ts, updated_ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           summary, request_json, last_status_json, artifacts_json, push_token_hash, approval, created_ts, updated_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         t.taskId,
@@ -315,9 +353,185 @@ export class A2AStore {
         t.summary,
         t.requestJson ?? null,
         t.statusJson ?? null,
+        t.artifactsJson ?? null,
+        t.pushTokenHash ?? null,
+        t.approval ?? null,
         now,
         now
       );
+  }
+
+  /** Newest first. `open` = not terminal. */
+  listTasks(f: { direction?: 'in' | 'out'; peerId?: string; contextId?: string; sessionId?: string; state?: string; open?: boolean; approval?: string; limit?: number; offset?: number } = {}): TaskRow[] {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (f.direction) (where.push('direction = ?'), args.push(f.direction));
+    if (f.peerId) (where.push('peer_id = ?'), args.push(f.peerId));
+    if (f.contextId) (where.push('context_id = ?'), args.push(f.contextId));
+    if (f.sessionId) (where.push('session_id = ?'), args.push(f.sessionId));
+    if (f.state) (where.push('state = ?'), args.push(f.state));
+    if (f.approval) (where.push('approval = ?'), args.push(f.approval));
+    if (f.open) where.push(`state NOT IN ${TERMINAL_SQL}`);
+    const sql =
+      'SELECT * FROM a2a_tasks' +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      ' ORDER BY COALESCE(updated_ts, created_ts, 0) DESC, rowid DESC LIMIT ? OFFSET ?';
+    args.push(Math.max(1, Math.min(f.limit ?? 200, 1000)), Math.max(0, f.offset ?? 0));
+    return this.db.prepare(sql).all<TaskRow>(...args);
+  }
+
+  countTasks(f: { direction?: 'in' | 'out'; peerId?: string; contextId?: string; state?: string; open?: boolean }): number {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (f.direction) (where.push('direction = ?'), args.push(f.direction));
+    if (f.peerId) (where.push('peer_id = ?'), args.push(f.peerId));
+    if (f.contextId) (where.push('context_id = ?'), args.push(f.contextId));
+    if (f.state) (where.push('state = ?'), args.push(f.state));
+    if (f.open) where.push(`state NOT IN ${TERMINAL_SQL}`);
+    const r = this.db
+      .prepare('SELECT COUNT(*) AS n FROM a2a_tasks' + (where.length ? ` WHERE ${where.join(' AND ')}` : ''))
+      .get<{ n: number }>(...args);
+    return Number(r?.n ?? 0);
+  }
+
+  /** Task ids starting with `prefix` (the UI and Slack show 8-char ids). */
+  findTasksByPrefix(prefix: string, direction?: 'in' | 'out'): TaskRow[] {
+    const p = String(prefix ?? '').trim().toLowerCase().replace(/[%_]/g, '');
+    if (!p) return [];
+    return this.db
+      .prepare(`SELECT * FROM a2a_tasks WHERE lower(task_id) LIKE ?${direction ? ' AND direction = ?' : ''} LIMIT 10`)
+      .all<TaskRow>(...(direction ? [`${p}%`, direction] : [`${p}%`]));
+  }
+
+  patchTask(
+    taskId: string,
+    patch: {
+      state?: TaskState;
+      sessionId?: string | null;
+      statusJson?: string | null;
+      artifactsJson?: string | null;
+      approval?: string | null;
+      lastPushTs?: number | null;
+      pushTokenHash?: string | null;
+    },
+    now = Date.now()
+  ): void {
+    const cols: string[] = [];
+    const args: unknown[] = [];
+    const set = (c: string, v: unknown) => (cols.push(`${c} = ?`), args.push(v));
+    if (patch.state !== undefined) set('state', patch.state);
+    if (patch.sessionId !== undefined) set('session_id', patch.sessionId);
+    if (patch.statusJson !== undefined) set('last_status_json', patch.statusJson);
+    if (patch.artifactsJson !== undefined) set('artifacts_json', patch.artifactsJson);
+    if (patch.approval !== undefined) set('approval', patch.approval);
+    if (patch.lastPushTs !== undefined) set('last_push_ts', patch.lastPushTs);
+    if (patch.pushTokenHash !== undefined) set('push_token_hash', patch.pushTokenHash);
+    set('updated_ts', now);
+    args.push(taskId);
+    this.db.prepare(`UPDATE a2a_tasks SET ${cols.join(', ')} WHERE task_id = ?`).run(...args);
+  }
+
+  // ---- push configs ----------------------------------------------------------
+
+  /**
+   * Store a push config for an IN task. The per-task token goes to secret
+   * storage; the row keeps only the name of that secret (design 6.2 rule: no
+   * plaintext token in the DB).
+   */
+  savePushConfig(taskId: string, url: string, token: string | null): PushConfigRow {
+    // One config per task: a re-sent message (dedup) replaces the old one.
+    for (const old of this.getPushConfigs(taskId)) this.deletePushConfig(old.config_id);
+    const configId = randomUUID();
+    const tokenRef = token ? `a2a.push.${configId}.token` : null;
+    if (tokenRef && !this.secrets.set(tokenRef, token!)) {
+      throw new Error('Could not store the push token in secure storage (OS keychain unavailable).');
+    }
+    this.db
+      .prepare('INSERT INTO a2a_push_configs (config_id, task_id, url, token, auth_json) VALUES (?, ?, ?, NULL, ?)')
+      .run(configId, taskId, url, JSON.stringify({ scheme: 'Bearer', tokenRef }));
+    return this.getPushConfigs(taskId)[0];
+  }
+
+  getPushConfigs(taskId: string): PushConfigRow[] {
+    return this.db.prepare('SELECT * FROM a2a_push_configs WHERE task_id = ?').all<PushConfigRow>(taskId);
+  }
+
+  getPushConfig(configId: string): PushConfigRow | undefined {
+    return this.db.prepare('SELECT * FROM a2a_push_configs WHERE config_id = ?').get<PushConfigRow>(configId);
+  }
+
+  /** The per-task token to echo in X-A2A-Notification-Token, from secret storage. */
+  getPushToken(cfg: PushConfigRow): string | null {
+    try {
+      const ref = JSON.parse(cfg.auth_json ?? '{}').tokenRef;
+      return typeof ref === 'string' ? this.secrets.get(ref) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  deletePushConfig(configId: string): void {
+    const c = this.getPushConfig(configId);
+    if (!c) return;
+    try {
+      const ref = JSON.parse(c.auth_json ?? '{}').tokenRef;
+      if (typeof ref === 'string') this.secrets.clear(ref);
+    } catch {
+      /* nothing to clear */
+    }
+    this.db.prepare('DELETE FROM a2a_push_configs WHERE config_id = ?').run(configId);
+  }
+
+  // ---- outbox (design 6.6) ---------------------------------------------------
+
+  /**
+   * Queue a push or a send. A newer push for the same task replaces an older
+   * one that has not gone out yet: the receiver only needs the latest
+   * snapshot, and sending stale ones first would just be dropped there.
+   */
+  enqueueOutbox(e: { peerId: string; kind: 'push' | 'send'; taskId: string | null; payload: unknown; nextTryTs: number; expiresTs: number; now: number }): number {
+    if (e.kind === 'push' && e.taskId) {
+      this.db.prepare("DELETE FROM a2a_outbox WHERE kind = 'push' AND task_id = ?").run(e.taskId);
+    }
+    this.db
+      .prepare(
+        `INSERT INTO a2a_outbox (peer_id, kind, payload_json, attempts, next_try_ts, last_error, task_id, created_ts, expires_ts)
+         VALUES (?, ?, ?, 0, ?, NULL, ?, ?, ?)`
+      )
+      .run(e.peerId, e.kind, JSON.stringify(e.payload), e.nextTryTs, e.taskId, e.now, e.expiresTs);
+    const r = this.db.prepare('SELECT MAX(id) AS id FROM a2a_outbox').get<{ id: number }>();
+    return Number(r?.id ?? 0);
+  }
+
+  dueOutbox(now: number, limit = 20): OutboxRow[] {
+    return this.db
+      .prepare('SELECT * FROM a2a_outbox WHERE next_try_ts <= ? ORDER BY next_try_ts, id LIMIT ?')
+      .all<OutboxRow>(now, limit);
+  }
+
+  listOutbox(peerId?: string): OutboxRow[] {
+    return peerId
+      ? this.db.prepare('SELECT * FROM a2a_outbox WHERE peer_id = ? ORDER BY id').all<OutboxRow>(peerId)
+      : this.db.prepare('SELECT * FROM a2a_outbox ORDER BY id').all<OutboxRow>();
+  }
+
+  getOutbox(id: number): OutboxRow | undefined {
+    return this.db.prepare('SELECT * FROM a2a_outbox WHERE id = ?').get<OutboxRow>(id);
+  }
+
+  rescheduleOutbox(id: number, attempts: number, nextTryTs: number, lastError: string): void {
+    this.db.prepare('UPDATE a2a_outbox SET attempts = ?, next_try_ts = ?, last_error = ? WHERE id = ?').run(attempts, nextTryTs, lastError.slice(0, 500), id);
+  }
+
+  /** Make everything queued for a peer due now (we just heard from them). */
+  expediteOutbox(peerId: string, now: number): number {
+    const n = this.listOutbox(peerId).filter((r) => r.next_try_ts > now).length;
+    if (n) this.db.prepare('UPDATE a2a_outbox SET next_try_ts = ? WHERE peer_id = ? AND next_try_ts > ?').run(now, peerId, now);
+    return n;
+  }
+
+  deleteOutbox(id: number): void {
+    this.db.prepare('DELETE FROM a2a_outbox WHERE id = ?').run(id);
   }
 
   getTask(taskId: string): TaskRow | undefined {
