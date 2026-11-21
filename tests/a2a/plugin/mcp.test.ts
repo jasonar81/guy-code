@@ -177,7 +177,11 @@ describe('plugin layout and manifests (validated against the plugins reference)'
     const cmds = readdirSync(join(PLUGIN, 'commands')).sort();
     expect(cmds).toEqual(['inbox.md', 'log.md', 'pair.md', 'peers.md', 'status.md', 'tasks.md', 'trust.md']);
     for (const c of ['pair.md', 'trust.md']) expect(readFileSync(join(PLUGIN, 'commands', c), 'utf8')).toContain('${CLAUDE_PLUGIN_ROOT}/dist/cli.js');
-    const skill = readFileSync(join(PLUGIN, 'skills/a2a-coordination/SKILL.md'), 'utf8');
+    // Normalise line endings first: git checks these files out with CRLF on
+    // Windows, so a \n-only regex passes on Linux and macOS and fails on the
+    // Windows runner. What matters is the frontmatter content, not which
+    // line ending the checkout used.
+    const skill = readFileSync(join(PLUGIN, 'skills/a2a-coordination/SKILL.md'), 'utf8').replace(/\r\n/g, '\n');
     expect(skill).toMatch(/^---\nname: a2a-coordination\ndescription: /);
   });
 
