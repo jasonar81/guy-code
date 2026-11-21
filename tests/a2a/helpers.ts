@@ -8,7 +8,7 @@ import initSqlJs, { type Database } from 'sql.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema } from '../../electron/a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema } from '../../electron/a2a/schema';
 import { A2ANode } from '../../electron/a2a/node';
 import { generateSelfSignedCert, type TlsIdentity } from '../../electron/a2a/tls';
 import type { SecretPort, SqlHandle } from '../../electron/a2a/store';
@@ -22,13 +22,13 @@ export async function makeSql(): Promise<{ sql: SqlHandle; raw: Database }> {
   raw.exec(A2A_SCHEMA_SQL);
   // The same guarded P2 migration db.ts runs (v15). There is no sessions
   // table here, so wait_a2a is skipped exactly as columnsOf() promises.
-  applyA2AP2Schema(
-    (q) => raw.exec(q),
-    (table) => {
-      const r = raw.exec(`PRAGMA table_info(${table})`);
-      return r.length ? r[0].values.map((v) => String(v[r[0].columns.indexOf('name')])) : [];
-    }
-  );
+  const columnsOf = (table: string) => {
+    const r = raw.exec(`PRAGMA table_info(${table})`);
+    return r.length ? r[0].values.map((v) => String(v[r[0].columns.indexOf('name')])) : [];
+  };
+  applyA2AP2Schema((q) => raw.exec(q), columnsOf);
+  // ...and the P3 watch column (v16).
+  applyA2AP3Schema((q) => raw.exec(q), columnsOf);
   const sql: SqlHandle = {
     prepare: (q: string) => ({
       run: (...p: unknown[]) => {

@@ -105,7 +105,8 @@ export function buildEnvelope(e: EnvelopeInput): string {
   const replyHint = (e.kind === 'request' || e.kind === 'notify') && tid
     ? e.kind === 'notify'
       ? `This is a NOTIFY request: ${who}'s agent wants to be told when something happens. Tell your user in one line. ` +
-        `If you take it on, call A2AReply with taskId "${tid}" and action "working" (say what you are watching), then ` +
+        `If you take it on and it can be checked by a command, prefer A2AReply with taskId "${tid}", action "watch" and a check command you write yourself ` +
+        `(it reports back with no AI calls, even while you are idle). Otherwise reply action "working" (say what you are watching), then ` +
         `action "complete" with the outcome when it happens; use "reject" to decline or "needs_input" if your user must decide.`
       : `This is a REQUEST from ${who}'s agent. Tell your user in one line. Answer it with A2AReply, taskId "${tid}": ` +
         `action "complete" with the answer, "needs_input" if your user must decide first, "reject" to decline, or "working" for a progress note.`

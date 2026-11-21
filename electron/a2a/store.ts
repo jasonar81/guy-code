@@ -73,6 +73,8 @@ export interface TaskRow {
   push_token_hash?: string | null;
   /** IN tasks from an inform peer: 'pending' | 'accepted' | 'declined' (P2). */
   approval?: string | null;
+  /** IN tasks with a live watch: when its check next runs (P3, design 5.5). NULL = no live watch. */
+  watch_next_ts?: number | null;
 }
 
 export interface PushConfigRow {
@@ -536,6 +538,29 @@ export class A2AStore {
 
   getTask(taskId: string): TaskRow | undefined {
     return this.db.prepare('SELECT * FROM a2a_tasks WHERE task_id = ?').get<TaskRow>(taskId);
+  }
+
+  // ---- watches (P3, design 5.5) ------------------------------------------------
+
+  /**
+   * Store (or clear, with `watchJson` null) an IN task's watch and when it
+   * next runs. Keeping the JSON after the watch ends is useful history
+   * (A2ATasks, the panel); `watch_next_ts = NULL` is what marks it inactive.
+   */
+  setWatch(taskId: string, watchJson: string | null, nextTs: number | null, now = Date.now()): void {
+    this.db.prepare('UPDATE a2a_tasks SET watch_json = ?, watch_next_ts = ?, updated_ts = ? WHERE task_id = ?').run(watchJson, nextTs, now, taskId);
+  }
+
+  /** Stop the watch (if any) but keep its JSON as a record. */
+  endWatch(taskId: string): void {
+    this.db.prepare('UPDATE a2a_tasks SET watch_next_ts = NULL WHERE task_id = ?').run(taskId);
+  }
+
+  /** Open IN tasks with a live watch, soonest first. */
+  listWatchedTasks(): TaskRow[] {
+    return this.db
+      .prepare(`SELECT * FROM a2a_tasks WHERE direction = 'in' AND watch_next_ts IS NOT NULL AND state NOT IN ${TERMINAL_SQL} ORDER BY watch_next_ts`)
+      .all<TaskRow>();
   }
 
   updateTask(taskId: string, patch: { state?: TaskState; sessionId?: string | null; statusJson?: string | null }, now = Date.now()): void {

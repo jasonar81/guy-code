@@ -38,7 +38,7 @@ import * as fsp from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema } from './a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema } from './a2a/schema';
 import type { WaitA2AState } from './a2a/waiters';
 
 let SQL: SqlJsStatic | null = null;
@@ -1201,6 +1201,14 @@ function migrate(d: Database) {
       // columns. ALTER TABLE ADD COLUMN is not idempotent in SQLite, so each
       // one is guarded by PRAGMA table_info (see a2a/schema.ts).
       up: (dd) => applyA2AP2Schema((sql) => dd.exec(sql), (table) => tableColumns(dd, table)),
+    },
+    {
+      version: 16,
+      // A2A P3: the watch extension (design 5.5). Adds `a2a_tasks.watch_next_ts`
+      // (when a watch's check next runs) and its index; the watch state itself
+      // goes in the existing `a2a_tasks.watch_json`. Guarded by PRAGMA
+      // table_info like v15 (see a2a/schema.ts).
+      up: (dd) => applyA2AP3Schema((sql) => dd.exec(sql), (table) => tableColumns(dd, table)),
     },
   ];
 

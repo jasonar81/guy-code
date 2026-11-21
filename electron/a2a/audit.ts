@@ -41,6 +41,11 @@ export type AuditEvent =
   | 'push.rejected'
   | 'poll.result'
   | 'wait.woke'
+  | 'watch.started'
+  | 'watch.check'
+  | 'watch.met'
+  | 'watch.woke'
+  | 'watch.stopped'
   | 'peer.unpaired_by_remote'
   | 'server.started'
   | 'server.stopped';

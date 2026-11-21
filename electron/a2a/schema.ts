@@ -129,10 +129,44 @@ export const A2A_P2_INDEX_SQL = `
  * `sessions` table; that column is then simply skipped).
  */
 export function applyA2AP2Schema(exec: (sql: string) => void, columnsOf: (table: string) => string[]): void {
-  for (const [table, column, type] of A2A_P2_COLUMNS) {
+  addMissingColumns(exec, columnsOf, A2A_P2_COLUMNS);
+  exec(A2A_P2_INDEX_SQL);
+}
+
+function addMissingColumns(
+  exec: (sql: string) => void,
+  columnsOf: (table: string) => string[],
+  list: ReadonlyArray<readonly [string, string, string]>
+): void {
+  for (const [table, column, type] of list) {
     const cols = columnsOf(table);
     if (cols.length === 0 || cols.includes(column)) continue;
     exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
   }
-  exec(A2A_P2_INDEX_SQL);
+}
+
+/**
+ * P3 (watch extension, design 5.5). `a2a_tasks.watch_json` already exists
+ * from P1 and holds the watch state (command, shell, interval, deadline,
+ * onMet...). P3 adds one column:
+ *
+ *   a2a_tasks.watch_next_ts  When the watch's check next runs (epoch ms), or
+ *                            NULL when the task has no live watch. Indexed so
+ *                            the sweep after a restart finds due watches
+ *                            without parsing every task's JSON. Kept out of
+ *                            the JSON so the "is anything due?" query is a
+ *                            plain range scan.
+ */
+export const A2A_P3_COLUMNS: ReadonlyArray<readonly [table: string, column: string, type: string]> = [
+  ['a2a_tasks', 'watch_next_ts', 'INTEGER'],
+];
+
+export const A2A_P3_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS a2a_tasks_watch_next ON a2a_tasks(watch_next_ts);
+`;
+
+/** Apply the P3 column and index. Guarded and re-runnable, like `applyA2AP2Schema`. */
+export function applyA2AP3Schema(exec: (sql: string) => void, columnsOf: (table: string) => string[]): void {
+  addMissingColumns(exec, columnsOf, A2A_P3_COLUMNS);
+  exec(A2A_P3_INDEX_SQL);
 }

@@ -11,6 +11,9 @@
  * sessions on a push, `a2aTimerWake` for agent.ts's timer path (poll
  * backstop, then resume or re-sleep), and the approval notifications
  * (desktop + Agents-panel event + Slack line).
+ *
+ * P3 hands the node tools.ts's `runConditionCheck` for watches and exports
+ * `a2aSweepWatches` for the budget governor's 60 s sweep.
  */
 import { app, BrowserWindow, dialog, Notification } from 'electron';
 import { join } from 'node:path';
@@ -35,6 +38,7 @@ import {
 } from '../db';
 import { getSecret, setSecret, clearSecret, getDefaultApiKeyId } from '../secret';
 import { runUserTurn, queueInterrupt, isRunning } from '../agent';
+import { runConditionCheck } from '../tools';
 import { loadMessagesFromJsonl, ourJsonlPath } from '../sessionRuntime';
 import { setEscalationUi } from '../a2aTools';
 import type { TrustLevel } from './types';
@@ -213,6 +217,20 @@ export async function a2aTimerWake(state: WaitA2AState): Promise<{ note: string 
 }
 
 /**
+ * Governor sweep hook for A2A watches (design 5.5): runs any watch check that
+ * is due and re-arms the in-process timers. The node already sweeps once on
+ * start; this 60 s backstop covers a lost timer and a machine waking from
+ * suspend, exactly like wakeSleepingToolSweep does for WaitForCondition.
+ * No-op while A2A is off: a watch then waits (its state stays in the DB) and
+ * resumes the next time A2A starts.
+ */
+export async function a2aSweepWatches(): Promise<void> {
+  const n = _node;
+  if (!n || !n.isRunning()) return;
+  await n.sweepWatches();
+}
+
+/**
  * The last thing the USER typed in a session (not a tool result, not an
  * injected A2A envelope wrapper we can tell apart). Used by A2APair's
  * escalation check (design 4.2.3: "full" only when the user's own turn says
@@ -319,6 +337,9 @@ export async function startA2A(): Promise<void> {
       agentKind: 'guycode',
       appVersion: app.getVersion(),
       log,
+      // Watches (design 5.5) run on the WaitForCondition runner: same shells,
+      // same WSL routing for bash on Windows, same 60 s per-check cap.
+      watchCheck: (command, cwd, shell, timeoutMs) => runConditionCheck(command, cwd || process.cwd(), shell, timeoutMs),
     });
     await node.start();
     _node = node;

@@ -872,6 +872,15 @@ async function runSleepingToolSweep(): Promise<void> {
   } catch (e) {
     log.error('[budget] sleeping-tool sweep error', e);
   }
+  // A2A watches (design 5.5) are the same kind of $0 persistent check as
+  // WaitForCondition, but owned by an A2A task rather than a sleeping
+  // session, so they get their own sweep on the same cadence.
+  try {
+    const { a2aSweepWatches } = await import('./a2a/index');
+    await a2aSweepWatches();
+  } catch (e) {
+    log.error('[budget] a2a watch sweep error', e);
+  }
 }
 
 /**

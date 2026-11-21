@@ -9,19 +9,40 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { A2A_TOOLS } from '../../electron/a2aTools';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema } from '../../electron/a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema } from '../../electron/a2a/schema';
 
 const root = join(__dirname, '..', '..');
 const src = (p: string) => readFileSync(join(root, p), 'utf8');
 
 describe('A2A wiring', () => {
-  it('db.ts applies the shared A2A schema as numbered migrations (v14 tables, v15 guarded P2 columns)', () => {
+  it('db.ts applies the shared A2A schema as numbered migrations (v14 tables, v15 P2 + v16 P3 guarded columns)', () => {
     const db = src('electron/db.ts');
-    expect(db).toMatch(/import \{ A2A_SCHEMA_SQL, applyA2AP2Schema \} from '\.\/a2a\/schema'/);
+    expect(db).toMatch(/import \{ A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema \} from '\.\/a2a\/schema'/);
     expect(db).toMatch(/version: 14,[\s\S]{0,800}up: A2A_SCHEMA_SQL/);
     expect(db).toMatch(/version: 15,[\s\S]{0,600}applyA2AP2Schema\(/);
-    // ALTER TABLE is not idempotent: v15 must go through the PRAGMA guard, not raw SQL.
+    expect(db).toMatch(/version: 16,[\s\S]{0,600}applyA2AP3Schema\(/);
+    // ALTER TABLE is not idempotent: v15 / v16 must go through the PRAGMA guard, not raw SQL.
     expect(db).not.toMatch(/ALTER TABLE sessions ADD COLUMN wait_a2a/);
+    expect(db).not.toMatch(/ALTER TABLE a2a_tasks ADD COLUMN watch_next_ts/);
+  });
+
+  it('the P3 watch migration is idempotent and adds a2a_tasks.watch_next_ts', async () => {
+    const { default: initSqlJs } = await import('sql.js');
+    const SQL = await initSqlJs();
+    const d = new SQL.Database();
+    d.exec(A2A_SCHEMA_SQL);
+    const cols = (t: string) => {
+      const r = d.exec(`PRAGMA table_info(${t})`);
+      return r.length ? r[0].values.map((v) => String(v[1])) : [];
+    };
+    applyA2AP3Schema((q) => d.exec(q), cols);
+    applyA2AP3Schema((q) => d.exec(q), cols);
+    expect(cols('a2a_tasks')).toEqual(expect.arrayContaining(['watch_json', 'watch_next_ts']));
+  });
+
+  it('the governor sweep also sweeps A2A watches; the app hands the node the WaitForCondition runner', () => {
+    expect(src('electron/budget.ts')).toMatch(/const \{ a2aSweepWatches \} = await import\('\.\/a2a\/index'\);/);
+    expect(src('electron/a2a/index.ts')).toMatch(/watchCheck: \(command, cwd, shell, timeoutMs\) => runConditionCheck\(/);
   });
 
   it('the P2 column migration is idempotent and adds sessions.wait_a2a', async () => {

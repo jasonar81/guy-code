@@ -18,15 +18,24 @@ export const A2A_PROTOCOL_VERSION = '1.0';
 /** Media type for request and response bodies in the HTTP+JSON binding. */
 export const A2A_CONTENT_TYPE = 'application/a2a+json';
 
-/** Extension URIs we declare in the card (design 5.1, 5.4). */
+/** Extension URIs we declare in the card (design 5.1, 5.4, 5.5). */
 export const EXT_ROUTING = 'https://ocient.dev/a2a/ext/routing/v1';
 export const EXT_PAIRING = 'https://ocient.dev/a2a/ext/pairing/v1';
-// TODO(P3): EXT_WATCH = 'https://ocient.dev/a2a/ext/watch/v1', declared once
-// the watch runner exists. Declaring it earlier would advertise a capability
-// we cannot honour.
+/**
+ * Notify-on-condition (design 5.5): the receiving agent can install a check
+ * command its own runtime polls at no model cost (`electron/a2a/watch.ts`).
+ */
+export const EXT_WATCH = 'https://ocient.dev/a2a/ext/watch/v1';
 
 /** Metadata key for the routing extension payload (design 5.4). */
 export const ROUTING_METADATA_KEY = 'ocient.routing';
+
+/**
+ * Metadata key for the watch extension payload (design 5.5). The requester
+ * may put `{ suggestion: "<text>" }` here. It is TEXT for the receiving
+ * model and user to read; no field of it is ever executed.
+ */
+export const WATCH_METADATA_KEY = 'ocient.watch';
 
 export type Role = 'ROLE_UNSPECIFIED' | 'ROLE_USER' | 'ROLE_AGENT';
 
@@ -237,6 +246,11 @@ export interface RoutingInfo {
   toSession?: string;
   toProject?: string;
   replyContextId?: string;
+}
+
+/** `message.metadata["ocient.watch"]` (design 5.5). Untrusted; `suggestion` is display text only. */
+export interface WatchSuggestionInfo {
+  suggestion?: string;
 }
 
 /** `metadata.kind` (design 5.2). Drives gating: request / notify from an inform peer wait for approval. */

@@ -794,7 +794,16 @@ export interface ConditionCheckResult {
   launched: boolean;
   /** Short detail for the broken-check case (e.g. the spawn error). */
   detail?: string;
+  /**
+   * The tail of stdout + stderr (interleaved as it arrived, capped at the last
+   * 16 KB). WaitForCondition ignores it; the A2A watch extension puts the last
+   * 20 lines in the task's artifact (design 5.5).
+   */
+  output?: string;
 }
+
+/** How much check output runConditionCheck keeps (the tail). */
+const CONDITION_OUTPUT_TAIL_BYTES = 16 * 1024;
 
 /**
  * Run a WaitForCondition check command. Resolves with the exit code AND whether
@@ -834,13 +843,23 @@ export function runConditionCheck(
         args = ['-NoProfile', '-NonInteractive', '-Command', command];
       }
       const child = spawn(cmd, args, { cwd, windowsHide: true });
+      // Keep only a bounded tail of the output: a chatty check run every
+      // minute for days must not grow memory.
+      let tail = Buffer.alloc(0);
+      const collect = (b: Buffer) => {
+        tail = Buffer.concat([tail, b]);
+        if (tail.length > CONDITION_OUTPUT_TAIL_BYTES) tail = tail.subarray(tail.length - CONDITION_OUTPUT_TAIL_BYTES);
+      };
+      child.stdout?.on('data', collect);
+      child.stderr?.on('data', collect);
+      const output = () => tail.toString('utf8');
       const killer = setTimeout(() => {
         try {
           child.kill();
         } catch {
           /* ignore */
         }
-        done({ code: 124, launched: false, detail: `check timed out after ${timeoutMs}ms` });
+        done({ code: 124, launched: false, detail: `check timed out after ${timeoutMs}ms`, output: output() });
       }, timeoutMs);
       child.on('error', (e) => {
         clearTimeout(killer);
@@ -848,7 +867,7 @@ export function runConditionCheck(
       });
       child.on('close', (code) => {
         clearTimeout(killer);
-        done({ code: typeof code === 'number' ? code : 1, launched: true });
+        done({ code: typeof code === 'number' ? code : 1, launched: true, output: output() });
       });
     } catch (e) {
       done({ code: 125, launched: false, detail: `spawn failed: ${(e as Error).message}` });
