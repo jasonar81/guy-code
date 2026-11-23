@@ -374,6 +374,14 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
   ipcMain.handle('a2a:invite', async () => (await import('./a2a/index')).a2aPanelInvite());
   ipcMain.handle('a2a:revoke', async (_e, peerId: string) => (await import('./a2a/index')).a2aPanelRevoke(String(peerId)));
   ipcMain.handle('a2a:audit', async (_e, limit?: number) => (await import('./a2a/index')).a2aPanelAudit(Number(limit) || 300));
+  ipcMain.handle('a2a:relayStatus', async () => (await import('./a2a/index')).a2aRelayStatus());
+  ipcMain.handle('a2a:setRelay', async (_e, url: string, enabled: boolean) => {
+    try {
+      return { ok: true, message: 'Saved.', status: (await import('./a2a/index')).a2aSetRelay({ url: String(url ?? ''), enabled: !!enabled }) };
+    } catch (e) {
+      return { ok: false, message: (e as Error).message, status: (await import('./a2a/index')).a2aRelayStatus() };
+    }
+  });
 
   /** Post a test message to the configured Slack channel (Settings button). */
   ipcMain.handle('slackBridge:test', async () => {

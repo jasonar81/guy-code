@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
 import { X, RefreshCw, Check, Ban, Copy, PauseCircle, PlayCircle, AlertTriangle } from 'lucide-react';
-import type { A2APanelPeer, A2APanelSnapshot, A2APanelTask, A2ATrust } from '@/types';
+import type { A2APanelPeer, A2APanelSnapshot, A2APanelTask, A2ARelayStatus, A2ATrust } from '@/types';
 import { relativeTime } from '@/lib/format';
 
 interface Props {
@@ -67,6 +67,74 @@ export function escalationWarning(who: string, level: A2ATrust): string {
   return level === 'full'
     ? `${who}'s agent will be able to make your agent run commands, edit files, and change shared systems without asking you.`
     : `${who}'s agent's requests will reach your agent without asking you first. It may act on reasonable ones but must still ask before destructive or shared-resource actions.`;
+}
+
+/**
+ * Relay (design 11a): for networks where peers cannot reach each other (a
+ * Fortinet-style VPN). Off by default; the relay only ever sees encrypted
+ * payloads plus who-talks-to-whom metadata.
+ */
+export function RelayBox({ refreshKey }: { refreshKey?: unknown }) {
+  const [st, setSt] = useState<A2ARelayStatus | null>(null);
+  const [url, setUrl] = useState('');
+  const [msg, setMsg] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    if (!window.api.a2a.relayStatus) return;
+    void window.api.a2a
+      .relayStatus()
+      .then((s) => {
+        setSt(s);
+        if (!dirty) setUrl(s.url);
+      })
+      .catch(() => {});
+  }, [refreshKey, dirty]);
+  if (!st) return null;
+  const save = async (enabled: boolean) => {
+    const r = await window.api.a2a.setRelay(url, enabled);
+    setSt(r.status);
+    setMsg(r.ok ? null : r.message);
+    setDirty(false);
+  };
+  const colour =
+    st.state === 'connected' ? 'bg-green-500' : st.state === 'connecting' ? 'bg-amber-500' : st.state === 'disconnected' ? 'bg-red-500' : 'bg-bg-hover';
+  return (
+    <div className="border border-border rounded p-3 text-[12px]" data-testid="a2a-relay">
+      <div className="flex items-center gap-2">
+        <span className={clsx('inline-block w-2 h-2 rounded-full', colour)} />
+        <span className="font-medium text-text">Relay</span>
+        <span className="text-text-dim" data-testid="a2a-relay-state">
+          {st.state === 'off' ? (st.enabled ? 'on, waiting for A2A to start' : 'off') : st.state}
+        </span>
+        {st.lastError && st.state !== 'connected' && <span className="text-[11px] text-red-500 truncate">{st.lastError}</span>}
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <input
+          className="flex-1 bg-bg-elevated border border-border rounded px-2 py-1 text-[11px] font-mono"
+          placeholder="https://relay-host:7429"
+          value={url}
+          aria-label="Relay URL"
+          onChange={(e) => {
+            setUrl(e.target.value);
+            setDirty(true);
+          }}
+        />
+        <button className="px-2 py-1 rounded border border-border text-[11px]" onClick={() => void save(true)} disabled={!url.trim()}>
+          {st.enabled ? 'Save' : 'Use relay'}
+        </button>
+        {st.enabled && (
+          <button className="px-2 py-1 rounded border border-border text-[11px] text-text-dim" onClick={() => void save(false)}>
+            Turn off
+          </button>
+        )}
+      </div>
+      {msg && <p className="mt-1 text-[11px] text-red-500">{msg}</p>}
+      <p className="mt-1 text-[10px] text-text-dim">
+        Used only when a peer cannot be reached directly. Messages are end-to-end encrypted; the relay sees who talks to whom and when, not what.
+        {st.relayCertSha256 ? ` Relay certificate pinned: ${st.relayCertSha256.slice(0, 16)}...` : ''}
+      </p>
+    </div>
+  );
 }
 
 export function AgentsPanel({ open, onClose, onOpenSession }: Props) {
@@ -253,6 +321,7 @@ export function AgentsPanel({ open, onClose, onOpenSession }: Props) {
                   </button>
                 )}
               </div>
+              <RelayBox refreshKey={snap} />
               {(snap?.peers ?? []).length === 0 && <p className="text-[12px] text-text-dim italic">No paired peers yet.</p>}
               {(snap?.peers ?? []).map((p) => (
                 <div key={p.peerId} className="border border-border rounded p-3 text-[12px]">

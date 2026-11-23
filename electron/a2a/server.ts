@@ -52,7 +52,8 @@ export interface A2AServerHandlers {
   sendMessage(peer: PeerRow, req: SendMessageRequest): Promise<Task>;
   getTask(peer: PeerRow, taskId: string): Task;
   cancelTask(peer: PeerRow, taskId: string): Task;
-  pair(req: PairRequest, remoteAddress: string): Promise<PairResponse>;
+  /** `ctx.relayFrom` = the relay-proven sender fingerprint when the request came through the relay. */
+  pair(req: PairRequest, remoteAddress: string, ctx?: { relayFrom?: string }): Promise<PairResponse>;
   /** ListTasks: only tasks between us and this peer. */
   listTasks(peer: PeerRow, query: URLSearchParams): ListTasksResponse;
   /** Inbound push for a task we created on this peer. `pushToken` from X-A2A-Notification-Token. */
@@ -83,6 +84,37 @@ export interface A2AServer {
   port(): number;
   /** Scheme + host + port as peers should dial it, e.g. https://10.30.1.23:7427 */
   origin(advertiseHost?: string): string;
+  /**
+   * Run a request that arrived through the relay (already decrypted) through
+   * exactly the same gate and routes as a direct one, minus the CIDR check
+   * (there is no socket address; the relay proved the sender's fingerprint
+   * and the payload was sealed with the pair key instead). A bearer token
+   * must belong to the peer whose fingerprint the relay proved.
+   */
+  handleRelayed(req: RelayedRequest): Promise<{ status: number; body: unknown }>;
+}
+
+export interface RelayedRequest {
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body?: unknown;
+  /** Sender fingerprint (lowercase hex), proven to the relay by signature. */
+  from: string;
+}
+
+/** The transport-neutral view of one request: a socket (direct) or a decrypted relay payload. */
+interface Exchange {
+  method: string;
+  url: string;
+  header(name: string): string;
+  remote: string;
+  relayFrom?: string;
+  /** Raw body, enforcing the size cap. */
+  body(reject: (e: A2AProtocolError) => never): Promise<Buffer>;
+  /** Throw away an unread body (direct: keep draining so the error response can be written). */
+  discard(): void;
+  send(status: number, body: unknown, contentType?: string): void;
 }
 
 export function createA2AServer(opts: A2AServerOptions): A2AServer {
@@ -195,78 +227,122 @@ class A2AServerImpl implements A2AServer {
 
   // ---- request handling ------------------------------------------------------
 
-  private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const remote = normaliseRemoteAddress(req.socket.remoteAddress);
-    const url = new URL(req.url ?? '/', 'http://x');
+  private handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    return this.route({
+      method: req.method ?? 'GET',
+      url: req.url ?? '/',
+      header: (n) => String(req.headers[n.toLowerCase()] ?? ''),
+      remote: normaliseRemoteAddress(req.socket.remoteAddress),
+      body: (reject) => this.readBody(req, reject),
+      discard: () => void req.resume(),
+      send: (status, body, ct) => this.sendJson(res, status, body, ct),
+    });
+  }
+
+  async handleRelayed(r: RelayedRequest): Promise<{ status: number; body: unknown }> {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(r.headers ?? {})) if (typeof v === 'string') headers[k.toLowerCase()] = v;
+    let out: { status: number; body: unknown } | null = null;
+    const from = String(r.from ?? '').toLowerCase();
+    try {
+      await this.route({
+        method: String(r.method ?? 'GET').toUpperCase(),
+        url: String(r.path ?? '/'),
+        header: (n) => headers[n.toLowerCase()] ?? '',
+        remote: `relay:${from.slice(0, 12)}`,
+        relayFrom: from,
+        body: async (reject) => {
+          if (r.body === undefined) return Buffer.alloc(0);
+          const buf = Buffer.from(JSON.stringify(r.body), 'utf8');
+          if (buf.length > LIMITS.maxBodyBytes) reject(errors.tooLarge(LIMITS.maxBodyBytes));
+          return buf;
+        },
+        discard: () => {},
+        send: (status, body) => {
+          out = { status, body };
+        },
+      });
+    } catch (e) {
+      const err = e instanceof A2AProtocolError ? e : new A2AProtocolError(500, 'INTERNAL', 'Internal error.');
+      return { status: err.httpStatus, body: err.toBody() };
+    }
+    return out ?? { status: 500, body: new A2AProtocolError(500, 'INTERNAL', 'No response.').toBody() };
+  }
+
+  private async route(x: Exchange): Promise<void> {
+    const { remote, method } = x;
+    const url = new URL(x.url, 'http://x');
     const path = url.pathname;
-    const method = req.method ?? 'GET';
     const reject = (e: A2AProtocolError, peer?: string): never => {
       this.opts.handlers.onRejected?.({ route: `${method} ${path}`, status: e.httpStatus, reason: e.reason, peer, remote });
       throw e;
     };
 
-    // 1. network allow-list, for every route.
-    if (!ipInCidrs(remote, this.opts.allowCidrs())) reject(errors.notAllowed());
+    // 1. network allow-list, for every route. A relayed request has no socket
+    //    address; its sender was proven to the relay and it decrypted under a
+    //    key only the two paired certificates can derive.
+    if (!x.relayFrom && !ipInCidrs(remote, this.opts.allowCidrs())) reject(errors.notAllowed());
 
     // 2. public card.
     if (method === 'GET' && path === '/.well-known/agent-card.json') {
-      return this.sendJson(res, 200, this.opts.handlers.card(), 'application/json');
+      return x.send(200, this.opts.handlers.card(), 'application/json');
     }
 
     // 3. pairing: unauthenticated by design, rate limited per address.
     if (path === '/a2a-pair') {
       if (method !== 'POST') reject(errors.notFound());
-      this.checkVersion(req, reject);
+      this.checkVersion(x, reject);
       if (!this.pairLimiter.allow(remote)) reject(errors.rateLimited());
-      const body = (await this.readJson(req, reject)) as PairRequest;
-      const out = await this.opts.handlers.pair(body, remote);
-      return this.sendJson(res, 200, out);
+      const body = (await this.readJson(x, reject)) as PairRequest;
+      const out = await this.opts.handlers.pair(body, remote, x.relayFrom ? { relayFrom: x.relayFrom } : undefined);
+      return x.send(200, out);
     }
 
     // 4. everything else needs a paired peer.
-    const auth = String(req.headers.authorization ?? '');
-    const m = /^Bearer\s+(\S+)$/i.exec(auth);
+    const m = /^Bearer\s+(\S+)$/i.exec(x.header('authorization'));
     const peer = m ? this.opts.handlers.authenticate(m[1]) : undefined;
     if (!peer) reject(errors.unauthenticated());
     const p = peer!;
+    // Through the relay, the token must belong to the identity the relay proved.
+    if (x.relayFrom && String(p.cert_sha256 ?? '').toLowerCase() !== x.relayFrom) reject(errors.unauthenticated(), p.peer_id);
     if (this.opts.handlers.effectiveTrust(p) === 'blocked') reject(errors.blocked(), p.peer_id);
-    this.checkVersion(req, (e) => reject(e, p.peer_id));
+    this.checkVersion(x, (e) => reject(e, p.peer_id));
     if (!this.peerLimiter.allow(p.peer_id)) reject(errors.rateLimited(), p.peer_id);
     this.opts.handlers.onPeerSeen?.(p);
 
     if (method === 'POST' && path === '/message:send') {
-      const body = (await this.readJson(req, (e) => reject(e, p.peer_id))) as SendMessageRequest;
+      const body = (await this.readJson(x, (e) => reject(e, p.peer_id))) as SendMessageRequest;
       const task = await this.opts.handlers.sendMessage(p, body);
       // proto SendMessageResponse is a oneof {task, message}; we always create a task.
-      return this.sendJson(res, 200, { task });
+      return x.send(200, { task });
     }
     if (method === 'GET' && path === '/extendedAgentCard') {
-      return this.sendJson(res, 200, this.opts.handlers.extendedCard(p));
+      return x.send(200, this.opts.handlers.extendedCard(p));
     }
     const taskRoute = /^\/tasks\/([^/:]+)(:cancel)?$/.exec(path);
     if (taskRoute) {
       const id = decodeURIComponent(taskRoute[1]);
-      if (method === 'GET' && !taskRoute[2]) return this.sendJson(res, 200, this.opts.handlers.getTask(p, id));
+      if (method === 'GET' && !taskRoute[2]) return x.send(200, this.opts.handlers.getTask(p, id));
       if (method === 'POST' && taskRoute[2]) {
-        await this.drain(req, (e) => reject(e, p.peer_id));
-        return this.sendJson(res, 200, this.opts.handlers.cancelTask(p, id));
+        await x.body((e) => reject(e, p.peer_id));
+        return x.send(200, this.opts.handlers.cancelTask(p, id));
       }
     }
     if (path === '/a2a-push') {
       if (method !== 'POST') reject(errors.notFound(), p.peer_id);
-      const body = (await this.readJson(req, (e) => reject(e, p.peer_id))) as StreamResponse;
-      const tok = String(req.headers['x-a2a-notification-token'] ?? '');
+      const body = (await this.readJson(x, (e) => reject(e, p.peer_id))) as StreamResponse;
+      const tok = x.header('x-a2a-notification-token');
       const r = this.opts.handlers.push(p, body, tok);
-      return this.sendJson(res, 200, r);
+      return x.send(200, r);
     }
     if (path === '/a2a-unpair') {
       if (method !== 'POST') reject(errors.notFound(), p.peer_id);
-      await this.drain(req, (e) => reject(e, p.peer_id));
+      await x.body((e) => reject(e, p.peer_id));
       this.opts.handlers.unpaired(p);
-      return this.sendJson(res, 200, {});
+      return x.send(200, {});
     }
     if (method === 'GET' && path === '/tasks') {
-      return this.sendJson(res, 200, this.opts.handlers.listTasks(p, url.searchParams));
+      return x.send(200, this.opts.handlers.listTasks(p, url.searchParams));
     }
     reject(errors.notFound(`No route for ${method} ${path}.`), p.peer_id);
   }
@@ -276,8 +352,8 @@ class A2AServerImpl implements A2AServer {
    * so both a missing and a different version get a clear error instead of a
    * confusing parse failure later.
    */
-  private checkVersion(req: http.IncomingMessage, reject: (e: A2AProtocolError) => never): void {
-    const v = String(req.headers['a2a-version'] ?? '').trim();
+  private checkVersion(x: Exchange, reject: (e: A2AProtocolError) => never): void {
+    const v = x.header('a2a-version').trim();
     if (v !== A2A_PROTOCOL_VERSION) reject(errors.version(v));
   }
 
@@ -317,17 +393,13 @@ class A2AServerImpl implements A2AServer {
     });
   }
 
-  private async drain(req: http.IncomingMessage, reject: (e: A2AProtocolError) => never): Promise<void> {
-    await this.readBody(req, reject);
-  }
-
-  private async readJson(req: http.IncomingMessage, reject: (e: A2AProtocolError) => never): Promise<unknown> {
-    const ct = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  private async readJson(x: Exchange, reject: (e: A2AProtocolError) => never): Promise<unknown> {
+    const ct = x.header('content-type').split(';')[0].trim().toLowerCase();
     if (ct !== A2A_CONTENT_TYPE && ct !== 'application/json') {
-      req.resume();
+      x.discard();
       reject(errors.contentType());
     }
-    const buf = await this.readBody(req, reject);
+    const buf = await x.body(reject);
     try {
       const v = JSON.parse(buf.toString('utf8'));
       if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object');

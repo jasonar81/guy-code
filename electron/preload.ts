@@ -80,6 +80,8 @@ const api = {
     invite: () => ipcRenderer.invoke('a2a:invite'),
     revoke: (peerId: string) => ipcRenderer.invoke('a2a:revoke', peerId),
     audit: (limit?: number) => ipcRenderer.invoke('a2a:audit', limit),
+    relayStatus: () => ipcRenderer.invoke('a2a:relayStatus'),
+    setRelay: (url: string, enabled: boolean) => ipcRenderer.invoke('a2a:setRelay', url, enabled),
   },
   settings: {
     get: (key: string) => ipcRenderer.invoke('settings:get', key),

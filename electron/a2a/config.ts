@@ -26,6 +26,12 @@ export const A2A_SETTING = {
   paused: 'a2a.paused',
   /** Our self-signed certificate (PEM). The private key goes through secret.ts, never here. */
   tlsCert: 'a2a.tlsCert',
+  /** Relay base URL (design 11a), e.g. https://net1:7429. Empty = off. */
+  relayUrl: 'a2a.relayUrl',
+  /** Use the relay at all. Default off: nothing changes unless the user opts in. */
+  relayEnabled: 'a2a.relayEnabled',
+  /** SHA-256 of the relay's TLS certificate. Empty = pin on first use and record it here. */
+  relayCertSha256: 'a2a.relayCertSha256',
 } as const;
 
 /** Secret name (secret.ts) for our TLS private key. */
@@ -74,6 +80,22 @@ export interface A2AConfig {
   displayName: string;
   insecureHttp: boolean;
   paused: boolean;
+  relayUrl: string;
+  relayEnabled: boolean;
+  relayCertSha256: string;
+}
+
+/** Trim and drop a trailing slash so two spellings of one relay compare equal. Empty if not http(s). */
+export function normaliseRelayUrl(u: string | null | undefined): string {
+  const s = String(u ?? '').trim().replace(/\/+$/, '');
+  if (!s) return '';
+  try {
+    const p = new URL(s);
+    if (p.protocol !== 'https:' && p.protocol !== 'http:') return '';
+    return `${p.protocol}//${p.host}${p.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return '';
+  }
 }
 
 type Getter = (key: string) => string | null;
@@ -97,6 +119,9 @@ export function readA2AConfig(get: Getter): A2AConfig {
     displayName: String(get(A2A_SETTING.displayName) ?? '').trim() || os.userInfo().username,
     insecureHttp: truthy(get(A2A_SETTING.insecureHttp)),
     paused: truthy(get(A2A_SETTING.paused)),
+    relayUrl: normaliseRelayUrl(get(A2A_SETTING.relayUrl)),
+    relayEnabled: truthy(get(A2A_SETTING.relayEnabled)),
+    relayCertSha256: String(get(A2A_SETTING.relayCertSha256) ?? '').replace(/[^0-9a-fA-F]/g, '').toLowerCase(),
   };
 }
 

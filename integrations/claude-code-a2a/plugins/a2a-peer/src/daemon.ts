@@ -14,7 +14,8 @@
  *                  ${CLAUDE_PLUGIN_DATA}" when no keychain module is present;
  *                  we deliberately add no native dependency)
  *   daemon.json    mode 0600: { pid, port, token, a2aUrl } for the local API
- *   config.json    optional: { displayName, port, bind, allowCidrs, advertiseHost }
+ *   config.json    optional: { displayName, port, bind, allowCidrs, advertiseHost,
+ *                  relayUrl, relayEnabled, relayCertSha256, listen }
  *   audit.jsonl    the append-only audit log (design 4.2.7)
  *
  * Settings come from config.json, then the plugin's userConfig, which Claude
@@ -36,7 +37,9 @@ import {
   CLAUDE_CODE_DEFAULT_PORT,
   fingerprintOfPem,
   generateSelfSignedCert,
+  normaliseRelayUrl,
   parseCidr,
+  type RelayNodeOptions,
   resolveAdvertiseHost,
   resolveBindAddress,
   runConditionCheck,
@@ -121,7 +124,15 @@ export interface DaemonConfig {
   bind: string;
   allowCidrs: string[];
   advertiseHost?: string;
+  /** Relay (design 11a). Empty URL or relayEnabled false = off. */
+  relayUrl: string;
+  relayEnabled: boolean;
+  relayCertSha256: string;
+  /** False = relay-only: never open a listening port (config.json "listen": false). */
+  listen: boolean;
 }
+
+const truthy = (v: unknown) => v === true || v === 'true' || v === '1' || v === 1;
 
 export function readConfig(dir: string, envIn: NodeJS.ProcessEnv = process.env): DaemonConfig {
   // An unset userConfig option may arrive as the literal "${user_config.x}"
@@ -158,6 +169,29 @@ export function readConfig(dir: string, envIn: NodeJS.ProcessEnv = process.env):
     bind: String(file.bind ?? env.CLAUDE_PLUGIN_OPTION_BIND ?? '').trim(),
     allowCidrs: cidrs.length ? cidrs : [...DEFAULT_ALLOW_CIDRS],
     advertiseHost: typeof file.advertiseHost === 'string' ? file.advertiseHost : undefined,
+    relayUrl: normaliseRelayUrl(String(file.relayUrl ?? env.CLAUDE_PLUGIN_OPTION_RELAY_URL ?? '')),
+    relayEnabled: truthy(file.relayEnabled ?? env.CLAUDE_PLUGIN_OPTION_RELAY_ENABLED),
+    relayCertSha256: String(file.relayCertSha256 ?? env.CLAUDE_PLUGIN_OPTION_RELAY_CERT_SHA256 ?? '')
+      .replace(/[^0-9a-fA-F]/g, '')
+      .toLowerCase(),
+    listen: file.listen === undefined ? true : truthy(file.listen),
+  };
+}
+
+const RELAY_PIN_SETTING = 'a2a.relayCertSha256';
+
+/**
+ * Relay options for the node, or null when off. With no configured pin, the
+ * first certificate seen is pinned and stored (per relay URL) in cc_settings,
+ * so a later certificate change is refused.
+ */
+export function relayOptions(cfg: DaemonConfig, sql: SqlHandle): RelayNodeOptions | null {
+  if (!cfg.relayEnabled || !cfg.relayUrl) return null;
+  const key = `${RELAY_PIN_SETTING}:${cfg.relayUrl}`;
+  return {
+    url: cfg.relayUrl,
+    certSha256: cfg.relayCertSha256 || getSetting(sql, key) || null,
+    onPinLearned: (fp) => setSetting(sql, key, fp),
   };
 }
 
@@ -187,6 +221,8 @@ export async function main(): Promise<void> {
     userName: cfg.displayName.toLowerCase().split(/\s+/)[0],
     appVersion: PLUGIN_VERSION,
     watchCheck: (command, cwd, shell, timeoutMs) => runConditionCheck(command, cwd || dir, shell, timeoutMs),
+    relay: relayOptions(cfg, db.sql),
+    listen: cfg.listen,
   });
   await core.start();
   const token = randomBytes(32).toString('base64url');

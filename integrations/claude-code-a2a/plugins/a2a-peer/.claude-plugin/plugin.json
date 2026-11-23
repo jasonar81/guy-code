@@ -29,6 +29,24 @@
       "title": "Allowed peer networks",
       "description": "Comma-separated CIDR ranges allowed to reach your endpoint, normally the VPN range.",
       "default": "10.0.0.0/8"
+    },
+    "relay_enabled": {
+      "type": "boolean",
+      "title": "Use an A2A relay",
+      "description": "Reach peers through a relay when they cannot be reached directly (e.g. two laptops on a Fortinet VPN). Messages are end-to-end encrypted; the relay sees only who talks to whom. Off by default.",
+      "default": false
+    },
+    "relay_url": {
+      "type": "string",
+      "title": "Relay URL",
+      "description": "e.g. https://net1:7429. Empty = no relay.",
+      "default": ""
+    },
+    "relay_cert_sha256": {
+      "type": "string",
+      "title": "Relay certificate SHA-256 (optional)",
+      "description": "Pin for the relay's TLS certificate. Leave empty to pin the first certificate seen (recorded in the plugin data directory).",
+      "default": ""
     }
   }
 }

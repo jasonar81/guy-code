@@ -363,6 +363,16 @@ export interface A2APanelSnapshot {
   tasks: A2APanelTask[];
 }
 
+/** A2A relay connection (design 11a), for the Agents panel. Mirrors electron/a2a/index.ts. */
+export interface A2ARelayStatus {
+  enabled: boolean;
+  url: string;
+  relayCertSha256: string;
+  state: 'connected' | 'connecting' | 'disconnected' | 'off';
+  lastError: string | null;
+  connectedSince: number | null;
+}
+
 export interface AuditEventRow {
   id: number;
   ts: number;
@@ -561,6 +571,8 @@ declare global {
         invite: () => Promise<{ code: string; expires: number }>;
         revoke: (peerId: string) => Promise<void>;
         audit: (limit?: number) => Promise<Array<Record<string, unknown>>>;
+        relayStatus: () => Promise<A2ARelayStatus>;
+        setRelay: (url: string, enabled: boolean) => Promise<{ ok: boolean; message: string; status: A2ARelayStatus }>;
       };
       settings: {
         get: (key: string) => Promise<string | null>;

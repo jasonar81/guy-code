@@ -46,9 +46,9 @@ import { broadcastAgentEvent, broadcastStateChanged } from '../agentEvents';
 import { resolveSession, postSlackLine } from '../slackBridge';
 import { decideTimerWake, messageConcerns, renameInWait, type WaitA2AState, type WaitPort } from './waiters';
 import type { PeerRow, TaskRow } from './store';
-import { A2A_SETTING, A2A_TLS_KEY_SECRET, readA2AConfig, resolveAdvertiseHost, resolveBindAddress } from './config';
+import { A2A_SETTING, A2A_TLS_KEY_SECRET, normaliseRelayUrl, readA2AConfig, resolveAdvertiseHost, resolveBindAddress } from './config';
 import { generateSelfSignedCert, fingerprintOfPem, type TlsIdentity } from './tls';
-import { A2ANode } from './node';
+import { A2ANode, type RelayNodeOptions } from './node';
 import { relayNoteForPeer } from './relayCrypto';
 import type { RoutableSession, SessionPort } from './router';
 import type { SqlHandle } from './store';
@@ -318,6 +318,13 @@ export async function startA2A(): Promise<void> {
     const advertiseHost = resolveAdvertiseHost(host, cfg);
     const tls = cfg.insecureHttp ? null : loadOrCreateTlsIdentity(advertiseHost);
     const node = new A2ANode({
+      // Relay (design 11a): off unless the user turned it on AND gave a URL.
+      relay: relayOptionsFromSettings(),
+      onRelayStatus: () => broadcastAgentEvent({ type: 'a2a_changed' }),
+      onRelayDropped: (n) => {
+        const peer = _node?.store.listPeers().find((p) => p.cert_sha256.toLowerCase() === n.to.toLowerCase());
+        notifyUser('A2A message not delivered', `The relay dropped a message to ${peer?.display_name || peer?.peer_id || 'a peer'}: ${n.reason}`);
+      },
       sql: db() as unknown as SqlHandle,
       secrets: { set: setSecret, get: getSecret, clear: clearSecret },
       sessions: sessionPort,
@@ -351,6 +358,66 @@ export async function startA2A(): Promise<void> {
   } finally {
     _starting = null;
   }
+}
+
+function relayOptionsFromSettings(): RelayNodeOptions | null {
+  const cfg = readA2AConfig(getSetting);
+  if (!cfg.relayEnabled || !cfg.relayUrl) return null;
+  return {
+    url: cfg.relayUrl,
+    certSha256: cfg.relayCertSha256 || null,
+    // Trust on first use: record the relay's certificate so a later change is refused.
+    onPinLearned: (fp) => setSetting(A2A_SETTING.relayCertSha256, fp),
+  };
+}
+
+function notifyUser(title: string, body: string): void {
+  try {
+    if (Notification.isSupported()) new Notification({ title, body }).show();
+  } catch {
+    /* best effort */
+  }
+  broadcastAgentEvent({ type: 'a2a_changed' });
+}
+
+export interface A2ARelayPanelStatus {
+  enabled: boolean;
+  url: string;
+  relayCertSha256: string;
+  state: 'connected' | 'connecting' | 'disconnected' | 'off';
+  lastError: string | null;
+  connectedSince: number | null;
+}
+
+/** Relay status for the Agents panel. Never includes the session token. */
+export function a2aRelayStatus(): A2ARelayPanelStatus {
+  const cfg = readA2AConfig(getSetting);
+  const s = _node?.relayStatus() ?? null;
+  return {
+    enabled: cfg.relayEnabled,
+    url: cfg.relayUrl,
+    relayCertSha256: cfg.relayCertSha256,
+    state: s ? s.state : 'off',
+    lastError: s?.lastError ?? null,
+    connectedSince: s?.connectedSince ?? null,
+  };
+}
+
+/**
+ * Change the relay settings from the Agents panel and apply them live. A new
+ * URL forgets the old pin (it belonged to the old relay) and pins on first use.
+ */
+export function a2aSetRelay(opts: { url: string; enabled: boolean }): A2ARelayPanelStatus {
+  const prev = readA2AConfig(getSetting);
+  const url = normaliseRelayUrl(opts.url);
+  if (String(opts.url ?? '').trim() && !url) throw new Error('The relay URL must look like https://host:7429');
+  if (url !== prev.relayUrl) setSetting(A2A_SETTING.relayCertSha256, '');
+  setSetting(A2A_SETTING.relayUrl, url);
+  setSetting(A2A_SETTING.relayEnabled, opts.enabled && url ? '1' : '');
+  _node?.audit.write({ event: 'relay.configured', url, enabled: !!(opts.enabled && url), by: 'user' });
+  if (_node?.isRunning()) _node.setRelay(relayOptionsFromSettings());
+  broadcastAgentEvent({ type: 'a2a_changed' });
+  return a2aRelayStatus();
 }
 
 export async function stopA2A(): Promise<void> {

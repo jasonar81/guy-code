@@ -19,6 +19,13 @@ import * as http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import type { DaemonCore } from './core';
+import type { RelayStatus } from './shared/protocol';
+
+/** One status line for the relay (design 11a). */
+export function relayLine(s: RelayStatus | null): string {
+  if (!s) return 'Relay: off';
+  return `Relay: ${s.state} (${s.url})${s.lastError && s.state !== 'connected' ? ` - last error: ${s.lastError}` : ''}`;
+}
 import {
   hookSessionEnd,
   hookSessionStart,
@@ -230,6 +237,7 @@ export function startLocalApi(core: DaemonCore, token: string, opts: { port?: nu
           `A2A endpoint: ${core.node.isRunning() ? core.node.origin() : 'not running'} (certificate sha256 ${core.node.fingerprint().slice(0, 16)}...)`,
           `This session: ${s ? `${s.session_id.slice(0, 8)} in ${s.cwd ?? '?'}, label "${s.label ?? s.project ?? ''}"` : 'not registered'}`,
           `Delivery: ${mode}`,
+          relayLine(core.node.relayStatus()),
           core.digest(ctx.sessionId),
         ];
         return send(res, 200, { text: lines.join('\n') });

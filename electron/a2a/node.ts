@@ -29,8 +29,15 @@ import { createA2AServer, type A2AServer } from './server';
 import { A2AStore, hashMatches, sha256Hex, type OutboxRow, type PeerRow, type SecretPort, type SqlHandle, type TaskRow } from './store';
 import { deliver, deliverRouted, deliveryMode, gate, routeSession, type DeliveryResult, type InboundForRouting, type SessionPort } from './router';
 import { acceptPair, createInvite, redeemCode, type LocalIdentity } from './pairing';
+import { RelayClient, type RelayDropNotice, type RelayStatus } from './relayClient';
+import { deriveRelayKey, deriveRelayKeyFromPublicKey, publicKeyFromRelayKey, relayAvailableForPeer } from './relayCrypto';
+import { normaliseFingerprint } from './tls';
+import { normaliseRelayUrl } from './config';
+import type { PairingCodePayload } from './types';
 import {
   A2AClientError,
+  RELAY_SCHEME,
+  type RelayRoute,
   baseUrlOf,
   cancelTask as clientCancelTask,
   fetchExtendedCard,
@@ -153,6 +160,30 @@ export interface A2ANodeOptions {
    * default; tests switch it off and call `sweepWatches()` with a fake clock.
    */
   autoWatch?: boolean;
+  /**
+   * Relay transport (design 11a). Null/omitted = off, exactly as before.
+   * Needs a TLS identity (the relay login and the end-to-end key both use it).
+   */
+  relay?: RelayNodeOptions | null;
+  /**
+   * Listen on host:port (default true). False = relay-only: no socket is ever
+   * opened for listening, the card URL is relay://<our fingerprint>, and
+   * every request arrives over the relay stream.
+   */
+  listen?: boolean;
+  onRelayStatus?(s: RelayStatus): void;
+  /** The relay reports a message of ours was never delivered (already audited). */
+  onRelayDropped?(n: RelayDropNotice): void;
+}
+
+export interface RelayNodeOptions {
+  url: string;
+  /** Pinned relay TLS fingerprint; empty = pin on first use (reported via onPinLearned). */
+  certSha256?: string | null;
+  onPinLearned?(fingerprint: string): void;
+  replyWaitMs?: number;
+  backoff?: { baseMs: number; maxMs: number };
+  staleMs?: number;
 }
 
 export interface WatchArgs {
@@ -212,6 +243,10 @@ export class A2ANode {
   readonly audit: AuditLog;
   readonly waiters: Waiters;
   private server: A2AServer | null = null;
+  private listening = false;
+  private relay: RelayClient | null = null;
+  private relayOpts: RelayNodeOptions | null = null;
+  private readonly relayKeys = new Map<string, { pem: string; key: Buffer }>();
   private readonly now: () => number;
   private readonly agentKind: AgentKind;
   private flushTimer: NodeJS.Timeout | null = null;
@@ -277,14 +312,16 @@ export class A2ANode {
         push: (p, body, tok) => this.onPush(p, body, tok),
         unpaired: (p) => this.onUnpaired(p),
         onPeerSeen: (p) => this.onPeerSeen(p),
-        pair: async (req, remote) => {
+        pair: async (req, remote, ctx) => {
           try {
             const { response, peer } = await acceptPair(this.store, req, this.identity(), {
               allowHttp: !!this.opts.insecureHttp,
               now: this.now(),
               verifyPeerCard: this.opts.verifyPeerCardOnPair,
+              relayFrom: ctx?.relayFrom,
             });
-            this.audit.write({ event: 'pair.accepted', peer: peer.peer_id, displayName: peer.display_name, cardUrl: peer.card_url, remote });
+            this.relayKeys.delete(normaliseFingerprint(peer.cert_sha256));
+            this.audit.write({ event: 'pair.accepted', peer: peer.peer_id, displayName: peer.display_name, cardUrl: peer.card_url, remote, via: ctx?.relayFrom ? 'relay' : 'direct' });
             this.changed();
             return response;
           } catch (e) {
@@ -295,9 +332,11 @@ export class A2ANode {
         onRejected: (info) => this.audit.write({ event: 'inbound.rejected', ...info }),
       },
     });
-    await server.start();
+    this.listening = this.opts.listen !== false;
+    if (this.listening) await server.start();
     this.server = server;
-    this.audit.write({ event: 'server.started', url: this.origin() });
+    this.audit.write({ event: 'server.started', url: this.origin(), listening: this.listening });
+    if (this.opts.relay) this.setRelay(this.opts.relay);
     if (this.opts.autoFlush !== false) {
       this.flushTimer = setInterval(() => void this.flushOutbox().catch(() => {}), OUTBOX_TICK_MS);
       this.flushTimer.unref?.();
@@ -313,10 +352,13 @@ export class A2ANode {
     this.watches.stopAll();
     if (this.flushTimer) clearInterval(this.flushTimer);
     this.flushTimer = null;
+    this.relay?.stop();
+    this.relay = null;
     const s = this.server;
     this.server = null;
     if (s) {
-      await s.stop();
+      if (this.listening) await s.stop();
+      this.listening = false;
       this.audit.write({ event: 'server.stopped' });
     }
   }
@@ -325,9 +367,135 @@ export class A2ANode {
     return !!this.server;
   }
 
+  /** False in relay-only mode (listen: false). */
+  isListening(): boolean {
+    return !!this.server && this.listening;
+  }
+
   origin(): string {
     if (!this.server) throw new Error('A2A server is not running');
+    // Relay-only: our "address" is our certificate fingerprint at the relay.
+    if (!this.listening) return `${RELAY_SCHEME}//${this.fingerprint()}`;
     return this.server.origin(this.opts.advertiseHost);
+  }
+
+  // ---- relay (design 11a) -------------------------------------------------------
+
+  /**
+   * Start, replace or (null) stop the relay connection. Safe at any time
+   * while running; index.ts calls it when the user changes the relay settings.
+   */
+  setRelay(cfg: RelayNodeOptions | null): void {
+    this.relay?.stop();
+    this.relay = null;
+    this.relayOpts = cfg;
+    const url = cfg ? normaliseRelayUrl(cfg.url) : '';
+    if (!cfg || !url || !this.server) {
+      this.changed();
+      return;
+    }
+    if (!this.opts.tls) {
+      this.opts.log?.warn('[a2a] relay needs a TLS identity; not starting it');
+      return;
+    }
+    const tls = this.opts.tls;
+    this.relay = new RelayClient({
+      url,
+      identity: { certPem: tls.certPem, keyPem: tls.keyPem, fingerprint: tls.fingerprint },
+      relayCertSha256: cfg.certSha256 || null,
+      onPinLearned: (fp) => {
+        this.audit.write({ event: 'relay.pinned', url, sha256: fp });
+        cfg.onPinLearned?.(fp);
+      },
+      keyFor: (fp) => this.relayKeyFor(fp),
+      handle: async (r) => {
+        const server = this.server;
+        if (!server) return { status: 503, body: { error: { code: 503, status: 'UNAVAILABLE', message: 'A2A is stopping.' } } };
+        return server.handleRelayed({ ...r.payload, from: r.from });
+      },
+      onDropped: (n) => this.onRelayDropped(n),
+      onStatus: (s) => {
+        try {
+          this.opts.onRelayStatus?.(s);
+        } catch {
+          /* UI nicety */
+        }
+        this.changed();
+      },
+      onReady: () => this.onRelayReady(),
+      replyWaitMs: cfg.replyWaitMs,
+      backoff: cfg.backoff,
+      staleMs: cfg.staleMs,
+      log: this.opts.log,
+    });
+    this.relay.start();
+  }
+
+  relayStatus(): RelayStatus | null {
+    return this.relay?.status() ?? null;
+  }
+
+  /** The live relay connection (tests, diagnostics). */
+  relayClient(): RelayClient | null {
+    return this.relay;
+  }
+
+  /** Pair key for a paired peer's fingerprint, or null (unknown peer, or paired before relay support). */
+  private relayKeyFor(fp: string): Buffer | null {
+    const want = normaliseFingerprint(fp);
+    const peer = this.store.listPeers().find((p) => normaliseFingerprint(p.cert_sha256) === want);
+    if (!peer || !peer.cert_pem || !this.opts.tls || !relayAvailableForPeer(peer).ok) return null;
+    const hit = this.relayKeys.get(want);
+    if (hit && hit.pem === peer.cert_pem) return hit.key;
+    try {
+      const key = deriveRelayKey(this.opts.tls.keyPem, peer.cert_pem, this.fingerprint(), want);
+      this.relayKeys.set(want, { pem: peer.cert_pem, key });
+      return key;
+    } catch {
+      return null;
+    }
+  }
+
+  private relayRouteFor(peer: PeerRow): RelayRoute | undefined {
+    const relayOnly = peer.card_url.startsWith(RELAY_SCHEME);
+    if (!this.relay) return relayOnly ? { client: null, key: null } : undefined;
+    const avail = relayAvailableForPeer(peer);
+    if (!avail.ok) return { client: this.relay, key: null, unavailable: avail.reason };
+    const key = this.relayKeyFor(peer.cert_sha256);
+    return key ? { client: this.relay, key } : { client: this.relay, key: null, unavailable: 'the relay key could not be derived; re-pair to use the relay' };
+  }
+
+  /** Route for redeeming a pairing code through the relay (the inviter's key comes from the code). */
+  private pairingRouteFor(p: PairingCodePayload): RelayRoute | undefined {
+    if (!p.relayKey) return undefined;
+    const expectedUrl = normaliseRelayUrl(p.relayUrl) || undefined;
+    if (!this.relay || !this.opts.tls) return { client: null, key: null, expectedUrl };
+    try {
+      const key = deriveRelayKeyFromPublicKey(this.opts.tls.keyPem, publicKeyFromRelayKey(p.relayKey), this.fingerprint(), p.certSha256);
+      return { client: this.relay, key, pairing: true, expectedUrl };
+    } catch (e) {
+      return { client: this.relay, key: null, unavailable: (e as Error).message, expectedUrl };
+    }
+  }
+
+  private onRelayReady(): void {
+    this.audit.write({ event: 'relay.connected', url: this.relay?.url });
+    // Anything that queued while we (or the relay) were away is worth trying now.
+    let n = 0;
+    for (const p of this.store.listPeers()) n += this.store.expediteOutbox(p.peer_id, this.now());
+    if (n > 0) this.kickFlush();
+  }
+
+  private onRelayDropped(n: RelayDropNotice): void {
+    const peer = this.store.listPeers().find((p) => normaliseFingerprint(p.cert_sha256) === normaliseFingerprint(n.to));
+    this.audit.write({ event: 'relay.dropped', peer: peer?.peer_id ?? n.to.slice(0, 12), msgId: n.msgId.slice(0, 16), reason: n.reason });
+    this.opts.log?.warn(`[a2a] relay did not deliver a message to ${peer?.peer_id ?? n.to.slice(0, 12)}: ${n.reason}`);
+    try {
+      this.opts.onRelayDropped?.(n);
+    } catch {
+      /* best effort */
+    }
+    this.changed();
   }
 
   cardUrl(): string {
@@ -345,6 +513,7 @@ export class A2ANode {
       certPem: this.opts.tls?.certPem,
       displayName: this.opts.displayName,
       agentKind: this.agentKind,
+      relayUrl: this.relay?.url,
     };
   }
 
@@ -1364,7 +1533,7 @@ export class A2ANode {
   private endpointFor(peer: PeerRow, withToken = true) {
     const token = withToken ? this.store.getOutboundToken(peer) : undefined;
     if (withToken && !token) throw new Error(`No stored token for ${peer.peer_id}. Re-pair with them.`);
-    return { baseUrl: baseUrlOf(peer.card_url), certSha256: peer.cert_sha256, token: token ?? undefined };
+    return { baseUrl: baseUrlOf(peer.card_url), certSha256: peer.cert_sha256, token: token ?? undefined, relay: this.relayRouteFor(peer) };
   }
 
   /** Resolve a peer by handle or (case-insensitive) display name. */
@@ -1632,13 +1801,15 @@ export class A2ANode {
   // ---- pairing -------------------------------------------------------------
 
   invite(): { code: string; expires: number } {
+    if (!this.listening && !this.relay) throw new Error('This agent does not listen on a port and has no relay configured, so nobody could redeem a pairing code. Set a relay URL first.');
     const inv = createInvite(this.store, this.identity(), LIMITS.inviteTtlMs, this.now());
     this.audit.write({ event: 'pair.invite', inviteId: inv.inviteId, expires: inv.expires });
     return { code: inv.code, expires: inv.expires };
   }
 
   async redeem(code: string): Promise<PeerRow> {
-    const peer = await redeemCode(this.store, code, this.identity(), this.now());
+    const peer = await redeemCode(this.store, code, this.identity(), this.now(), (p) => this.pairingRouteFor(p));
+    this.relayKeys.delete(normaliseFingerprint(peer.cert_sha256));
     this.audit.write({ event: 'pair.redeemed', peer: peer.peer_id, displayName: peer.display_name, cardUrl: peer.card_url });
     this.changed();
     return peer;

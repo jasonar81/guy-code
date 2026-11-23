@@ -17,11 +17,13 @@
  * stored only as a SHA-256 and compared in constant time (store.consumeInvite).
  * A leaked code after redemption is useless.
  */
+import { timingSafeEqual } from 'node:crypto';
 import { A2AProtocolError } from './errors';
 import { fingerprintOfPem, normaliseFingerprint } from './tls';
 import { newToken, type A2AStore, type PeerRow } from './store';
 import type { AgentKind, PairingCodePayload, PairRequest, PairResponse } from './types';
-import { CertPinMismatchError, baseUrlOf, fetchCard, redeemPairing } from './client';
+import { CertPinMismatchError, RELAY_SCHEME, baseUrlOf, fetchCard, redeemPairing, type PeerEndpoint, type RelayRoute } from './client';
+import { relayPublicKeyOf } from './relayCrypto';
 
 export const PAIRING_CODE_PREFIX = 'a2a1:';
 
@@ -46,10 +48,15 @@ export function decodePairingCode(code: string): PairingCodePayload {
   }
   try {
     const u = new URL(p.cardUrl);
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('bad scheme');
+    if (u.protocol !== 'https:' && u.protocol !== 'http:' && u.protocol !== RELAY_SCHEME) throw new Error('bad scheme');
+    // relay://<fingerprint> must name the same identity the code pins.
+    if (u.protocol === RELAY_SCHEME && normaliseFingerprint(u.host) !== fp) throw new Error('bad relay address');
   } catch {
     throw new Error('The pairing code has an invalid address in it.');
   }
+  if (p.relayKey !== undefined && (typeof p.relayKey !== 'string' || p.relayKey.length > 1024)) throw new Error('The pairing code is damaged (bad relay key). Ask for a fresh one.');
+  if (p.relayUrl !== undefined && typeof p.relayUrl !== 'string') throw new Error('The pairing code is damaged (bad relay URL). Ask for a fresh one.');
+  if (new URL(p.cardUrl).protocol === RELAY_SCHEME && !p.relayKey) throw new Error('The pairing code is incomplete (no relay key). Ask for a fresh one.');
   return { ...p, certSha256: fp, displayName: String(p.displayName ?? '') };
 }
 
@@ -64,6 +71,8 @@ export interface LocalIdentity {
   certPem?: string;
   displayName: string;
   agentKind: AgentKind;
+  /** The relay we are connected to, if any: invites then carry it so a redeemer can find us there. */
+  relayUrl?: string;
 }
 
 /**
@@ -90,8 +99,20 @@ export function createInvite(store: A2AStore, me: LocalIdentity, ttlMs: number, 
     inviteSecret: inv.inviteSecret,
     expires: inv.expires,
     displayName: me.displayName,
+    ...(me.relayUrl && me.certPem ? { relayUrl: me.relayUrl, relayKey: relayPublicKeyOf(me.certPem) } : {}),
   });
   return { code, expires: inv.expires, inviteId: inv.inviteId };
+}
+
+/** Same public key in a certificate and a relay-key string? */
+function certCarriesKey(certPem: string, relayKey: string): boolean {
+  try {
+    const a = Buffer.from(relayPublicKeyOf(certPem), 'base64url');
+    const b = Buffer.from(relayKey, 'base64url');
+    return a.length === b.length && timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -103,7 +124,18 @@ export async function acceptPair(
   store: A2AStore,
   req: PairRequest,
   me: LocalIdentity,
-  opts: { allowHttp: boolean; now?: number; verifyPeerCard?: boolean }
+  opts: {
+    allowHttp: boolean;
+    now?: number;
+    verifyPeerCard?: boolean;
+    /**
+     * Set when the request came through the relay: the sender fingerprint the
+     * relay verified by signature. The request must name exactly that
+     * identity and carry the matching certificate (it is how we will reach
+     * them back), which replaces the card check below.
+     */
+    relayFrom?: string;
+  }
 ): Promise<{ response: PairResponse; peer: PeerRow }> {
   const bad = (msg: string) => new A2AProtocolError(400, 'INVALID_REQUEST', msg);
   if (!req || typeof req !== 'object') throw bad('Body must be a pairing request object.');
@@ -118,12 +150,18 @@ export async function acceptPair(
   } catch {
     throw bad('myCardUrl is not a URL.');
   }
-  if (cardUrl.protocol !== 'https:' && !(opts.allowHttp && cardUrl.protocol === 'http:')) throw bad('myCardUrl must be https.');
+  const relayCard = cardUrl.protocol === RELAY_SCHEME;
+  if (cardUrl.protocol !== 'https:' && !relayCard && !(opts.allowHttp && cardUrl.protocol === 'http:')) throw bad('myCardUrl must be https.');
+  if (relayCard && normaliseFingerprint(cardUrl.host) !== fp) throw bad('A relay:// myCardUrl must name myCertSha256.');
   // A PEM that does not match the fingerprint the request names is a lie about
   // its own identity, like a card pin mismatch below. Checked before the invite
   // is burned. Absent is fine (older builds): no relay for that peer.
   const certPem = pinnedCertPem(req.myCertPem, fp);
   if (req.myCertPem !== undefined && req.myCertPem !== null && !certPem) throw bad('myCertPem does not match myCertSha256.');
+  // Through the relay the sender's identity is the one the relay proved.
+  if (opts.relayFrom !== undefined && normaliseFingerprint(opts.relayFrom) !== fp) throw bad('myCertSha256 is not the identity that sent this request through the relay.');
+  // We could never reach a relay-only peer without its certificate.
+  if ((relayCard || opts.relayFrom !== undefined) && !certPem) throw bad('Pairing through the relay needs myCertPem.');
 
   const check = store.consumeInvite(String(req.inviteId ?? ''), String(req.inviteSecret ?? ''), opts.now);
   if (check !== 'ok') {
@@ -143,8 +181,10 @@ export async function acceptPair(
   // claims, and keep its card. A pin mismatch means the request is lying about
   // its own identity, so refuse. Unreachable is tolerated: inform traffic from
   // them to us still works, and the first call back will surface the problem.
+  // (Skipped for relay pairings: there is no address to dial, and the relay
+  // proof plus myCertPem already bind the request to that certificate.)
   let cardJson: string | null = null;
-  if (opts.verifyPeerCard !== false) {
+  if (opts.verifyPeerCard !== false && !relayCard && opts.relayFrom === undefined) {
     try {
       const card = await fetchCard({ baseUrl: baseUrlOf(cardUrl.toString()), certSha256: fp }, 3000);
       cardJson = JSON.stringify(card);
@@ -155,7 +195,7 @@ export async function acceptPair(
     }
   }
 
-  const displayName = String(req.myDisplayName ?? '').slice(0, 80) || cardUrl.hostname;
+  const displayName = String(req.myDisplayName ?? '').slice(0, 80) || (relayCard ? `peer-${fp.slice(0, 8)}` : cardUrl.hostname);
   const agentKind: AgentKind = req.myAgentKind === 'guycode' || req.myAgentKind === 'claude-code' ? req.myAgentKind : 'other';
   const tokenForMeToCallYou = newToken();
   const peerId = store.allocatePeerId(displayName, cardUrl.toString());
@@ -177,14 +217,26 @@ export async function acceptPair(
   };
 }
 
-/** Client side: redeem a code someone sent us. Returns the stored peer. */
-export async function redeemCode(store: A2AStore, code: string, me: LocalIdentity, now = Date.now()): Promise<PeerRow> {
+/**
+ * Client side: redeem a code someone sent us. Returns the stored peer.
+ *
+ * `relayRoute` (node.ts) supplies the relay fallback when the code carries a
+ * relay key: direct is still tried first, exactly as before, and the relay is
+ * used only if the inviter is unreachable (or has no address at all).
+ */
+export async function redeemCode(
+  store: A2AStore,
+  code: string,
+  me: LocalIdentity,
+  now = Date.now(),
+  relayRoute?: (p: PairingCodePayload) => RelayRoute | undefined
+): Promise<PeerRow> {
   const p = decodePairingCode(code);
   if (now > p.expires) throw new Error('This pairing code has expired (codes last 15 minutes). Ask for a fresh one.');
   if (normaliseFingerprint(p.certSha256) === normaliseFingerprint(me.certSha256)) {
     throw new Error('That is your own pairing code. Send it to the other person instead.');
   }
-  const ep = { baseUrl: baseUrlOf(p.cardUrl), certSha256: p.certSha256 };
+  const ep: PeerEndpoint = { baseUrl: baseUrlOf(p.cardUrl), certSha256: p.certSha256, relay: relayRoute?.(p) };
   // Fetch the card first: it proves the pin before we send anything that matters.
   const card = await fetchCard(ep, 5000);
   const tokenForYouToCallMe = newToken();
@@ -201,6 +253,15 @@ export async function redeemCode(store: A2AStore, code: string, me: LocalIdentit
   if (!res || typeof res.tokenForMeToCallYou !== 'string' || res.tokenForMeToCallYou.length < 32) {
     throw new Error('The other agent answered the pairing request with something unexpected.');
   }
+  // The code's relay key and the certificate the inviter returns must agree:
+  // a code that pins one certificate but advertises another key is forged.
+  if (p.relayKey && typeof res.certPem === 'string' && pinnedCertPem(res.certPem, p.certSha256) && !certCarriesKey(res.certPem, p.relayKey)) {
+    throw new Error('The pairing code\'s relay key does not match the other agent\'s certificate. Ask for a fresh code.');
+  }
+  const certPem = pinnedCertPem(res.certPem, p.certSha256);
+  if (new URL(p.cardUrl).protocol === RELAY_SCHEME && !certPem) {
+    throw new Error('The other agent did not send its certificate, so it could never be reached through the relay.');
+  }
   const displayName = String(res.displayName || p.displayName || card.name || new URL(p.cardUrl).hostname).slice(0, 80);
   const agentKind: AgentKind = res.agentKind === 'guycode' || res.agentKind === 'claude-code' ? res.agentKind : 'other';
   return store.savePairedPeer({
@@ -214,7 +275,7 @@ export async function redeemCode(store: A2AStore, code: string, me: LocalIdentit
     cardJson: JSON.stringify(card),
     // Only kept if it hashes to the pin from the code (and so matches the cert
     // the TLS connection just proved). Otherwise null: no relay for this peer.
-    certPem: pinnedCertPem(res.certPem, p.certSha256),
+    certPem,
     now,
   });
 }

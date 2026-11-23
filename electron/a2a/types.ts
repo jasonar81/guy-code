@@ -302,6 +302,16 @@ export interface PairingCodePayload {
   /** epoch ms */
   expires: number;
   displayName: string;
+  /**
+   * Relay (design 11a): the relay the inviter is connected to, and the
+   * inviter's certificate public key (base64url SPKI DER). With these a
+   * redeemer that cannot reach `cardUrl` - or whose cardUrl is
+   * relay://<fingerprint> because the inviter does not listen at all - can
+   * seal the pairing request to the inviter through the relay. Absent in
+   * codes from builds without relay support.
+   */
+  relayUrl?: string;
+  relayKey?: string;
 }
 
 /**

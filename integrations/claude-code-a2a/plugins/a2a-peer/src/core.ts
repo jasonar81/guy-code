@@ -35,6 +35,7 @@ import {
   type TaskRow,
   type TlsIdentity,
   type WatchCheckFn,
+  type RelayNodeOptions,
 } from './shared/protocol';
 import { CcStore, type InboxRow } from './inbox';
 import { ccSessionPort, HELD, metaFromEnvelope } from './port';
@@ -57,6 +58,10 @@ export interface DaemonCoreOptions {
   autoFlush?: boolean;
   autoWatch?: boolean;
   verifyPeerCardOnPair?: boolean;
+  /** Relay transport (design 11a); null/omitted = off. */
+  relay?: RelayNodeOptions | null;
+  /** False = relay-only, never listen on a port. */
+  listen?: boolean;
 }
 
 /** A live MCP connection's event stream (daemon.ts wires SSE; tests use a recorder). */
@@ -99,6 +104,8 @@ export class DaemonCore {
       autoWatch: opts.autoWatch,
       watchCheck: opts.watchCheck,
       verifyPeerCardOnPair: opts.verifyPeerCardOnPair,
+      relay: opts.relay ?? null,
+      listen: opts.listen,
       onApprovalNeeded: (task, peer, text) => this.onApprovalNeeded(task, peer, text),
       onTaskEvent: (ev) => this.onTaskEvent(ev),
     });

@@ -16,6 +16,10 @@ import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export type AuditEvent =
+  | 'relay.configured'
+  | 'relay.pinned'
+  | 'relay.connected'
+  | 'relay.dropped'
   | 'inbound.message'
   | 'inbound.rejected'
   | 'inbound.duplicate'

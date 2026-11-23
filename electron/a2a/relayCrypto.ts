@@ -55,21 +55,30 @@ export class RelayCryptoError extends Error {
  * 32 bytes. Fingerprint order does not matter.
  */
 export function deriveRelayKey(myPrivateKeyPem: string, theirCertPem: string, myFingerprint: string, theirFingerprint: string): Buffer {
+  let publicKey: crypto.KeyObject;
+  try {
+    publicKey = new crypto.X509Certificate(theirCertPem).publicKey;
+  } catch {
+    throw new RelayCryptoError("The peer's stored certificate could not be read.");
+  }
+  return deriveRelayKeyFromPublicKey(myPrivateKeyPem, publicKey, myFingerprint, theirFingerprint);
+}
+
+/**
+ * Same derivation from the peer's bare public key. Used only for pairing
+ * through the relay (step 3): the redeemer has the inviter's fingerprint and
+ * public key from the pairing code, but not yet its certificate.
+ */
+export function deriveRelayKeyFromPublicKey(myPrivateKeyPem: string, publicKey: crypto.KeyObject, myFingerprint: string, theirFingerprint: string): Buffer {
   const a = normaliseFingerprint(myFingerprint);
   const b = normaliseFingerprint(theirFingerprint);
   if (a.length !== 64 || b.length !== 64) throw new RelayCryptoError('Relay key derivation needs two SHA-256 certificate fingerprints.');
   if (a === b) throw new RelayCryptoError('Relay key derivation needs two different peers (both fingerprints are the same).');
   let privateKey: crypto.KeyObject;
-  let publicKey: crypto.KeyObject;
   try {
     privateKey = crypto.createPrivateKey(myPrivateKeyPem);
   } catch {
     throw new RelayCryptoError('Our own TLS private key could not be read.');
-  }
-  try {
-    publicKey = new crypto.X509Certificate(theirCertPem).publicKey;
-  } catch {
-    throw new RelayCryptoError("The peer's stored certificate could not be read.");
   }
   if (privateKey.asymmetricKeyType !== 'ec' || publicKey.asymmetricKeyType !== 'ec') {
     throw new RelayCryptoError('Relay encryption needs EC (P-256) certificates on both sides.');
@@ -114,6 +123,23 @@ export function openEnvelope<T = RelayPayload>(key: Buffer, env: SealedEnvelope)
   } catch {
     throw new RelayCryptoError('Relay envelope decrypted but is not valid JSON.');
   }
+}
+
+/** A certificate's public key as base64url SPKI DER: what a relay pairing code carries (~122 chars). */
+export function relayPublicKeyOf(certPem: string): string {
+  return (new crypto.X509Certificate(certPem).publicKey.export({ type: 'spki', format: 'der' }) as Buffer).toString('base64url');
+}
+
+/** Inverse of relayPublicKeyOf. Throws RelayCryptoError on anything that is not an EC key. */
+export function publicKeyFromRelayKey(spki: string): crypto.KeyObject {
+  let k: crypto.KeyObject;
+  try {
+    k = crypto.createPublicKey({ key: Buffer.from(spki, 'base64url'), format: 'der', type: 'spki' });
+  } catch {
+    throw new RelayCryptoError('The relay key in the pairing code is unreadable.');
+  }
+  if (k.asymmetricKeyType !== 'ec') throw new RelayCryptoError('The relay key in the pairing code is not EC P-256.');
+  return k;
 }
 
 /** The bits of a peer row the relay check needs. */

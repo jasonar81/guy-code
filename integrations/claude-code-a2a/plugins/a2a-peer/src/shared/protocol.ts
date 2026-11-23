@@ -23,6 +23,10 @@ export { lastPathSegment, type RoutableSession, type SessionPort } from '../../.
 export { buildEnvelope, parseEnvelope, HEADER_PREFIX } from '../../../../../../electron/a2a/envelope';
 export { generateSelfSignedCert, fingerprintOfPem, type TlsIdentity } from '../../../../../../electron/a2a/tls';
 export { relayNoteForPeer } from '../../../../../../electron/a2a/relayCrypto';
+// Relay client transport (design 11a step 3). A2ANode drives it; the daemon only passes settings.
+export { RelayClient, type RelayStatus, type RelayDropNotice } from '../../../../../../electron/a2a/relayClient';
+export { type RelayNodeOptions } from '../../../../../../electron/a2a/node';
+export { normaliseRelayUrl } from '../../../../../../electron/a2a/config';
 // CLAUDE_CODE_DEFAULT_PORT (7428) is what this plugin listens on. DEFAULT_PORT
 // (7427) is Guy Code's and is re-exported only so the two can be named in
 // error messages - the daemon must never fall back to it, or both would fight

@@ -935,6 +935,31 @@ A peer record keeps its direct endpoint. The client tries direct, and falls back
 the peer is unreachable, so a pair who *can* reach each other (two servers, or a LAN) keeps the
 lower-latency path and the relay carries only what it must.
 
+### Client (step 3, shipped) - `electron/a2a/relayClient.ts`
+- Settings `a2a.relayEnabled` (default off) + `a2a.relayUrl` + `a2a.relayCertSha256` (empty = pin on
+  first use, then saved). Plugin: `relay_enabled` / `relay_url` / `relay_cert_sha256`, and
+  `"listen": false` in config.json for relay-only.
+- `a2aRequest` tries direct first. On `PeerOfflineError` only, it uses the relay if this peer has a
+  stored cert. `CertPinMismatchError` is thrown before any fallback and is never relayed. Once direct
+  fails for an origin, the relay is used straight away for 2 minutes. While the relay is up, the direct
+  connect attempt gets 4 s instead of 10 s.
+- Inbound envelopes go through `A2AServer.handleRelayed`, which runs the same gate and routes as HTTPS.
+  The only difference is that the CIDR check is replaced by the relay-proven sender, and a bearer token
+  must belong to that fingerprint. Repeat deliveries are deduplicated by `(from, msgId)`; a repeat after
+  we answered re-posts the cached sealed reply.
+- `202 queued` (peer offline): the caller gets `PeerOfflineError` → it goes to the normal 24h outbox,
+  and the relay also delivers when the peer connects. The A2A messageId dedups the two copies.
+  `dropped` fails a waiting caller and is audited (`relay.dropped`) and shown to the user.
+- **Relay-only agents** (`listen: false`) never open a port. Their card URL is `relay://<fingerprint>`.
+- **Pairing over the relay.** The invite also carries `relayUrl` and `relayKey`, the inviter's SPKI
+  public key (it has to: the redeemer has no cert to run ECDH against yet). The pairing request
+  (msgId `p-...`) puts the redeemer's SPKI in front of the ciphertext, so the inviter can derive the
+  same key. The relay never decodes `ct`, and these keys are public anyway. The inviter accepts only
+  the card and `/a2a-pair` in this form. It also requires that `myCertPem` carries the sealing key,
+  and that its fingerprint equals the relay-proven sender. The redeemer checks that the returned cert
+  matches both the code's pin and its `relayKey`. Single use, 15-minute expiry and constant-time
+  comparison are unchanged (same `consumeInvite`).
+
 ## 12a. P0 spike results (2026-11-19) — corrections that override the text above
 
 Verified against the real sources, not inferred. Where this section disagrees with sections 5–7,
