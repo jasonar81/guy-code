@@ -59,13 +59,55 @@
  * message goes back to the front of the queue and is redelivered on
  * reconnect (recipients dedupe by msgId). Replies and `dropped` notices are
  * at-most-once when written to a stream that then dies.
+ *
+ * ROOMS (DESIGN.md 11b). A room is a mailbox: an opaque, client-generated id
+ * (16-128 chars of [A-Za-z0-9_-]) plus a set of member fingerprints. The relay
+ * holds NOTHING else about it - not the room key, not the roster's public
+ * keys, not display names, not any plaintext. Members encrypt (and sign)
+ * before posting; the relay only fans ciphertext out.
+ *   POST /relay/v1/rooms/join  {room}  -> 200 {room, members, joined}
+ *   POST /relay/v1/rooms/leave {room}  -> 200 {room, left: true}
+ *   POST /relay/v1/send  with to = "room:<id>" (still exactly the six fields)
+ *        -> 202 {status:'posted', msgId, delivered, queued, dropped:[{to, reason}]}
+ *        Each CURRENT member except the sender gets event `envelope` (to stays
+ *        "room:<id>", from = the proven sender), or has it queued if offline,
+ *        with the per-destination bound and TTL applied per member. There is
+ *        no reply: the recipient acknowledges with
+ *   POST /relay/v1/ack {room, sender, msgId} -> 200; until then the message is
+ *        in flight and is redelivered if the member's stream dies (same
+ *        at-least-once rule as direct envelopes).
+ *   Events: `room_member` {room, fingerprint, change:'joined'|'left'} to the
+ *        other members who are online; `room_snapshot` {room, members} for
+ *        each of an agent's rooms right after `ready`, before queued mail, so a
+ *        member that was offline resynchronises without a queue of old events.
+ *
+ * WHY "ANYONE AUTHENTICATED CAN JOIN ANY ROOM ID" IS NOT A HOLE. The relay
+ * cannot check an invite code: the code carries the room key, and the relay
+ * must never see that key. So a join here is only an assertion by an agent
+ * that has proved its own identity. That is harmless for confidentiality and
+ * integrity, because the real gates are end to end: without the room key a
+ * joiner can read nothing (it receives AES-GCM ciphertext) and write nothing
+ * that decrypts, and without being on the members' roster its signature will
+ * not verify, so members drop whatever it posts. What a stranger who learns a
+ * room id CAN get is metadata - the member fingerprints, and when and how much
+ * the members post - plus the ability to send members junk that they discard
+ * (bounded by the rate limit and per-member queue). Room ids should therefore
+ * be random and treated as semi-secret, and are never logged in full (6-char
+ * prefix only, log.ts roomPrefix). Joining requires an authenticated session;
+ * an unauthenticated stream can never join, post or receive.
+ *
+ * ROOM PERSISTENCE: in memory, like the queue. Membership survives an agent
+ * disconnecting (that is what makes offline delivery work) but NOT a relay
+ * restart: after a restart every room is gone and members must re-join
+ * (clients should re-join their rooms each time they authenticate; join is
+ * idempotent).
  */
 import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import type { AddressInfo } from 'node:net';
 import { isFingerprint, verifyProof } from './identity';
-import { RelayLogger, fpPrefix } from './log';
+import { RelayLogger, fpPrefix, roomPrefix } from './log';
 
 export const RELAY_VERSION = '1';
 
@@ -92,6 +134,12 @@ export interface RelayLimits {
   heartbeatMs: number;
   /** `dropped` notices held for an offline sender. */
   maxNoticesPerAgent: number;
+  /** Rooms one agent may be a member of at once. */
+  maxRoomsPerAgent: number;
+  /** Members in one room. */
+  maxMembersPerRoom: number;
+  /** Rooms in existence (bounds memory against made-up room ids). */
+  maxRooms: number;
 }
 
 export const DEFAULT_LIMITS: RelayLimits = {
@@ -106,6 +154,9 @@ export const DEFAULT_LIMITS: RelayLimits = {
   connectsPerMinutePerIp: 30,
   heartbeatMs: 15_000,
   maxNoticesPerAgent: 500,
+  maxRoomsPerAgent: 50,
+  maxMembersPerRoom: 50,
+  maxRooms: 5_000,
 };
 
 export interface RelayServerOptions {
@@ -134,6 +185,15 @@ const MSG_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const IV_B64_LEN = 16; // 12-byte GCM nonce
 const TAG_B64_LEN = 24; // 16-byte GCM tag
+/** Opaque client-generated room id. Min 16 chars so ids are guessable only if a client is careless. */
+export const ROOM_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
+/** `to` of a room post is ROOM_ADDRESS_PREFIX + room id; a fingerprint is never addressed this way. */
+export const ROOM_ADDRESS_PREFIX = 'room:';
+
+/** The room id of a `to` field, or null if `to` addresses a single agent. */
+export function roomOfAddress(to: string): string | null {
+  return to.startsWith(ROOM_ADDRESS_PREFIX) ? to.slice(ROOM_ADDRESS_PREFIX.length) : null;
+}
 
 class RelayError extends Error {
   constructor(
@@ -158,7 +218,12 @@ export function validateEnvelope(x: unknown): RelayEnvelope {
     throw new RelayError(400, 'bad_envelope', `Unexpected field(s): ${extra.slice(0, 5).join(', ')}. The relay accepts only {to, from, msgId, iv, ct, tag}; encrypt everything else.`);
   }
   for (const f of ENVELOPE_FIELDS) if (typeof o[f] !== 'string') throw new RelayError(400, 'bad_envelope', `Field "${f}" must be a string.`);
-  if (!isFingerprint(o.to)) throw new RelayError(400, 'bad_envelope', 'Field "to" must be a lowercase SHA-256 hex certificate fingerprint.');
+  const room = roomOfAddress(o.to as string);
+  if (room !== null) {
+    if (!ROOM_ID_RE.test(room)) throw new RelayError(400, 'bad_envelope', `Field "to" addresses a room, so it must be "${ROOM_ADDRESS_PREFIX}" followed by 16-128 chars of [A-Za-z0-9_-].`);
+  } else if (!isFingerprint(o.to)) {
+    throw new RelayError(400, 'bad_envelope', `Field "to" must be a lowercase SHA-256 hex certificate fingerprint, or "${ROOM_ADDRESS_PREFIX}<room id>".`);
+  }
   if (!isFingerprint(o.from)) throw new RelayError(400, 'bad_envelope', 'Field "from" must be a lowercase SHA-256 hex certificate fingerprint.');
   if (o.to === o.from) throw new RelayError(400, 'bad_envelope', 'An agent cannot send to itself.');
   if (!MSG_ID_RE.test(o.msgId as string)) throw new RelayError(400, 'bad_envelope', 'Field "msgId" must be 1-128 chars of [A-Za-z0-9._:-].');
@@ -169,15 +234,51 @@ export function validateEnvelope(x: unknown): RelayEnvelope {
   return { to: o.to as string, from: o.from as string, msgId: o.msgId as string, iv: o.iv as string, ct: o.ct as string, tag: o.tag as string };
 }
 
+/** Body of /rooms/join and /rooms/leave: exactly {room}. */
+function parseRoomBody(x: unknown): string {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) throw new RelayError(400, 'bad_room', 'Body must be a JSON object {room}.');
+  const o = x as Record<string, unknown>;
+  const extra = Object.keys(o).filter((k) => k !== 'room');
+  if (extra.length) throw new RelayError(400, 'bad_room', `Unexpected field(s): ${extra.slice(0, 5).join(', ')}. The relay accepts only {room}; it never holds a room key, roster or name.`);
+  if (typeof o.room !== 'string' || !ROOM_ID_RE.test(o.room)) throw new RelayError(400, 'bad_room', 'Field "room" must be 16-128 chars of [A-Za-z0-9_-] (a random, client-generated id).');
+  return o.room;
+}
+
+/** Body of /ack: exactly {room, sender, msgId}. */
+function parseAckBody(x: unknown): { room: string; sender: string; msgId: string } {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) throw new RelayError(400, 'bad_ack', 'Body must be a JSON object {room, sender, msgId}.');
+  const o = x as Record<string, unknown>;
+  const extra = Object.keys(o).filter((k) => k !== 'room' && k !== 'sender' && k !== 'msgId');
+  if (extra.length) throw new RelayError(400, 'bad_ack', `Unexpected field(s): ${extra.slice(0, 5).join(', ')}. An ack is only {room, sender, msgId}.`);
+  if (typeof o.room !== 'string' || !ROOM_ID_RE.test(o.room)) throw new RelayError(400, 'bad_ack', 'Field "room" must be a room id.');
+  if (!isFingerprint(o.sender)) throw new RelayError(400, 'bad_ack', 'Field "sender" must be the posting agent\'s fingerprint (the envelope\'s "from").');
+  if (typeof o.msgId !== 'string' || !MSG_ID_RE.test(o.msgId)) throw new RelayError(400, 'bad_ack', 'Field "msgId" must be 1-128 chars of [A-Za-z0-9._:-].');
+  return { room: o.room, sender: o.sender, msgId: o.msgId };
+}
+
 type QueueItem =
   | { kind: 'message'; env: RelayEnvelope; enqueuedAt: number }
   | { kind: 'reply'; env: RelayEnvelope; enqueuedAt: number }
+  /** One member's copy of a room post; env.to is "room:<id>". */
+  | { kind: 'room'; env: RelayEnvelope; enqueuedAt: number }
   | { kind: 'notice'; notice: DropNotice; enqueuedAt: number };
 
 interface DropNotice {
   msgId: string;
+  /** The destination that did not get it: an agent fingerprint (for a room post, the member). */
   to: string;
+  /** Set when the dropped message was a room post. */
+  room?: string;
   reason: string;
+}
+
+/** A room post written to one member's stream and not yet acknowledged. */
+interface RoomInflight {
+  env: RelayEnvelope;
+  member: string;
+  room: string;
+  enqueuedAt: number;
+  streamId: string;
 }
 
 interface Stream {
@@ -229,6 +330,7 @@ class RateLimiter {
 }
 
 const inflightKey = (sender: string, msgId: string) => `${sender}|${msgId}`;
+const roomInflightKey = (member: string, room: string, sender: string, msgId: string) => `${member}|${room}|${sender}|${msgId}`;
 const shortId = (id: string) => id.slice(0, 16);
 
 export class RelayServer {
@@ -248,6 +350,9 @@ export class RelayServer {
   private readonly queues = new Map<string, QueueItem[]>(); // destination fingerprint -> FIFO
   private readonly inflight = new Map<string, Inflight>(); // sender|msgId -> delivered, awaiting reply
   private readonly pending = new Map<string, PendingSend>(); // sender|msgId -> held POST /send
+  private readonly rooms = new Map<string, Set<string>>(); // room id -> member fingerprints (join order)
+  private readonly agentRooms = new Map<string, Set<string>>(); // fingerprint -> room ids it belongs to
+  private readonly roomInflight = new Map<string, RoomInflight>(); // member|room|sender|msgId -> awaiting ack
 
   constructor(private readonly opts: RelayServerOptions) {
     this.limits = { ...DEFAULT_LIMITS, ...(opts.limits ?? {}) };
@@ -310,10 +415,20 @@ export class RelayServer {
   }
 
   /** Counts only - safe for /health. */
-  stats(): { streams: number; agents: number; queued: number; inflight: number } {
+  stats(): { streams: number; agents: number; queued: number; inflight: number; rooms: number; memberships: number; roomInflight: number } {
     let queued = 0;
     for (const q of this.queues.values()) queued += q.length;
-    return { streams: this.streams.size, agents: this.byFingerprint.size, queued, inflight: this.inflight.size };
+    let memberships = 0;
+    for (const m of this.rooms.values()) memberships += m.size;
+    return {
+      streams: this.streams.size,
+      agents: this.byFingerprint.size,
+      queued,
+      inflight: this.inflight.size,
+      rooms: this.rooms.size,
+      memberships,
+      roomInflight: this.roomInflight.size,
+    };
   }
 
   /**
@@ -324,6 +439,8 @@ export class RelayServer {
     return JSON.stringify({
       queues: [...this.queues.entries()],
       inflight: [...this.inflight.entries()],
+      roomInflight: [...this.roomInflight.entries()],
+      rooms: [...this.rooms.entries()].map(([id, m]) => [id, [...m]]),
       streams: [...this.streams.values()].map((s) => ({ id: s.id, fingerprint: s.fingerprint, remote: s.remote })),
     });
   }
@@ -349,7 +466,27 @@ export class RelayServer {
       }
       const env = validateEnvelope(await this.readJson(req));
       if (env.from !== st.fingerprint) throw new RelayError(403, 'wrong_sender', '"from" does not match the identity this session proved.');
-      const r = path === '/relay/v1/send' ? await this.handleSend(env) : this.handleReply(env);
+      const room = roomOfAddress(env.to);
+      if (room !== null && path === '/relay/v1/reply') {
+        throw new RelayError(400, 'bad_envelope', 'Room posts have no reply; acknowledge them with POST /relay/v1/ack, and answer by posting to the room.');
+      }
+      const r = room !== null ? this.handleRoomPost(room, env) : path === '/relay/v1/send' ? await this.handleSend(env) : this.handleReply(env);
+      return this.sendJson(res, r.status, r.body);
+    }
+    if (method === 'POST' && (path === '/relay/v1/rooms/join' || path === '/relay/v1/rooms/leave')) {
+      const st = this.authenticate(req);
+      if (!this.agentLimiter.allow(st.fingerprint!)) {
+        this.log.warn('rate_limited', { agent: fpPrefix(st.fingerprint), route: path });
+        throw new RelayError(429, 'rate_limited', `Rate limit exceeded: at most ${this.limits.sendsPerMinutePerAgent} sends per minute per agent.`);
+      }
+      const room = parseRoomBody(await this.readJson(req));
+      const r = path === '/relay/v1/rooms/join' ? this.joinRoom(st.fingerprint!, room) : this.leaveRoom(st.fingerprint!, room);
+      return this.sendJson(res, r.status, r.body);
+    }
+    if (method === 'POST' && path === '/relay/v1/ack') {
+      // Not rate limited: an ack can only release state the relay already holds.
+      const st = this.authenticate(req);
+      const r = this.handleAck(st.fingerprint!, await this.readJson(req));
       return this.sendJson(res, r.status, r.body);
     }
     throw new RelayError(404, 'not_found', `No route for ${method} ${path}.`);
@@ -426,6 +563,9 @@ export class RelayServer {
     this.log.info('agent_connected', { agent: fpPrefix(fp), remote, queued: this.queues.get(fp)?.length ?? 0 });
     this.sendJson(res, 200, { session: st.session, fingerprint: fp });
     this.writeEvent(st, 'ready', { fingerprint: fp });
+    // Current membership of each of its rooms, before any queued mail, so an
+    // agent that missed join/leave events while offline resynchronises.
+    for (const room of this.agentRooms.get(fp) ?? []) this.writeEvent(st, 'room_snapshot', { room, members: [...(this.rooms.get(room) ?? [])] });
     this.flush(fp);
   }
 
@@ -442,11 +582,11 @@ export class RelayServer {
     // Anything written to this stream but not yet answered may never have
     // arrived. Put it back at the FRONT of the queue (original order) so it is
     // redelivered on reconnect, and release any sender still waiting on it.
-    const back: Inflight[] = [];
+    const back: QueueItem[] = [];
     for (const [k, f] of this.inflight) {
       if (f.streamId !== st.id) continue;
       this.inflight.delete(k);
-      back.push(f);
+      back.push({ kind: 'message', env: f.env, enqueuedAt: f.enqueuedAt });
       const p = this.pending.get(k);
       if (p) {
         this.pending.delete(k);
@@ -454,10 +594,17 @@ export class RelayServer {
         p.resolve({ status: 202, body: { status: 'queued', msgId: f.env.msgId, reason: 'Recipient disconnected before replying; it will be redelivered when they reconnect.' } });
       }
     }
+    // Room posts written but not acked are redelivered the same way - unless
+    // the member has since left the room (they are no longer entitled to it).
+    for (const [k, f] of this.roomInflight) {
+      if (f.streamId !== st.id) continue;
+      this.roomInflight.delete(k);
+      if (this.rooms.get(f.room)?.has(fp)) back.push({ kind: 'room', env: f.env, enqueuedAt: f.enqueuedAt });
+    }
     if (back.length) {
       back.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
       const q = this.queues.get(fp) ?? [];
-      q.unshift(...back.map((f): QueueItem => ({ kind: 'message', env: f.env, enqueuedAt: f.enqueuedAt })));
+      q.unshift(...back);
       this.queues.set(fp, q);
     }
     this.log.info('agent_disconnected', { agent: fpPrefix(fp), requeued: back.length });
@@ -559,6 +706,7 @@ export class RelayServer {
     let n = 0;
     for (const i of this.queues.get(dest) ?? []) if (i.kind !== 'notice') n++;
     for (const f of this.inflight.values()) if (f.env.to === dest) n++;
+    for (const f of this.roomInflight.values()) if (f.member === dest) n++;
     return n;
   }
 
@@ -597,6 +745,12 @@ export class RelayServer {
         this.inflight.set(inflightKey(item.env.from, item.env.msgId), { env: item.env, enqueuedAt: item.enqueuedAt, streamId: st.id });
         ok = this.writeEvent(st, 'envelope', item.env);
         if (!ok) this.inflight.delete(inflightKey(item.env.from, item.env.msgId));
+      } else if (item.kind === 'room') {
+        const room = roomOfAddress(item.env.to)!;
+        const k = roomInflightKey(fp, room, item.env.from, item.env.msgId);
+        this.roomInflight.set(k, { env: item.env, member: fp, room, enqueuedAt: item.enqueuedAt, streamId: st.id });
+        ok = this.writeEvent(st, 'envelope', item.env);
+        if (!ok) this.roomInflight.delete(k);
       } else if (item.kind === 'reply') {
         ok = this.writeEvent(st, 'reply', item.env);
       } else {
@@ -610,6 +764,133 @@ export class RelayServer {
     if (sent) this.log.info('flushed', { agent: fpPrefix(fp), count: sent, remaining: q.length });
   }
 
+  // ---- rooms (DESIGN.md 11b; see the file-top comment) ------------------------
+
+  private joinRoom(fp: string, room: string): SendResult {
+    let members = this.rooms.get(room);
+    if (members?.has(fp)) return { status: 200, body: { room, members: [...members], joined: false } }; // idempotent
+    const mine = this.agentRooms.get(fp) ?? new Set<string>();
+    if (mine.size >= this.limits.maxRoomsPerAgent) {
+      this.log.warn('room_refused', { reason: 'too_many_rooms', agent: fpPrefix(fp), room: roomPrefix(room) });
+      throw new RelayError(409, 'too_many_rooms', `You are already in ${this.limits.maxRoomsPerAgent} rooms, the most one agent may join; leave one first.`);
+    }
+    if (members && members.size >= this.limits.maxMembersPerRoom) {
+      this.log.warn('room_refused', { reason: 'room_full', agent: fpPrefix(fp), room: roomPrefix(room) });
+      throw new RelayError(409, 'room_full', `This room already has ${this.limits.maxMembersPerRoom} members, the most a room may have.`);
+    }
+    if (!members && this.rooms.size >= this.limits.maxRooms) {
+      this.log.warn('room_refused', { reason: 'relay_rooms_full', agent: fpPrefix(fp), room: roomPrefix(room) });
+      throw new RelayError(507, 'relay_rooms_full', `Relay is at its limit of ${this.limits.maxRooms} rooms; retry later.`);
+    }
+    if (!members) {
+      members = new Set<string>();
+      this.rooms.set(room, members);
+    }
+    members.add(fp);
+    mine.add(room);
+    this.agentRooms.set(fp, mine);
+    this.log.info('room_joined', { room: roomPrefix(room), agent: fpPrefix(fp), members: members.size });
+    this.memberEvent(room, fp, 'joined');
+    return { status: 200, body: { room, members: [...members], joined: true } };
+  }
+
+  private leaveRoom(fp: string, room: string): SendResult {
+    const members = this.rooms.get(room);
+    if (!members?.has(fp)) throw new RelayError(404, 'not_a_member', 'You are not a member of that room.');
+    members.delete(fp);
+    if (!members.size) this.rooms.delete(room);
+    const mine = this.agentRooms.get(fp);
+    mine?.delete(room);
+    if (mine && !mine.size) this.agentRooms.delete(fp);
+    // Stop delivery now: discard this member's undelivered and unacked copies of
+    // the room's posts. Their senders are not told - the member chose to leave.
+    const address = ROOM_ADDRESS_PREFIX + room;
+    let purged = 0;
+    const q = this.queues.get(fp);
+    if (q) {
+      const keep = q.filter((i) => !(i.kind === 'room' && i.env.to === address));
+      purged += q.length - keep.length;
+      if (keep.length) this.queues.set(fp, keep);
+      else this.queues.delete(fp);
+    }
+    for (const [k, f] of [...this.roomInflight]) {
+      if (f.member === fp && f.room === room) {
+        this.roomInflight.delete(k);
+        purged++;
+      }
+    }
+    this.log.info('room_left', { room: roomPrefix(room), agent: fpPrefix(fp), members: members.size, purged });
+    this.memberEvent(room, fp, 'left');
+    return { status: 200, body: { room, left: true } };
+  }
+
+  /** Tell the room's other ONLINE members. Offline members get a `room_snapshot` when they reconnect instead. */
+  private memberEvent(room: string, who: string, change: 'joined' | 'left'): void {
+    for (const m of this.rooms.get(room) ?? []) {
+      if (m === who) continue;
+      const st = this.liveStream(m);
+      if (st) this.writeEvent(st, 'room_member', { room, fingerprint: who, change });
+    }
+  }
+
+  private handleRoomPost(room: string, env: RelayEnvelope): SendResult {
+    const members = this.rooms.get(room);
+    if (!members?.has(env.from)) {
+      throw new RelayError(403, 'not_a_member', 'You are not a member of that room; POST /relay/v1/rooms/join first.');
+    }
+    for (const m of members) {
+      if (m === env.from) continue;
+      if (this.roomInflight.has(roomInflightKey(m, room, env.from, env.msgId)) || (this.queues.get(m) ?? []).some((i) => i.kind === 'room' && i.env.to === env.to && i.env.from === env.from && i.env.msgId === env.msgId)) {
+        throw new RelayError(409, 'duplicate_msg_id', 'A post with this msgId from you to this room is still undelivered or unacknowledged.');
+      }
+    }
+    let delivered = 0;
+    let queued = 0;
+    const dropped: Array<{ to: string; reason: string }> = [];
+    const now = this.now();
+    for (const m of members) {
+      if (m === env.from) continue; // the sender never gets its own post back
+      this.sweepDestination(m);
+      // Bounds per member: one full mailbox must not stop the others getting it.
+      try {
+        this.checkBound(m, env);
+      } catch (e) {
+        if (!(e instanceof RelayError)) throw e;
+        dropped.push({ to: m, reason: e.code });
+        continue;
+      }
+      const st = this.liveStream(m);
+      if (st && !this.queues.get(m)?.length) {
+        const k = roomInflightKey(m, room, env.from, env.msgId);
+        this.roomInflight.set(k, { env, member: m, room, enqueuedAt: now, streamId: st.id });
+        if (this.writeEvent(st, 'envelope', env)) {
+          delivered++;
+          continue;
+        }
+        this.roomInflight.delete(k);
+      }
+      const q = this.queues.get(m) ?? [];
+      q.push({ kind: 'room', env, enqueuedAt: now });
+      this.queues.set(m, q);
+      queued++;
+      if (st) this.flush(m);
+    }
+    this.log.info('room_posted', { room: roomPrefix(room), from: fpPrefix(env.from), msg: shortId(env.msgId), bytes: env.ct.length, delivered, queued, dropped: dropped.length });
+    if (dropped.length && !delivered && !queued) {
+      throw new RelayError(507, dropped.every((d) => d.reason === 'relay_full') ? 'relay_full' : 'queue_full', `No member could accept the post (${dropped.length} full); message dropped. Retry later.`);
+    }
+    return { status: 202, body: { status: 'posted', msgId: env.msgId, delivered, queued, dropped } };
+  }
+
+  private handleAck(fp: string, body: unknown): SendResult {
+    const a = parseAckBody(body);
+    const k = roomInflightKey(fp, a.room, a.sender, a.msgId);
+    if (!this.roomInflight.delete(k)) {
+      throw new RelayError(404, 'unknown_msg', 'No room post with that room, sender and msgId is awaiting your acknowledgement (already acked, expired, or never delivered to you).');
+    }
+    return { status: 200, body: { status: 'acked' } };
+  }
+
   // ---- expiry and drop reporting --------------------------------------------
 
   /** Drop anything older than the TTL and tell its sender. Runs every minute, and on demand. */
@@ -621,6 +902,12 @@ export class RelayServer {
       this.inflight.delete(k);
       this.log.warn('dropped', { reason: 'expired_unanswered', from: fpPrefix(f.env.from), to: fpPrefix(f.env.to), msg: shortId(f.env.msgId) });
       this.notify(f.env.from, { msgId: f.env.msgId, to: f.env.to, reason: 'expired: delivered but never answered within the relay TTL' });
+    }
+    for (const [k, f] of [...this.roomInflight]) {
+      if (f.enqueuedAt > cutoff) continue;
+      this.roomInflight.delete(k);
+      this.log.warn('dropped', { reason: 'expired_unacked', room: roomPrefix(f.room), from: fpPrefix(f.env.from), to: fpPrefix(f.member), msg: shortId(f.env.msgId) });
+      this.notify(f.env.from, { msgId: f.env.msgId, to: f.member, room: f.room, reason: 'expired: delivered to this room member but never acknowledged within the relay TTL' });
     }
   }
 
@@ -639,8 +926,9 @@ export class RelayServer {
         this.log.warn('notice_expired', { agent: fpPrefix(dest), msg: shortId(i.notice.msgId) });
         continue;
       }
-      this.log.warn('dropped', { reason: 'expired', kind: i.kind, from: fpPrefix(i.env.from), to: fpPrefix(dest), msg: shortId(i.env.msgId) });
-      this.notify(i.env.from, { msgId: i.env.msgId, to: dest, reason: `expired: recipient did not connect within ${Math.round(this.limits.queueTtlMs / 3_600_000)}h` });
+      const room = i.kind === 'room' ? roomOfAddress(i.env.to)! : undefined;
+      this.log.warn('dropped', { reason: 'expired', kind: i.kind, room: room ? roomPrefix(room) : undefined, from: fpPrefix(i.env.from), to: fpPrefix(dest), msg: shortId(i.env.msgId) });
+      this.notify(i.env.from, { msgId: i.env.msgId, to: dest, ...(room ? { room } : {}), reason: `expired: recipient did not connect within ${Math.round(this.limits.queueTtlMs / 3_600_000)}h` });
     }
   }
 

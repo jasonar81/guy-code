@@ -960,6 +960,105 @@ lower-latency path and the relay carries only what it must.
   matches both the code's pin and its `relayKey`. Single use, 15-minute expiry and constant-time
   comparison are unchanged (same `consumeInvite`).
 
+## 11b. Rooms (added 2026-11-24) - REPLACES pairwise messaging
+
+### Why the pairwise model is wrong
+Measured in real use, not theorised:
+
+1. **Groups need N^2 pairings.** Four agents coordinating is six separate pairing exchanges, and
+   each link is private, so if Dylan tells me something Priya also needs, she never sees it. The
+   thing people actually want - "the four of us working on this" - is not expressible.
+2. **Two sessions in ONE install cannot talk at all.** A2A pairs *installs*: one endpoint, one
+   certificate, one peer record per colleague. `a2a_peers.is_self` exists in the schema and is
+   never read, because self-pairing would mean one endpoint holding two peer rows for the same
+   certificate. Jason hit this immediately; it is the first thing anyone tries.
+3. **Routing to a person is ambiguous.** With pairs, a message is addressed to an *install*, and
+   the install guesses which session should see it (most-recently-active). With two sessions open,
+   that guess looked random: a request addressed to one session was answered by another.
+
+Rooms fix all three, and the relay from §11a already does most of the work: it is a dial-out
+service holding open connections, which is exactly what a shared mailbox needs.
+
+### Shape
+A **room** is a mailbox with an id and a shared key. An invite code admits one joiner. Every
+member - a Guy Code session, a Claude Code session, a colleague's agent - connects to the relay and
+sees everything posted to the room, tagged with who sent it. Membership is by *agent session*, not
+by install, so two sessions in one Guy Code join the same room as equals.
+
+This **replaces** pairwise peers rather than sitting beside it (Jason's call: one mechanism, not
+two). A 1:1 conversation is a two-member room, so nothing is lost and there is one concept to
+learn, one to document and one to maintain.
+
+### ⛔ Shared key means the sender MUST be signed
+This is the design's load-bearing fact, and it was demonstrated before the design was written, not
+assumed:
+
+| property | pairwise (§11a) | room |
+|---|---|---|
+| who can read | exactly the two certs | every member |
+| who can have sent it | implied by the key | **any member** |
+
+With a per-pair key, "it decrypted" implies "the other half of this pair sent it". With one key
+shared by the room that implication is **false**: a member can seal a message claiming to be from
+anyone else, and AES-GCM accepts it. Verified: Bob, holding the room key, forged a message
+`{from: 'alice'}` and the recipient could not tell.
+
+So every room message carries a **signature over the payload made with the sender's own
+certificate key**. Members know each other's public keys from the room roster. Verified: a real
+signature passes, Bob signing as Alice is rejected. Unsigned or badly-signed messages are dropped
+and audited, never delivered.
+
+### Joining, leaving, and the thing people get wrong
+- **Invite code**: single use, short expiry, carries room id + relay URL + the room key, exactly
+  like today's pairing code. Nobody joins a room without one.
+- **Roster**: each member's fingerprint, public key and display name. Distributed with the invite
+  and updated as members join, so signatures can be checked.
+- **⚠ Removal must ROTATE the key.** A departed member still holds the old key and can read
+  anything sent with it, including messages they fetch later from the relay queue. "Remove" that
+  only drops a roster entry is security theatre. On removal: new key, redistributed to remaining
+  members over their existing connections.
+- The relay stays **untrusted**: it fans out ciphertext to room members and still cannot read
+  anything. It does learn more metadata than before - room membership and who posts, rather than
+  just which two fingerprints talk.
+
+### ⛔ One identity per session, NOT per install (found while building the relay side)
+§11b above says "membership is by agent session, so two sessions in one Guy Code join the same room
+as equals". That does not work with the identity model as shipped, and the whole point of rooms for
+Jason was fixing the two-sessions case - so this has to change before the client work.
+
+The relay keeps **one stream per authenticated fingerprint** (`byFingerprint`, a replace-on-login
+map), and Guy Code stores **one certificate per install** (`a2a.tlsCert`). Verified against the
+live relay on net1: two sessions presenting the same certificate cannot both be connected - the
+second login evicts the first, which simply disappears.
+
+So each **session** that joins a room needs its own keypair and fingerprint. Consequences:
+- Guy Code generates and stores a per-session cert, with `a2a.tlsCert` remaining the install's
+  identity for the inbound HTTPS endpoint and for pairing-era peers.
+- The room roster lists session identities, so "who sent this" names a session, which is what the
+  user wants to see anyway ("Jason's loader-fix session", not just "Jason").
+- A member leaving is a session leaving; closing a session should leave its rooms.
+- The relay needs no change for this: it already treats each fingerprint as a separate agent.
+
+### Migration
+Pairwise peers become two-member rooms. Jason has exactly one paired peer today, so the cheap
+moment to do this is now, before anyone else pairs. Peers that cannot be migrated (no stored cert
+PEM, i.e. paired before v17) are reported with the existing re-pair wording rather than silently
+dropped.
+
+## 11c. Waiting for anything (the missing primitive)
+
+A session cannot currently notice an incoming message. `a2a_wait` takes a **`task_id`**, so it only
+waits for a reply to something this session already sent. Jason's question was the right one: *"I
+can tell it to constantly check Slack, why can't I tell it to check this?"* - Slack polling works
+because there is a call for "anything new?", and A2A has no equivalent.
+
+Without it, rooms do not help: messages would still only surface when the user happens to type.
+
+So: **wait for anything addressed to me** - block until a new message arrives in any room this
+session belongs to, or the timeout passes, then return sender, room and content. Zero model cost
+while blocked, same mechanism as `WaitForCondition` and the §5.5 watch runner, and it survives a
+restart. That turns "watch the room" into an ordinary monitoring loop the agent can run itself.
+
 ## 12a. P0 spike results (2026-11-19) — corrections that override the text above
 
 Verified against the real sources, not inferred. Where this section disagrees with sections 5–7,

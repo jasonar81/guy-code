@@ -21,12 +21,22 @@ export type LogLevel = 'info' | 'warn' | 'error';
 export type LogSink = (line: string) => void;
 export type LogValue = string | number | boolean | undefined | null;
 
-const FORBIDDEN_FIELDS = new Set(['ct', 'iv', 'tag', 'token', 'signature', 'nonce', 'certpem', 'cert', 'body', 'payload', 'envelope', 'authorization']);
+const FORBIDDEN_FIELDS = new Set(['ct', 'iv', 'tag', 'token', 'signature', 'nonce', 'certpem', 'cert', 'body', 'payload', 'envelope', 'authorization', 'roomid']);
 
 /** First 12 hex chars of a fingerprint - enough to correlate, not enough to identify outside the relay. */
 export function fpPrefix(fp: string | undefined | null): string {
   if (!fp) return '';
   return fp.slice(0, 12);
+}
+
+/**
+ * First 6 chars of a room id. Room ids are client-chosen random strings, and
+ * knowing one lets an authenticated agent join that room at the relay, so a
+ * full id must never reach a log line (DESIGN.md 11b).
+ */
+export function roomPrefix(room: string | undefined | null): string {
+  if (!room) return '';
+  return room.slice(0, 6);
 }
 
 function scrub(v: string): string {

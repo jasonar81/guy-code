@@ -24,8 +24,22 @@ What it **can** observe, unavoidably (state this plainly to users):
 - reply timing (roughly how long a peer took to answer);
 - each agent's certificate (presented at login), including its subject CN.
 
-Logs record only events, 12-char fingerprint prefixes, the first 16 chars of a
-msgId, byte counts and source IPs. journald owns retention (see below).
+With rooms (below) it **also** observes, and this is new metadata compared with
+pairwise relaying:
+
+- **room membership**: which fingerprints are in which room id, and when each
+  joined and left (the full member list, not just pairs that happened to talk);
+- **who posts to which room**, when, and how much, and how many members each
+  post was fanned out to / queued for;
+- per-member acknowledgement timing (roughly when each member read a post);
+- every member's fingerprint is shown to the other members (`room_member`,
+  `room_snapshot`) and to anyone who joins the room id.
+
+It still never holds a room key, roster public keys, display names or plaintext.
+
+Logs record only events, 12-char fingerprint prefixes, 6-char room-id prefixes,
+the first 16 chars of a msgId, byte counts and source IPs. journald owns
+retention (see below).
 
 Known limitations (v1):
 
@@ -35,6 +49,9 @@ Known limitations (v1):
   relay's disk never holds ciphertext.
 - Delivery of envelopes is at-least-once (redelivered if a stream dies before
   the reply); recipients dedupe by `msgId`.
+- **In-memory rooms.** Membership survives an agent disconnecting but not a
+  relay restart: afterwards every room is gone. Clients must re-join their rooms
+  after each successful auth (join is idempotent).
 
 ## Protocol (v1)
 
@@ -42,11 +59,14 @@ All connections are opened by the agent.
 
 | route | auth | purpose |
 |---|---|---|
-| `GET /relay/v1/health` | none | `{ok, version, uptimeS, streams, agents, queued, inflight}` - counts only |
+| `GET /relay/v1/health` | none | `{ok, version, uptimeS, streams, agents, queued, inflight, rooms, memberships, roomInflight}` - counts only |
 | `GET /relay/v1/stream` | none (then proof) | Server-Sent Events, relay -> agent |
 | `POST /relay/v1/auth` | proof | `{streamId, fingerprint, certPem, signature}` -> `{session}` |
 | `POST /relay/v1/send` | `Bearer <session>` | envelope; response is the peer's reply |
 | `POST /relay/v1/reply` | `Bearer <session>` | the reply envelope for a received `msgId` |
+| `POST /relay/v1/rooms/join` | `Bearer <session>` | `{room}` -> `{room, members, joined}` |
+| `POST /relay/v1/rooms/leave` | `Bearer <session>` | `{room}` -> `{room, left}` |
+| `POST /relay/v1/ack` | `Bearer <session>` | `{room, sender, msgId}` - acknowledge a room post |
 
 1. Open the stream. First event: `challenge {streamId, nonce}`.
 2. Sign `"a2a-relay-auth-v1\n" + nonce` (ECDSA-SHA256, the cert's P-256 key,
@@ -65,14 +85,46 @@ All connections are opened by the agent.
    is logged and reported to the sender as event `dropped {msgId, to, reason}`
    (held for the sender if it is offline).
 
+### Rooms (DESIGN.md 11b)
+
+A room id is an opaque, random, client-generated string (16-128 chars of
+`[A-Za-z0-9_-]`). The relay keeps only `room id -> member fingerprints`.
+
+- **Join** `{room}`: any authenticated agent may join any room id. The relay
+  cannot check an invite - the invite carries the room key, which the relay must
+  never see. This is harmless for content: without the key a joiner receives
+  only ciphertext and cannot write anything that decrypts, and without being on
+  the members' roster its signatures do not verify, so members drop its posts.
+  What a stranger who learns a room id *can* get is the member list and posting
+  metadata, so treat room ids as semi-secret. Join is idempotent.
+- **Post**: `POST /relay/v1/send` with `to = "room:<id>"` (still exactly the six
+  fields; you must be a member). Every current member except the sender gets
+  event `envelope` (unchanged shape, `to` stays `room:<id>`), or has it queued if
+  offline. Response `202 {status:'posted', msgId, delivered, queued, dropped:[{to, reason}]}`;
+  bounds and TTL apply per member, so one full mailbox drops only that member's
+  copy (`507` only if *no* member could take it). There is no reply.
+- **Ack** `{room, sender, msgId}`: a member acknowledges each room envelope; until
+  then it is redelivered if the member's stream dies (at-least-once).
+- **Leave** `{room}`: stops delivery immediately and discards that member's
+  undelivered copies. The last member leaving deletes the room.
+- **Events**: `room_member {room, fingerprint, change:'joined'|'left'}` to the
+  other online members; `room_snapshot {room, members}` for each of your rooms
+  right after `ready` (before queued mail), so missed events are not replayed.
+  TTL drops of a room post reach the sender as `dropped {msgId, to: member, room, reason}`.
+
 Errors are `{error: {code, message}}`:
 
 | status | code | when |
 |---|---|---|
 | 400 | `bad_envelope` / `bad_json` | malformed, or any field beyond the six |
 | 401 | `unauthenticated` / `auth_failed` | no/stale session; bad proof |
+| 400 | `bad_room` / `bad_ack` | malformed room id, or any field beyond `{room}` / `{room, sender, msgId}` |
 | 403 | `wrong_sender` | `from` is not your proven identity |
+| 403 / 404 | `not_a_member` | posting to / leaving a room you are not in |
+| 404 | `unknown_msg` | reply or ack for nothing awaiting one |
 | 409 | `duplicate_msg_id` | same `msgId` from you already pending |
+| 409 | `room_full` / `too_many_rooms` | > 50 members in the room, or you are in 50 rooms |
+| 507 | `relay_rooms_full` | > 5 000 rooms on the relay |
 | 413 | `too_large` | body > 512 KiB |
 | 429 | `rate_limited` | > 300 sends/min per agent, or > 30 connects/min per IP |
 | 503 | `too_many_streams` | > 500 concurrent streams |
