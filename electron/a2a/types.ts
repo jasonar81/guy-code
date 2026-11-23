@@ -277,12 +277,20 @@ export interface PairRequest {
   myDisplayName: string;
   myAgentKind?: AgentKind;
   tokenForYouToCallMe: string;
+  /**
+   * Our certificate PEM (relay, design 11a). Must hash to myCertSha256.
+   * Optional so peers on an older build can still pair (they just cannot use
+   * the relay until both sides send it).
+   */
+  myCertPem?: string;
 }
 
 export interface PairResponse {
   tokenForMeToCallYou: string;
   displayName: string;
   agentKind: AgentKind;
+  /** The inviter's certificate PEM (relay, design 11a). Must hash to the code's certSha256. */
+  certPem?: string;
 }
 
 /** Decoded `a2a1:` pairing code (design 4.3 step 1). */

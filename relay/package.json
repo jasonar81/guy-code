@@ -1,0 +1,21 @@
+{
+  "name": "guy-code-a2a-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Untrusted dial-out relay for A2A agents on networks where peers cannot reach each other (docs/a2a/DESIGN.md 11a).",
+  "license": "UNLICENSED",
+  "main": "dist/main.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

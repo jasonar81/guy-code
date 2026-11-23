@@ -338,6 +338,8 @@ export interface A2APanelPeer {
   lastSeenTs: number | null;
   /** Messages / pushes waiting in the outbox for this peer. */
   queued: number;
+  /** Why the relay cannot carry traffic for this peer (e.g. paired before relay support), or null. */
+  relayNote?: string | null;
 }
 
 export interface A2APanelTask {

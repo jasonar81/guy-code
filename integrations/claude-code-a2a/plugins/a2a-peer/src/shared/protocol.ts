@@ -17,11 +17,12 @@
  * code going through this one file so the boundary stays visible.
  */
 export { A2ANode, type A2ANodeOptions } from '../../../../../../electron/a2a/node';
-export { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema } from '../../../../../../electron/a2a/schema';
+export { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema } from '../../../../../../electron/a2a/schema';
 export { type SecretPort, type SqlHandle, type PeerRow, type TaskRow } from '../../../../../../electron/a2a/store';
 export { lastPathSegment, type RoutableSession, type SessionPort } from '../../../../../../electron/a2a/router';
 export { buildEnvelope, parseEnvelope, HEADER_PREFIX } from '../../../../../../electron/a2a/envelope';
 export { generateSelfSignedCert, fingerprintOfPem, type TlsIdentity } from '../../../../../../electron/a2a/tls';
+export { relayNoteForPeer } from '../../../../../../electron/a2a/relayCrypto';
 // CLAUDE_CODE_DEFAULT_PORT (7428) is what this plugin listens on. DEFAULT_PORT
 // (7427) is Guy Code's and is re-exported only so the two can be named in
 // error messages - the daemon must never fall back to it, or both would fight

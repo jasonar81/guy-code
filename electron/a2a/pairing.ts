@@ -18,7 +18,7 @@
  * A leaked code after redemption is useless.
  */
 import { A2AProtocolError } from './errors';
-import { normaliseFingerprint } from './tls';
+import { fingerprintOfPem, normaliseFingerprint } from './tls';
 import { newToken, type A2AStore, type PeerRow } from './store';
 import type { AgentKind, PairingCodePayload, PairRequest, PairResponse } from './types';
 import { CertPinMismatchError, baseUrlOf, fetchCard, redeemPairing } from './client';
@@ -57,8 +57,28 @@ export interface LocalIdentity {
   /** Our public card URL, e.g. https://10.30.1.23:7427/.well-known/agent-card.json */
   cardUrl: string;
   certSha256: string;
+  /**
+   * Our certificate PEM, sent to the other side during pairing so it can derive
+   * the relay key (design 11a). Omitted only in insecure-HTTP tests.
+   */
+  certPem?: string;
   displayName: string;
   agentKind: AgentKind;
+}
+
+/**
+ * A peer's certificate PEM, accepted only when it hashes to the fingerprint
+ * we pinned for them. Anything else (missing, unparsable, different cert)
+ * gives null: the peer still pairs and works directly, but the relay reports
+ * it unavailable with a re-pair hint (relayCrypto.relayAvailableForPeer).
+ */
+export function pinnedCertPem(pem: unknown, expectedFingerprint: string): string | null {
+  if (typeof pem !== 'string' || !pem || pem.length > 16_384) return null;
+  try {
+    return fingerprintOfPem(pem) === normaliseFingerprint(expectedFingerprint) ? pem : null;
+  } catch {
+    return null;
+  }
 }
 
 export function createInvite(store: A2AStore, me: LocalIdentity, ttlMs: number, now = Date.now()): { code: string; expires: number; inviteId: string } {
@@ -99,6 +119,11 @@ export async function acceptPair(
     throw bad('myCardUrl is not a URL.');
   }
   if (cardUrl.protocol !== 'https:' && !(opts.allowHttp && cardUrl.protocol === 'http:')) throw bad('myCardUrl must be https.');
+  // A PEM that does not match the fingerprint the request names is a lie about
+  // its own identity, like a card pin mismatch below. Checked before the invite
+  // is burned. Absent is fine (older builds): no relay for that peer.
+  const certPem = pinnedCertPem(req.myCertPem, fp);
+  if (req.myCertPem !== undefined && req.myCertPem !== null && !certPem) throw bad('myCertPem does not match myCertSha256.');
 
   const check = store.consumeInvite(String(req.inviteId ?? ''), String(req.inviteSecret ?? ''), opts.now);
   if (check !== 'ok') {
@@ -143,9 +168,13 @@ export async function acceptPair(
     tokenOut: req.tokenForYouToCallMe,
     tokenIn: tokenForMeToCallYou,
     cardJson,
+    certPem,
     now: opts.now,
   });
-  return { response: { tokenForMeToCallYou, displayName: me.displayName, agentKind: me.agentKind }, peer };
+  return {
+    response: { tokenForMeToCallYou, displayName: me.displayName, agentKind: me.agentKind, ...(me.certPem ? { certPem: me.certPem } : {}) },
+    peer,
+  };
 }
 
 /** Client side: redeem a code someone sent us. Returns the stored peer. */
@@ -167,6 +196,7 @@ export async function redeemCode(store: A2AStore, code: string, me: LocalIdentit
     myDisplayName: me.displayName,
     myAgentKind: me.agentKind,
     tokenForYouToCallMe,
+    ...(me.certPem ? { myCertPem: me.certPem } : {}),
   });
   if (!res || typeof res.tokenForMeToCallYou !== 'string' || res.tokenForMeToCallYou.length < 32) {
     throw new Error('The other agent answered the pairing request with something unexpected.');
@@ -182,6 +212,9 @@ export async function redeemCode(store: A2AStore, code: string, me: LocalIdentit
     tokenOut: res.tokenForMeToCallYou,
     tokenIn: tokenForYouToCallMe,
     cardJson: JSON.stringify(card),
+    // Only kept if it hashes to the pin from the code (and so matches the cert
+    // the TLS connection just proved). Otherwise null: no relay for this peer.
+    certPem: pinnedCertPem(res.certPem, p.certSha256),
     now,
   });
 }

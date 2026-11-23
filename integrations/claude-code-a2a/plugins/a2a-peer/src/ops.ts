@@ -20,6 +20,7 @@ import {
   fmtDuration,
   isTrustLevel,
   partsText,
+  relayNoteForPeer,
   stateWord,
   TERMINAL_STATES,
   trustAtLeast,
@@ -100,7 +101,8 @@ export async function opPeers(core: DaemonCore): Promise<string> {
     .map(({ peer, online }) => {
       const kind = peer.agent_kind === 'guycode' ? 'Guy Code' : peer.agent_kind === 'claude-code' ? 'Claude Code' : 'A2A agent';
       const exp = peer.trust_expires_ts ? `, until ${new Date(peer.trust_expires_ts).toISOString().slice(0, 16).replace('T', ' ')} UTC` : '';
-      return `- ${peer.peer_id} (${peer.display_name ?? peer.peer_id}, ${kind}) trust ${peer.trust}${exp}, ${online ? 'online' : 'offline'}`;
+      const relay = relayNoteForPeer(peer);
+      return `- ${peer.peer_id} (${peer.display_name ?? peer.peer_id}, ${kind}) trust ${peer.trust}${exp}, ${online ? 'online' : 'offline'}${relay ? `. ${relay}` : ''}`;
     })
     .join('\n');
 }

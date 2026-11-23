@@ -30,6 +30,7 @@ import { TERMINAL_STATES, isTrustLevel, trustAtLeast, type TaskState, type Trust
 import type { A2ANode } from './a2a/node';
 import { MAX_WAIT_MS, normaliseState, stateWord } from './a2a/waiters';
 import { escalationRefusal as sharedEscalationRefusal } from './a2a/escalation';
+import { relayNoteForPeer } from './a2a/relayCrypto';
 
 type NodeResolver = () => Promise<A2ANode>;
 let _resolver: NodeResolver | null = null;
@@ -498,7 +499,8 @@ const A2A_PEERS: ToolDef = {
         const eff = n.effectiveTrust(p);
         const trust = eff !== p.trust ? `${p.trust} (effective ${eff})` : p.trust;
         const exp = p.trust_expires_ts ? `, until ${new Date(p.trust_expires_ts).toISOString().slice(0, 16).replace('T', ' ')} UTC` : '';
-        return `- ${p.peer_id}: ${p.display_name ?? p.peer_id} (${kind}), trust ${trust}${exp}, ${online ? 'online' : 'offline'}, last seen ${seen}`;
+        const relay = relayNoteForPeer(p);
+        return `- ${p.peer_id}: ${p.display_name ?? p.peer_id} (${kind}), trust ${trust}${exp}, ${online ? 'online' : 'offline'}, last seen ${seen}${relay ? `. ${relay}` : ''}`;
       })
       .join('\n');
   },

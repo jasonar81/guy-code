@@ -170,3 +170,21 @@ export function applyA2AP3Schema(exec: (sql: string) => void, columnsOf: (table:
   addMissingColumns(exec, columnsOf, A2A_P3_COLUMNS);
   exec(A2A_P3_INDEX_SQL);
 }
+
+/**
+ * Relay (design 11a). End-to-end relay encryption derives its key from the
+ * peer's certificate PUBLIC KEY, which the fingerprint alone cannot give us:
+ *
+ *   a2a_peers.cert_pem  The peer's certificate PEM, exchanged during pairing and
+ *                       checked against cert_sha256 before it is stored. NULL for
+ *                       peers paired before relay support: they keep working
+ *                       directly but must re-pair to use the relay.
+ */
+export const A2A_RELAY_COLUMNS: ReadonlyArray<readonly [table: string, column: string, type: string]> = [
+  ['a2a_peers', 'cert_pem', 'TEXT'],
+];
+
+/** Apply the relay column. Guarded and re-runnable, like `applyA2AP2Schema`. */
+export function applyA2ARelaySchema(exec: (sql: string) => void, columnsOf: (table: string) => string[]): void {
+  addMissingColumns(exec, columnsOf, A2A_RELAY_COLUMNS);
+}

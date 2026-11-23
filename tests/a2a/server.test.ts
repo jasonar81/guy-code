@@ -332,6 +332,29 @@ describe('certificate pinning', () => {
     expect(r.status).toBe(400);
     expect(a.node.store.listPeers()).toHaveLength(0);
   });
+
+  it('a2a-pair refuses a cert PEM that does not hash to myCertSha256, before burning the invite', async () => {
+    const a = await node('Alice', 0);
+    const b = await node('Bob', 1);
+    const p = decodePairingCode(a.node.invite().code);
+    const body = {
+      inviteId: p.inviteId,
+      inviteSecret: p.inviteSecret,
+      myCardUrl: b.node.cardUrl(),
+      myCertSha256: cert(1).fingerprint,
+      myCertPem: cert(5).certPem, // someone else's cert
+      myDisplayName: 'Bob',
+      tokenForYouToCallMe: 'y'.repeat(43),
+    };
+    const r = await raw(a, 'POST', '/a2a-pair', { body });
+    expect(r.status).toBe(400);
+    expect(JSON.stringify(r.body)).toMatch(/myCertPem does not match myCertSha256/);
+    expect(a.node.store.listPeers()).toHaveLength(0);
+    // The invite was not burned: the honest request still works.
+    const ok = await raw(a, 'POST', '/a2a-pair', { body: { ...body, myCertPem: cert(1).certPem } });
+    expect(ok.status).toBe(200);
+    expect(a.node.store.listPeers()[0].cert_pem).toBe(cert(1).certPem);
+  });
 });
 
 describe('inbound messages', () => {

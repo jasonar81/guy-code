@@ -51,6 +51,8 @@ export interface PeerRow {
   card_json: string | null;
   last_seen_ts: number | null;
   created_ts: number | null;
+  /** Peer's certificate PEM (relay key derivation, design 11a). NULL for peers paired before relay support. */
+  cert_pem?: string | null;
 }
 
 export interface TaskRow {
@@ -195,6 +197,8 @@ export class A2AStore {
     tokenOut: string;
     tokenIn: string;
     cardJson?: string | null;
+    /** Peer cert PEM, already checked against certSha256 by the caller. */
+    certPem?: string | null;
     now?: number;
   }): PeerRow {
     const now = args.now ?? Date.now();
@@ -207,13 +211,14 @@ export class A2AStore {
     this.db
       .prepare(
         `INSERT INTO a2a_peers (peer_id, display_name, agent_kind, card_url, cert_sha256, trust,
-           token_out_ref, token_in_hash, card_json, last_seen_ts, created_ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           token_out_ref, token_in_hash, card_json, last_seen_ts, created_ts, cert_pem)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(peer_id) DO UPDATE SET
            display_name = excluded.display_name, agent_kind = excluded.agent_kind,
            card_url = excluded.card_url, cert_sha256 = excluded.cert_sha256,
            token_out_ref = excluded.token_out_ref, token_in_hash = excluded.token_in_hash,
-           card_json = excluded.card_json, last_seen_ts = excluded.last_seen_ts`
+           card_json = excluded.card_json, last_seen_ts = excluded.last_seen_ts,
+           cert_pem = excluded.cert_pem`
       )
       .run(
         args.peerId,
@@ -226,7 +231,8 @@ export class A2AStore {
         sha256Hex(args.tokenIn),
         args.cardJson ?? null,
         now,
-        prev?.created_ts ?? now
+        prev?.created_ts ?? now,
+        args.certPem ?? null
       );
     return this.getPeer(args.peerId)!;
   }

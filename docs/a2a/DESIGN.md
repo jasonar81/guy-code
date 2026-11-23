@@ -876,6 +876,65 @@ Total: roughly 2.5–3 weeks of focused work for one implementer.
 
 ---
 
+## 11a. Relay transport (added 2026-11-23) - for networks where nobody is reachable
+
+### Why
+§1 scoped this to "peer to peer over the company VPN, with no central broker". That assumption does
+not survive contact with a Fortinet SSL VPN. Measured on a real laptop:
+
+| from | to | result |
+|---|---|---|
+| laptop | net1 (a VPN server) | works |
+| WSL on the laptop | laptop:7427 | works (never leaves the host) |
+| net1 | laptop:7427 (Allow rule present) | **blocked** |
+| net1 | laptop:7499 (no rule at all) | **blocked** |
+| net1 | laptop (ICMP) | replies |
+
+A port with no firewall rule behaves exactly like one with an Allow rule, so the laptop's firewall
+is not the cause. The VPN assigns a **/32** with no subnet route, and the gateway forwards only
+traffic for sessions the client itself opened. This is the normal remote-access configuration, not
+a fault, and no local rule can change it. Two laptops therefore cannot reach each other at all -
+which also means **Claude Code to Claude Code is impossible** on this network without a relay,
+since neither side can accept a connection.
+
+### Shape
+A small service both sides **dial out** to. Each agent holds one long-lived outbound connection and
+receives work over it; nobody needs inbound reachability. It stays a relay, not a host: tasks,
+watches, trust and keys remain on each person's machine, so the existing security model and all of
+P1-P4 keep working. The relay only moves bytes.
+
+### The relay is UNTRUSTED (this is the important part)
+A naive relay would see every bearer token and every message body. Unacceptable on a shared box,
+and worse if IT hosts it later. Instead the payload is encrypted end to end, and the relay sees
+only `{to, iv, ct, tag}`.
+
+No new pairing step and no new dependency are needed, because pairing **already** exchanges each
+side's certificate, and those certs are EC P-256:
+
+```
+shared = crypto.diffieHellman({ privateKey: myCertKey, publicKey: theirPinnedCertPublicKey })
+key    = hkdf('sha256', shared, salt = sorted(fpA, fpB).join(':'), info = 'a2a-relay-v1', 32)
+payload= AES-256-GCM(key, iv, JSON{ method, path, headers, body })
+```
+
+Verified in a spike: both sides derive identical bytes; the bearer token and the message text are
+absent from the wire form; and a third party who pinned neither certificate fails the GCM auth tag.
+Binding the salt to the fingerprint pair stops a payload being replayed at a different peer.
+
+⚠ This is not forward secret - compromising a long-lived cert key exposes past traffic. Acceptable
+for v1 on an internal VPN, and the obvious upgrade is an ephemeral ECDH per session. Record it as a
+known limitation rather than pretending otherwise.
+
+### What the relay knows regardless
+Metadata: which fingerprints talk to each other, when, and how much. That is unavoidable for any
+relay and must be stated plainly in the docs. It is also the argument for the relay logging as
+little as possible and rotating what it does log.
+
+### Direct-first
+A peer record keeps its direct endpoint. The client tries direct, and falls back to the relay when
+the peer is unreachable, so a pair who *can* reach each other (two servers, or a LAN) keeps the
+lower-latency path and the relay carries only what it must.
+
 ## 12a. P0 spike results (2026-11-19) — corrections that override the text above
 
 Verified against the real sources, not inferred. Where this section disagrees with sections 5–7,

@@ -49,6 +49,7 @@ import type { PeerRow, TaskRow } from './store';
 import { A2A_SETTING, A2A_TLS_KEY_SECRET, readA2AConfig, resolveAdvertiseHost, resolveBindAddress } from './config';
 import { generateSelfSignedCert, fingerprintOfPem, type TlsIdentity } from './tls';
 import { A2ANode } from './node';
+import { relayNoteForPeer } from './relayCrypto';
 import type { RoutableSession, SessionPort } from './router';
 import type { SqlHandle } from './store';
 
@@ -371,6 +372,8 @@ export interface A2APanelPeer {
   trustExpiresTs: number | null;
   lastSeenTs: number | null;
   queued: number;
+  /** Why the relay cannot carry traffic for this peer (e.g. "re-pair"), or null. */
+  relayNote: string | null;
 }
 export interface A2APanelTask {
   taskId: string;
@@ -433,6 +436,7 @@ export function a2aPanelSnapshot(): A2APanelSnapshot {
     trustExpiresTs: p.trust_expires_ts,
     lastSeenTs: p.last_seen_ts,
     queued: n.store.listOutbox(p.peer_id).length,
+    relayNote: relayNoteForPeer(p),
   }));
   return {
     running: true,

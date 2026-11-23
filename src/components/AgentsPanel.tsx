@@ -267,6 +267,7 @@ export function AgentsPanel({ open, onClose, onOpenSession }: Props) {
                     {p.queued > 0 && <span className="text-[10px] text-amber-600">{p.queued} queued</span>}
                     <span className="ml-auto text-[10px] text-text-dim">{p.lastSeenTs ? relativeTime(p.lastSeenTs) : 'never seen'}</span>
                   </div>
+                  {p.relayNote && <div className="mt-1 text-[10px] text-amber-600">{p.relayNote}</div>}
                   <div className="mt-2 flex items-center gap-2">
                     <label className="text-text-dim text-[11px]">Trust</label>
                     <select

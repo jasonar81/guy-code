@@ -26,7 +26,7 @@
 import initSqlJs, { type Database } from 'sql.js';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, type SqlHandle } from './shared/protocol';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, type SqlHandle } from './shared/protocol';
 
 export const CC_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS cc_sessions (
@@ -73,6 +73,7 @@ export function applyDaemonSchema(raw: Database): void {
   };
   applyA2AP2Schema((q) => raw.exec(q), columnsOf);
   applyA2AP3Schema((q) => raw.exec(q), columnsOf);
+  applyA2ARelaySchema((q) => raw.exec(q), columnsOf);
   raw.exec(CC_SCHEMA_SQL);
 }
 

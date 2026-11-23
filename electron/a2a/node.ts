@@ -339,7 +339,13 @@ export class A2ANode {
   }
 
   identity(): LocalIdentity {
-    return { cardUrl: this.cardUrl(), certSha256: this.fingerprint(), displayName: this.opts.displayName, agentKind: this.agentKind };
+    return {
+      cardUrl: this.cardUrl(),
+      certSha256: this.fingerprint(),
+      certPem: this.opts.tls?.certPem,
+      displayName: this.opts.displayName,
+      agentKind: this.agentKind,
+    };
   }
 
   private changed(): void {

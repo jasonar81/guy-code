@@ -38,7 +38,7 @@ import * as fsp from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema } from './a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema } from './a2a/schema';
 import type { WaitA2AState } from './a2a/waiters';
 
 let SQL: SqlJsStatic | null = null;
@@ -1209,6 +1209,14 @@ function migrate(d: Database) {
       // goes in the existing `a2a_tasks.watch_json`. Guarded by PRAGMA
       // table_info like v15 (see a2a/schema.ts).
       up: (dd) => applyA2AP3Schema((sql) => dd.exec(sql), (table) => tableColumns(dd, table)),
+    },
+    {
+      version: 17,
+      // A2A relay (design 11a): `a2a_peers.cert_pem`, the peer's certificate,
+      // so relay traffic can be end-to-end encrypted with a key derived from
+      // its public key. Older peers keep NULL and must re-pair to use the
+      // relay. Guarded by PRAGMA table_info like v15 / v16 (see a2a/schema.ts).
+      up: (dd) => applyA2ARelaySchema((sql) => dd.exec(sql), (table) => tableColumns(dd, table)),
     },
   ];
 
