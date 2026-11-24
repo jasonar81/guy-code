@@ -26,6 +26,16 @@ export function relayLine(s: RelayStatus | null): string {
   if (!s) return 'Relay: off';
   return `Relay: ${s.state} (${s.url})${s.lastError && s.state !== 'connected' ? ` - last error: ${s.lastError}` : ''}`;
 }
+/** Rooms for this session (design 11b): its own identity and relay stream. */
+function roomsLine(core: DaemonCore, sessionId: string | null): string {
+  if (!sessionId) return 'Rooms: (no session)';
+  const rooms = core.node.roomStore.listRooms(sessionId);
+  const id = core.node.roomStore.getIdentity(sessionId);
+  const c = core.node.rooms.clientFor(sessionId);
+  if (!rooms.length) return 'Rooms: none for this session';
+  return `Rooms: ${rooms.map((r) => `"${r.display_name}"${r.status === 'pending' ? ' (join pending)' : ''}`).join(', ')}; session identity ${id ? id.fingerprint.slice(0, 12) : 'none'}, relay stream ${c ? c.status().state : 'not started'}`;
+}
+
 import {
   hookSessionEnd,
   hookSessionStart,
@@ -46,10 +56,25 @@ import {
   opWatch,
   type OpCtx,
 } from './ops';
+import { opPost, opRead, opRoom, opWaitAny } from './roomOps';
 
 const MAX_BODY = 512 * 1024;
 
-export const TOOL_NAMES = ['a2a_peers', 'a2a_send', 'a2a_request', 'a2a_reply', 'a2a_watch', 'a2a_tasks', 'a2a_inbox', 'a2a_cancel', 'a2a_wait'] as const;
+export const TOOL_NAMES = [
+  'a2a_peers',
+  'a2a_send',
+  'a2a_request',
+  'a2a_reply',
+  'a2a_watch',
+  'a2a_tasks',
+  'a2a_inbox',
+  'a2a_cancel',
+  'a2a_wait',
+  'a2a_room',
+  'a2a_post',
+  'a2a_read',
+  'a2a_wait_any',
+] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
 export interface LocalApi {
@@ -117,6 +142,14 @@ export async function runTool(core: DaemonCore, name: string, args: Record<strin
       return opCancel(core, args as any);
     case 'a2a_wait':
       return opWait(core, args as any, ctx, signal);
+    case 'a2a_room':
+      return opRoom(core, args as any, ctx);
+    case 'a2a_post':
+      return opPost(core, args as any, ctx);
+    case 'a2a_read':
+      return opRead(core, args as any, ctx);
+    case 'a2a_wait_any':
+      return opWaitAny(core, args as any, ctx, signal);
     default:
       return `error: unknown tool ${name}`;
   }
@@ -238,6 +271,7 @@ export function startLocalApi(core: DaemonCore, token: string, opts: { port?: nu
           `This session: ${s ? `${s.session_id.slice(0, 8)} in ${s.cwd ?? '?'}, label "${s.label ?? s.project ?? ''}"` : 'not registered'}`,
           `Delivery: ${mode}`,
           relayLine(core.node.relayStatus()),
+          roomsLine(core, ctx.sessionId),
           core.digest(ctx.sessionId),
         ];
         return send(res, 200, { text: lines.join('\n') });

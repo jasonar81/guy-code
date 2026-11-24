@@ -9,8 +9,11 @@
  *
  * State lives in ${CLAUDE_PLUGIN_DATA}:
  *   a2a.db         sql.js database (db.ts): Guy Code's A2A tables + cc_sessions + inbox
- *   secrets.json   mode 0600: peer bearer tokens, per-task push tokens and the
- *                  TLS private key (design 4.2.1 allows "a 0600 file under
+ *   secrets.json   mode 0600: peer bearer tokens, per-task push tokens, the
+ *                  TLS private key, and for rooms (design 11b) each Claude
+ *                  Code session's private key (a2a.session.<id>.key) and the
+ *                  room keys (a2a.room.<session>.<room>.<epoch>)
+ *                  (design 4.2.1 allows "a 0600 file under
  *                  ${CLAUDE_PLUGIN_DATA}" when no keychain module is present;
  *                  we deliberately add no native dependency)
  *   daemon.json    mode 0600: { pid, port, token, a2aUrl } for the local API
@@ -229,7 +232,11 @@ export async function main(): Promise<void> {
   const api = await startLocalApi(core, token);
   writePrivate(join(dir, DAEMON_JSON), JSON.stringify({ pid: process.pid, port: api.port, token, a2aUrl: core.node.origin(), version: PLUGIN_VERSION }));
   // A periodic backstop for watches (the node also arms in-process timers).
-  const sweep = setInterval(() => void core.node.sweepWatches().catch(() => {}), 60_000);
+  // ...and for room identities of sessions that ended and never came back.
+  const sweep = setInterval(() => {
+    void core.node.sweepWatches().catch(() => {});
+    void core.sweepEndedRoomSessions().catch(() => {});
+  }, 60_000);
   const shutdown = async () => {
     clearInterval(sweep);
     try {

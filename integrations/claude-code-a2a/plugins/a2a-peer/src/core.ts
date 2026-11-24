@@ -38,7 +38,7 @@ import {
   type RelayNodeOptions,
 } from './shared/protocol';
 import { CcStore, type InboxRow } from './inbox';
-import { ccSessionPort, HELD, metaFromEnvelope } from './port';
+import { ccSessionPort, HELD, metaFromEnvelope, roomEnvelopeForClaude } from './port';
 
 export interface DaemonCoreOptions {
   sql: SqlHandle;
@@ -161,6 +161,7 @@ export class DaemonCore {
    * proves Claude saw it.
    */
   pushItem(row: InboxRow): boolean {
+    if (row.routed_session) for (const w of [...this.inboxWaiters]) if (w.sessionId === row.routed_session) w.resolve(row);
     let sent = false;
     for (const sub of this.subscribers.values()) {
       if (!sub.sessionId || (row.routed_session && sub.sessionId !== row.routed_session)) continue;
@@ -219,6 +220,7 @@ export class DaemonCore {
     if (ev.direction !== 'out') return;
     if (ev.kind === 'state' && !stateWakes(null, ev.state, ev.approvalPending)) return;
     const t = this.node.store.getTask(ev.taskId);
+    if (t && ev.peerId.startsWith('room:')) return this.onRoomTaskEvent(t, ev);
     const peer = this.node.store.getPeer(ev.peerId);
     if (!t || !peer) return;
     const what = t.summary ? ` "${t.summary.replace(/\s+/g, ' ').slice(0, 80)}"` : '';
@@ -244,6 +246,94 @@ export class DaemonCore {
     const meta = metaFromEnvelope(envelope, { kind: 'task_update', state: stateWord(ev.state), task_id: t.task_id });
     const row = this.cc.addItem({ peer: peer.peer_id, taskId: t.task_id, contextId: t.context_id, sessionId: owner, kind: 'task_update', envelope, meta });
     this.pushItem(row);
+  }
+
+  /**
+   * A member answered one of OUR room requests (A2ANode.roomReply). A room
+   * task has no peer row - its peer_id is `room:<id>` - so the pairwise path
+   * above would drop it. The member's words still go inside the envelope.
+   */
+  private onRoomTaskEvent(t: TaskRow, ev: A2ATaskEvent): void {
+    const roomId = ev.peerId.slice('room:'.length);
+    const owner = t.session_id && this.cc.getSession(t.session_id) ? t.session_id : null;
+    const room = owner ? this.node.roomStore.getRoom(owner, roomId) : undefined;
+    const name = room?.display_name ?? roomId.slice(0, 8);
+    const what = t.summary ? ` "${t.summary.replace(/\s+/g, ' ').slice(0, 80)}"` : '';
+    const head =
+      ev.kind === 'message'
+        ? `[A2A task update] a member of room "${name}" answered your ${t.kind ?? ''} ${t.task_id.slice(0, 8)}${what}.`
+        : `[A2A task update] your ${t.kind ?? ''} ${t.task_id.slice(0, 8)}${what} in room "${name}" -> ${stateWord(ev.state)}.`;
+    const tail = `If this is what you were waiting for, continue the plan your user gave you and tell them in one line. To follow up, use a2a_post with room "${name}".`;
+    const envelope = `${head}\n${tail}\n${roomEnvelopeForClaude(
+      buildEnvelope({
+        peerId: 'room-member',
+        displayName: `a member of room "${name}"`,
+        agentKind: 'other',
+        trust: 'inform',
+        kind: 'inform',
+        taskId: t.task_id,
+        room: name,
+        text: ev.text || `(no text; the task is now ${stateWord(ev.state)})`,
+        dialect: 'claude-code',
+      })
+    )}`;
+    const meta = metaFromEnvelope(envelope, { kind: 'task_update', state: stateWord(ev.state), task_id: t.task_id, room: name });
+    const row = this.cc.addItem({ peer: `room:${name}`, taskId: t.task_id, contextId: t.context_id, sessionId: owner, kind: 'task_update', envelope, meta });
+    this.pushItem(row);
+  }
+
+  // ---- rooms: session lifecycle (design 11b "One identity per session") --------
+
+  /**
+   * A Claude Code session went away for good: leave its rooms (signed leave,
+   * then a relay leave) and drop its identity - the cert row and the private
+   * key in secrets.json. Never touches a session that has no identity.
+   */
+  async forgetRoomSession(sessionId: string, why: string): Promise<boolean> {
+    if (!this.node.roomStore.getIdentity(sessionId) && !this.node.roomStore.listRooms(sessionId, true).length) return false;
+    await this.node.forgetSession(sessionId);
+    this.node.audit.write({ event: 'cc.session', sessionId, action: 'rooms_forgotten', reason: why });
+    return true;
+  }
+
+  /**
+   * Sessions that ended (SessionEnd without `/clear`) keep their identity and
+   * rooms so `claude --resume` can carry on as the same member. One that has
+   * not come back after SESSION_STALE_MS has gone away: forget it.
+   */
+  async sweepEndedRoomSessions(maxAgeMs = 7 * 24 * 3_600_000): Promise<number> {
+    let n = 0;
+    const now = this.now();
+    for (const s of this.cc.listSessions(true)) {
+      if (s.ended_ts == null || now - s.ended_ts < maxAgeMs) continue;
+      if (await this.forgetRoomSession(s.session_id, 'ended')) n++;
+    }
+    return n;
+  }
+
+  // ---- wait for anything (design 11c): the inbox side ----------------------------
+
+  private readonly inboxWaiters = new Set<{ sessionId: string; resolve(row: InboxRow): void }>();
+
+  /** Resolve on the next inbox item routed to this session (pairwise message, task update, room message). */
+  nextInboxItem(sessionId: string, signal: AbortSignal): Promise<InboxRow | null> {
+    return new Promise((resolve) => {
+      if (signal.aborted) return resolve(null);
+      const w = {
+        sessionId,
+        resolve: (row: InboxRow) => {
+          this.inboxWaiters.delete(w);
+          signal.removeEventListener('abort', onAbort);
+          resolve(row);
+        },
+      };
+      const onAbort = () => {
+        this.inboxWaiters.delete(w);
+        resolve(null);
+      };
+      signal.addEventListener('abort', onAbort);
+      this.inboxWaiters.add(w);
+    });
   }
 
   /** Accept a held request because Claude is answering it after asking its user (design 7.2). */

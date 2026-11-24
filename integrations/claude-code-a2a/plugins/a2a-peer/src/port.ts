@@ -13,7 +13,7 @@
  * session starts": it returns a placeholder id, and `add` stores the item
  * with routed_session NULL, which the next SessionStart claims.
  */
-import { parseEnvelope, type RoutableSession, type SessionPort } from './shared/protocol';
+import { HEADER_PREFIX, parseEnvelope, type RoutableSession, type SessionPort } from './shared/protocol';
 import type { CcStore, InboxRow } from './inbox';
 
 /** Placeholder session id for "no session yet: hold it" (design 7.2). */
@@ -42,13 +42,46 @@ export function metaFromEnvelope(envelope: string, extra: Record<string, string>
   return { ...meta, ...extra };
 }
 
+/** The room name from an envelope header (`... · room "loader fix" · ...]`), or null. */
+export function roomOfEnvelope(envelope: string): string | null {
+  // The header line only (a wait note puts one line in front of it); never the peer's body.
+  const header = String(envelope ?? '')
+    .split('\n')
+    .find((l) => l.startsWith(HEADER_PREFIX));
+  const m = header ? /· room "([^"]*)"/.exec(header) : null;
+  return m ? m[1] : null;
+}
+
+/**
+ * Room messages (design 11b) arrive in Guy Code's envelope with the
+ * claude-code dialect. For an `inform` that dialect's last line says "use
+ * a2a_send with peer <member>", which is wrong in a room: the member handle
+ * is not a paired peer, and the answer belongs in the room. Swap that one
+ * line for the room's own instruction. The header, the untrusted-content
+ * preamble and the body are untouched. Request / notify hints (a2a_reply /
+ * a2a_watch with the task_id) are already right and are left alone.
+ */
+export function roomEnvelopeForClaude(envelope: string): string {
+  const room = roomOfEnvelope(envelope);
+  if (!room) return envelope;
+  return envelope.replace(
+    /^Tell your user in one line what arrived\. To answer .*'s agent, use a2a_send with peer .*$/m,
+    `Tell your user in one line what arrived. Everyone in room "${room}" sees this. To answer, use a2a_post with room "${room}".`
+  );
+}
+
 export function ccSessionPort(store: CcStore, sink: InboxSink, muted: () => boolean = () => false): SessionPort {
-  const add = (sessionId: string, text: string) => {
+  const add = (sessionId: string, raw: string) => {
     // Muted while the daemon accepts a held request on Claude's own a2a_reply:
     // Claude is answering it, so re-delivering the same envelope would only
     // show it twice.
     if (muted()) return;
-    const meta = metaFromEnvelope(text);
+    const text = roomEnvelopeForClaude(raw);
+    const room = roomOfEnvelope(text);
+    // Every room request / notify is created HELD (A2ANode.roomInTask): say
+    // so in the meta, as onApprovalNeeded does for a pairwise one.
+    const meta = metaFromEnvelope(text, room ? { room } : {});
+    if (room && meta.kind !== 'inform' && meta.kind !== 'runtime_note') meta.approval = 'pending';
     const row = store.addItem({
       peer: meta.from ?? null,
       taskId: meta.task_id ?? null,

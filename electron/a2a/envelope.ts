@@ -152,6 +152,13 @@ function claudeCodeHint(e: EnvelopeInput, who: string, tid: string): string {
       `action "complete" with the answer, "needs_input" if your user must decide first, "reject" to decline, or "working" for a progress note.`
     );
   }
+  // A ROOM message is not from a paired peer, so the pairwise hint would send
+  // the model to `a2a_send with peer "<sender>"` and fail: the sender is a
+  // room member, not a peer. Answer in the room instead.
+  const room = headerSafe(e.room, 128);
+  if (room) {
+    return `Tell your user in one line what arrived. To answer, use a2a_post with room "${room}" (it goes to everyone in the room, not just ${who}).`;
+  }
   const ctx = headerSafe(e.contextId, 64);
   return ctx
     ? `Tell your user in one line what arrived. To answer ${who}'s agent, use a2a_send with peer "${who}" and context_id "${ctx}".`

@@ -17,7 +17,14 @@
  * code going through this one file so the boundary stays visible.
  */
 export { A2ANode, type A2ANodeOptions } from '../../../../../../electron/a2a/node';
-export { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema } from '../../../../../../electron/a2a/schema';
+export { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, applyA2ARoomsSchema } from '../../../../../../electron/a2a/schema';
+// Rooms (design 11b / 11c). A2ANode already owns a RoomManager (rooms.ts) and
+// a RoomStore (roomStore.ts); the plugin drives those same objects, so the
+// sealed + signed wire format, the key boxes, the a2r1: invite codes and the
+// approval hold on room requests are Guy Code's code, not a copy.
+export { memberHandle, memberLabel, type PostResult, type RoomView } from '../../../../../../electron/a2a/rooms';
+export { type RoomRow, type MemberRow, type RoomMessageRow } from '../../../../../../electron/a2a/roomStore';
+export { INSTALL_OWNER } from '../../../../../../electron/a2a/waiters';
 export { type SecretPort, type SqlHandle, type PeerRow, type TaskRow } from '../../../../../../electron/a2a/store';
 export { lastPathSegment, type RoutableSession, type SessionPort } from '../../../../../../electron/a2a/router';
 export { buildEnvelope, parseEnvelope, HEADER_PREFIX } from '../../../../../../electron/a2a/envelope';

@@ -15,6 +15,8 @@ import { join } from 'node:path';
 import { DaemonCore, type ChannelSubscriber } from '../../../integrations/claude-code-a2a/plugins/a2a-peer/src/core';
 import { openMemoryDb } from '../../../integrations/claude-code-a2a/plugins/a2a-peer/src/db';
 import type { WatchCheckFn, WatchCheckResult } from '../../../electron/a2a/watch';
+import type { RelayNodeOptions } from '../../../electron/a2a/node';
+import type { SqlHandle } from '../../../electron/a2a/store';
 import { cert, memSecrets, type TestNode } from '../helpers';
 
 export interface TestDaemon {
@@ -24,12 +26,20 @@ export interface TestDaemon {
   auditPath: string;
 }
 
-export async function makeDaemon(opts: { name: string; certIndex: number; watchCheck?: WatchCheckFn }): Promise<TestDaemon> {
-  const { sql } = await openMemoryDb();
-  const secrets = memSecrets();
-  const dir = mkdtempSync(join(tmpdir(), 'a2a-plugin-'));
-  const clock = { now: Date.now() };
-  const auditPath = join(dir, 'audit.jsonl');
+export async function makeDaemon(opts: {
+  name: string;
+  certIndex: number;
+  watchCheck?: WatchCheckFn;
+  /** Rooms tests: relay settings and relay-only mode. */
+  relay?: RelayNodeOptions | null;
+  listen?: boolean;
+  /** Restart tests: reuse a previous daemon's database, secrets and audit file. */
+  reuse?: { sql: SqlHandle; secrets: ReturnType<typeof memSecrets>; auditPath: string; clock: { now: number } };
+}): Promise<TestDaemon & { sql: SqlHandle }> {
+  const sql = opts.reuse?.sql ?? (await openMemoryDb()).sql;
+  const secrets = opts.reuse?.secrets ?? memSecrets();
+  const clock = opts.reuse?.clock ?? { now: Date.now() };
+  const auditPath = opts.reuse?.auditPath ?? join(mkdtempSync(join(tmpdir(), 'a2a-plugin-')), 'audit.jsonl');
   const core = new DaemonCore({
     sql,
     secrets,
@@ -45,9 +55,11 @@ export async function makeDaemon(opts: { name: string; certIndex: number; watchC
     autoFlush: false,
     autoWatch: false,
     watchCheck: opts.watchCheck,
+    relay: opts.relay ?? null,
+    listen: opts.listen,
   });
   await core.start();
-  return { core, secrets, clock, auditPath };
+  return { core, secrets, clock, auditPath, sql };
 }
 
 /** Guy Code node invites; the daemon redeems. Returns each side's handle for the other. */

@@ -15,7 +15,13 @@
  *     Channel notifications are NOT acknowledged by Claude Code and are
  *     dropped silently when channels are off, so "delivered" proves nothing;
  *     only "acked" stops the UserPromptSubmit hook from re-surfacing it;
- *   - `cc_settings`: small key/value settings (TLS certificate, labels).
+ *   - `cc_settings`: small key/value settings (TLS certificate, labels);
+ *   - the rooms tables (design 11b, Guy Code migration v18, schema.ts
+ *     A2A_ROOMS_SQL): `a2a_session_identities` (one cert per Claude Code
+ *     SESSION; its private key is in secrets.json as a2a.session.<id>.key),
+ *     `a2a_rooms`, `a2a_room_members`, `a2a_room_messages`,
+ *     `a2a_room_invites`. All CREATE TABLE IF NOT EXISTS, so an existing
+ *     a2a.db gains them on the next daemon start and re-running is harmless.
  *
  * sql.js (pure WASM, already a Guy Code dependency) rather than a native
  * sqlite module, so the plugin needs no compiler on install and runs on any
@@ -26,7 +32,7 @@
 import initSqlJs, { type Database } from 'sql.js';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, type SqlHandle } from './shared/protocol';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, applyA2ARoomsSchema, type SqlHandle } from './shared/protocol';
 
 export const CC_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS cc_sessions (
@@ -74,6 +80,9 @@ export function applyDaemonSchema(raw: Database): void {
   applyA2AP2Schema((q) => raw.exec(q), columnsOf);
   applyA2AP3Schema((q) => raw.exec(q), columnsOf);
   applyA2ARelaySchema((q) => raw.exec(q), columnsOf);
+  // Rooms (Guy Code migration v18): without these tables A2ANode's
+  // RoomManager finds nothing to list and rooms silently switch themselves off.
+  applyA2ARoomsSchema((q) => raw.exec(q));
   raw.exec(CC_SCHEMA_SQL);
 }
 

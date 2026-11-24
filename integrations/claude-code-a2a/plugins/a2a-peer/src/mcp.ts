@@ -90,7 +90,8 @@ function httpBackend(getClient: () => LocalClient | null, conn: () => string | n
       const c = getClient();
       if (!c) throw new Error('daemon not running');
       // a2a_wait may block up to 10 minutes inside the daemon.
-      const timeout = name === 'a2a_wait' ? 11 * 60_000 : 20_000;
+      // a2a_room join waits up to ~30 s for the inviter's admit (connect + JOIN_WAIT_MS).
+      const timeout = name === 'a2a_wait' || name === 'a2a_wait_any' ? 11 * 60_000 : name === 'a2a_room' ? 60_000 : 20_000;
       const r = await c.request<{ text: string }>('POST', `/local/tool/${name}`, { args, conn: conn(), cwd: process.env.CLAUDE_PROJECT_DIR || process.cwd() }, timeout);
       return r.text;
     },

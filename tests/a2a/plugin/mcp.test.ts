@@ -74,11 +74,25 @@ describe('MCP server: capabilities and instructions', () => {
     }
   });
 
-  it('lists exactly the nine a2a_* tools and forwards calls; the result echoes what was sent', async () => {
+  it('lists exactly the nine a2a_* tools plus the four room tools and forwards calls; the result echoes what was sent', async () => {
     const calls: Array<{ name: string; args: unknown }> = [];
     const { client } = await connected(calls);
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(['a2a_cancel', 'a2a_inbox', 'a2a_peers', 'a2a_reply', 'a2a_request', 'a2a_send', 'a2a_tasks', 'a2a_wait', 'a2a_watch']);
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'a2a_cancel',
+      'a2a_inbox',
+      'a2a_peers',
+      'a2a_post',
+      'a2a_read',
+      'a2a_reply',
+      'a2a_request',
+      'a2a_room',
+      'a2a_send',
+      'a2a_tasks',
+      'a2a_wait',
+      'a2a_wait_any',
+      'a2a_watch',
+    ]);
     const r = await client.callTool({ name: 'a2a_send', arguments: { peer: 'dylan', text: "we're changing the retry policy" } });
     expect((r.content as Array<{ text: string }>)[0].text).toBe(`sent to dylan: "we're changing the retry policy" (task 7f3c1234, COMPLETED).`);
     expect(calls).toEqual([{ name: 'a2a_send', args: { peer: 'dylan', text: "we're changing the retry policy" } }]);
@@ -175,7 +189,7 @@ describe('plugin layout and manifests (validated against the plugins reference)'
 
   it('every command and the skill exist; commands that change state go through the CLI (Bash permission prompt)', () => {
     const cmds = readdirSync(join(PLUGIN, 'commands')).sort();
-    expect(cmds).toEqual(['inbox.md', 'log.md', 'pair.md', 'peers.md', 'status.md', 'tasks.md', 'trust.md']);
+    expect(cmds).toEqual(['inbox.md', 'log.md', 'pair.md', 'peers.md', 'post.md', 'read.md', 'room.md', 'status.md', 'tasks.md', 'trust.md', 'wait.md']);
     for (const c of ['pair.md', 'trust.md']) expect(readFileSync(join(PLUGIN, 'commands', c), 'utf8')).toContain('${CLAUDE_PLUGIN_ROOT}/dist/cli.js');
     // Normalise line endings first: git checks these files out with CRLF on
     // Windows, so a \n-only regex passes on Linux and macOS and fails on the
