@@ -213,6 +213,13 @@ export function registerIpc(getMainWindow: () => BrowserWindow | null) {
         `[ipc] deleteFromDisk: attachments cleanup failed: ${(e as Error).message}`
       );
     }
+    // A2A rooms (design 11b): the session leaves its rooms and its own
+    // identity is dropped. Best effort; never blocks the delete.
+    try {
+      await (await import('./a2a/index')).a2aSessionDeleted(id);
+    } catch (e) {
+      log.warn(`[ipc] deleteFromDisk: A2A room cleanup failed: ${(e as Error).message}`);
+    }
     // Finally drop the DB row (and dependent rows). This is what makes
     // it disappear from the sidebar.
     deleteSession(id);

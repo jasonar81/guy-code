@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
 import { X, RefreshCw, Check, Ban, Copy, PauseCircle, PlayCircle, AlertTriangle } from 'lucide-react';
-import type { A2APanelPeer, A2APanelSnapshot, A2APanelTask, A2ARelayStatus, A2ATrust } from '@/types';
+import type { A2APanelPeer, A2APanelRoom, A2APanelSnapshot, A2APanelTask, A2ARelayStatus, A2ATrust } from '@/types';
 import { relativeTime } from '@/lib/format';
 
 interface Props {
@@ -372,6 +372,7 @@ export function AgentsPanel({ open, onClose, onOpenSession }: Props) {
                   </div>
                 </div>
               ))}
+              <RoomList rooms={snap?.rooms ?? []} />
             </section>
           )}
 
@@ -413,6 +414,45 @@ export function AgentsPanel({ open, onClose, onOpenSession }: Props) {
           />
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Rooms (design 11b) next to the peers: each room with its members and which
+ * session each member is - this session, another session of this Guy Code,
+ * or a colleague's agent (with their session label when they sent one).
+ */
+export function RoomList({ rooms }: { rooms: A2APanelRoom[] }) {
+  if (!rooms.length) return <p className="text-[12px] text-text-dim italic">No rooms yet. Ask a session to "create a room" (A2ARoom).</p>;
+  return (
+    <div className="space-y-2">
+      <h3 className="text-[12px] font-semibold text-text">Rooms</h3>
+      {rooms.map((r) => (
+        <div key={`${r.sessionId}|${r.roomId}`} className="border border-border rounded p-3 text-[12px]" data-testid="a2a-room">
+          <div className="flex items-center gap-2">
+            <span className="font-medium text-text">{r.name}</span>
+            <span className="text-text-dim">
+              {r.migratedFrom ? `paired with ${r.migratedFrom}` : `as session ${r.sessionLabel ?? r.sessionId.slice(0, 8)}`}
+            </span>
+            {r.status === 'pending' && <span className="text-[10px] text-amber-600">join pending</span>}
+            {r.relayState && <span className="ml-auto text-[10px] text-text-dim">relay {r.relayState}</span>}
+          </div>
+          <ul className="mt-1 space-y-0.5">
+            {r.members.map((m) => (
+              <li key={m.fingerprint} className="text-[11px] text-text-muted">
+                <span className="font-mono">{m.handle}</span>{' '}
+                {m.you
+                  ? 'this session'
+                  : m.localSessionId
+                    ? `session "${m.sessionLabel ?? m.localSessionId.slice(0, 8)}" of this Guy Code`
+                    : `${m.displayName ?? 'member'}${m.sessionLabel ? ` - session "${m.sessionLabel}"` : ''}`}
+                {m.agentKind ? ` (${m.agentKind === 'claude-code' ? 'Claude Code' : m.agentKind === 'guycode' ? 'Guy Code' : m.agentKind})` : ''}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
     </div>
   );
 }

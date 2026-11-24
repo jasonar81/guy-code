@@ -50,6 +50,7 @@ import { A2A_SETTING, A2A_TLS_KEY_SECRET, normaliseRelayUrl, readA2AConfig, reso
 import { generateSelfSignedCert, fingerprintOfPem, type TlsIdentity } from './tls';
 import { A2ANode, type RelayNodeOptions } from './node';
 import { relayNoteForPeer } from './relayCrypto';
+import { memberHandle } from './rooms';
 import type { RoutableSession, SessionPort } from './router';
 import type { SqlHandle } from './store';
 
@@ -454,12 +455,66 @@ export interface A2APanelTask {
   lastText: string;
   updatedTs: number | null;
 }
+export interface A2APanelRoomMember {
+  fingerprint: string;
+  handle: string;
+  displayName: string | null;
+  sessionLabel: string | null;
+  agentKind: string | null;
+  /** This member is the local session that owns this room row. */
+  you: boolean;
+  /** Another session of THIS Guy Code (id), or null. */
+  localSessionId: string | null;
+  sameInstall: boolean;
+}
+export interface A2APanelRoom {
+  roomId: string;
+  name: string;
+  /** The local session that is the member, or '@install' for a paired peer's room. */
+  sessionId: string;
+  sessionLabel: string | null;
+  status: string;
+  epoch: number;
+  migratedFrom: string | null;
+  members: A2APanelRoomMember[];
+  /** Relay connection state of that session's identity. */
+  relayState: string | null;
+}
 export interface A2APanelSnapshot {
   running: boolean;
   paused: boolean;
   peers: A2APanelPeer[];
   pending: A2APanelTask[];
   tasks: A2APanelTask[];
+  rooms?: A2APanelRoom[];
+}
+
+function panelRooms(n: A2ANode): A2APanelRoom[] {
+  const sessions = listSessionsAll();
+  const labelOf = (id: string | null) => {
+    const s = id ? sessions.find((r) => r.id === id) : undefined;
+    return s ? label(s as unknown as RoutableSession) || id!.slice(0, 8) : null;
+  };
+  return n.rooms.list().map((v) => ({
+    roomId: v.room.room_id,
+    name: v.room.display_name ?? v.room.room_id,
+    sessionId: v.owner,
+    sessionLabel: v.owner === '@install' ? null : labelOf(v.owner),
+    status: v.room.status,
+    epoch: v.room.epoch,
+    migratedFrom: v.room.migrated_from,
+    relayState: n.rooms.clientFor(v.owner)?.status().state ?? null,
+    members: v.members.map((m) => ({
+      fingerprint: m.fingerprint,
+      handle: memberHandle(m),
+      displayName: m.display_name,
+      sessionLabel: m.localSession ? labelOf(m.localSession) ?? m.session_label : m.session_label,
+      agentKind: m.agent_kind,
+      you: m.you,
+      localSessionId: m.localSession,
+      sameInstall: m.sameInstall,
+    })),
+  }));
 }
 
 function panelTask(t: TaskRow): A2APanelTask {
@@ -511,6 +566,7 @@ export function a2aPanelSnapshot(): A2APanelSnapshot {
     peers,
     pending: n.pendingApprovals().map(panelTask),
     tasks: n.store.listTasks({ limit: 100 }).map(panelTask),
+    rooms: panelRooms(n),
   };
 }
 
@@ -553,6 +609,28 @@ export function a2aPanelInvite(): { code: string; expires: number } {
 
 export async function a2aPanelRevoke(peerId: string): Promise<void> {
   await requireA2ANode().revoke(peerId);
+}
+
+/**
+ * A session is being deleted: leave its rooms at the relay (best effort, a
+ * few seconds at most) and drop its per-session identity and room keys from
+ * secret storage. db.deleteSession removes the rows either way.
+ */
+export async function a2aSessionDeleted(sessionId: string): Promise<void> {
+  const n = _node;
+  if (!n || !n.isRunning()) {
+    // A2A off: still drop the private key and room keys from secret storage.
+    try {
+      const { RoomStore } = await import('./roomStore');
+      const rs = new RoomStore(db() as unknown as SqlHandle, { set: setSecret, get: getSecret, clear: clearSecret });
+      for (const r of rs.listRooms(sessionId, true)) rs.deleteRoom(sessionId, r.room_id);
+      rs.deleteIdentity(sessionId);
+    } catch (e) {
+      log.warn('[a2a] could not clear room state for a deleted session', e);
+    }
+    return;
+  }
+  await n.forgetSession(sessionId).catch((e) => log.warn('[a2a] leaving rooms for a deleted session failed', e));
 }
 
 export function a2aPanelAudit(limit = 300): Array<Record<string, unknown>> {

@@ -188,3 +188,89 @@ export const A2A_RELAY_COLUMNS: ReadonlyArray<readonly [table: string, column: s
 export function applyA2ARelaySchema(exec: (sql: string) => void, columnsOf: (table: string) => string[]): void {
   addMissingColumns(exec, columnsOf, A2A_RELAY_COLUMNS);
 }
+
+/**
+ * Rooms (design 11b), migration v18. All new tables, so every statement is
+ * IF NOT EXISTS and the migration is safe to re-run.
+ *
+ *   a2a_session_identities  ONE identity per SESSION (11b "One identity per
+ *                           session"): the relay keeps one stream per
+ *                           fingerprint, so two sessions sharing the install
+ *                           cert evict each other. Public cert here; the
+ *                           private key lives in secret storage under
+ *                           `a2a.session.<sessionId>.key`.
+ *   a2a_rooms               One row per (session, room): membership is by
+ *                           session, so two sessions of one install in the
+ *                           same room are two rows. The room KEY is not here:
+ *                           it is in secret storage (`a2a.room.<session>.<room>`).
+ *   a2a_room_members        The roster each member keeps: fingerprint + public
+ *                           key (SPKI, base64url) for signature checks, plus
+ *                           who it is (user name, session label). left_ts set =
+ *                           no longer a member; their posts are then dropped.
+ *   a2a_room_messages       Per-session inbox (and own posts) for "read recent
+ *                           messages", and dedup of relay redeliveries.
+ *   a2a_room_invites        Room invite secrets, SHA-256 only, single use,
+ *                           short expiry - the same rules as a2a_invites.
+ */
+export const A2A_ROOMS_SQL = `
+  CREATE TABLE IF NOT EXISTS a2a_session_identities (
+    session_id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    cert_pem TEXT NOT NULL,
+    created_ts INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS a2a_rooms (
+    session_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    display_name TEXT,
+    relay_url TEXT,
+    status TEXT NOT NULL,
+    epoch INTEGER NOT NULL DEFAULT 0,
+    trust TEXT NOT NULL DEFAULT 'inform',
+    migrated_from TEXT,
+    created_ts INTEGER,
+    joined_ts INTEGER,
+    PRIMARY KEY (session_id, room_id)
+  );
+  CREATE TABLE IF NOT EXISTS a2a_room_members (
+    session_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    display_name TEXT,
+    session_label TEXT,
+    agent_kind TEXT,
+    install_fp TEXT,
+    joined_ts INTEGER,
+    left_ts INTEGER,
+    PRIMARY KEY (session_id, room_id, fingerprint)
+  );
+  CREATE TABLE IF NOT EXISTS a2a_room_messages (
+    session_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    sender_fp TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    type TEXT,
+    kind TEXT,
+    text TEXT,
+    outgoing INTEGER NOT NULL DEFAULT 0,
+    task_id TEXT,
+    ts INTEGER,
+    PRIMARY KEY (session_id, room_id, sender_fp, msg_id)
+  );
+  CREATE INDEX IF NOT EXISTS a2a_room_messages_ts ON a2a_room_messages(session_id, room_id, ts);
+  CREATE TABLE IF NOT EXISTS a2a_room_invites (
+    invite_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    secret_hash TEXT NOT NULL,
+    expires_ts INTEGER NOT NULL,
+    used_ts INTEGER,
+    created_ts INTEGER
+  );
+`;
+
+/** Apply the rooms tables. Re-runnable (every statement is IF NOT EXISTS). */
+export function applyA2ARoomsSchema(exec: (sql: string) => void): void {
+  exec(A2A_ROOMS_SQL);
+}

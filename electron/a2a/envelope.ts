@@ -46,6 +46,8 @@ export interface EnvelopeInput {
    * so parseEnvelope reads both.
    */
   dialect?: EnvelopeDialect;
+  /** Set for a room message (design 11b): the room's name, shown in the header and used by the reply hint. */
+  room?: string | null;
 }
 
 export type EnvelopeDialect = 'guycode' | 'claude-code';
@@ -93,6 +95,8 @@ export function buildEnvelope(e: EnvelopeInput): string {
   }
   if (e.taskId) parts.push(`task ${headerSafe(e.taskId, 64)}`);
   if (e.contextId) parts.push(`context ${headerSafe(e.contextId, 64)}`);
+  const room = headerSafe(e.room, 60);
+  if (room) parts.push(`room "${room}"`);
   const label = headerSafe(e.fromSessionLabel, 60);
   const proj = headerSafe(e.fromProject, 60);
   if (label || proj) parts.push(`from ${label ? `"${label}"` : ''}${label && proj ? ' ' : ''}${proj ? `(${proj})` : ''}`);
@@ -119,6 +123,8 @@ export function buildEnvelope(e: EnvelopeInput): string {
         `action "complete" with the outcome when it happens; use "reject" to decline or "needs_input" if your user must decide.`
       : `This is a REQUEST from ${who}'s agent. Tell your user in one line. Answer it with A2AReply, taskId "${tid}": ` +
         `action "complete" with the answer, "needs_input" if your user must decide first, "reject" to decline, or "working" for a progress note.`
+    : room
+    ? `Tell your user in one line what arrived. Everyone in room "${room}" sees this. To answer, use A2APost with room "${room}".`
     : e.contextId
     ? `Tell your user in one line what arrived. To answer ${who}'s agent, use A2ASend with peer "${who}" and contextId "${headerSafe(e.contextId, 64)}".`
     : `Tell your user in one line what arrived. To answer ${who}'s agent, use A2ASend with peer "${who}".`;

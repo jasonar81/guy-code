@@ -34,6 +34,9 @@ import { deriveRelayKey, deriveRelayKeyFromPublicKey, publicKeyFromRelayKey, rel
 import { normaliseFingerprint } from './tls';
 import { normaliseRelayUrl } from './config';
 import type { PairingCodePayload } from './types';
+import { RoomStore, type RoomRow } from './roomStore';
+import { RoomManager } from './rooms';
+import { INSTALL_OWNER } from './waiters';
 import {
   A2AClientError,
   RELAY_SCHEME,
@@ -242,6 +245,9 @@ export class A2ANode {
   readonly store: A2AStore;
   readonly audit: AuditLog;
   readonly waiters: Waiters;
+  /** Rooms (design 11b): per-session identities, rosters, inbox. */
+  readonly roomStore: RoomStore;
+  readonly rooms: RoomManager;
   private server: A2AServer | null = null;
   private listening = false;
   private relay: RelayClient | null = null;
@@ -261,6 +267,33 @@ export class A2ANode {
     this.now = opts.now ?? Date.now;
     this.agentKind = opts.agentKind ?? 'guycode';
     this.waiters = new Waiters(opts.waits);
+    this.roomStore = new RoomStore(opts.sql, opts.secrets);
+    const self = this;
+    this.rooms = new RoomManager({
+      rooms: this.roomStore,
+      audit: this.audit,
+      waiters: this.waiters,
+      sessions: opts.sessions,
+      now: () => this.now(),
+      log: opts.log,
+      displayName: opts.displayName,
+      agentKind: this.agentKind,
+      dialect: opts.envelopeDialect,
+      installIdentity: () => opts.tls,
+      relayOptions: () => self.relayOpts,
+      sessionLabel: (id) => {
+        const s = opts.sessions.listSessions().find((r) => r.id === id);
+        return (s?.user_title || s?.title || '').trim() || null;
+      },
+      createInTask: (a) => this.roomInTask(a),
+      applyReply: (a) => this.roomReply(a),
+      pairSend: async (peerId, kind, text, sessionId) => {
+        const r = kind === 'inform' ? await this.send({ peer: peerId, text, sessionId }) : await this.request({ peer: peerId, text, kind, sessionId });
+        const line = r.queued ? `${peerId}'s agent is offline; queued for 24h` : `delivered to ${peerId} (${stateWord(r.state)})`;
+        return { taskId: r.taskId, line };
+      },
+      changed: () => this.changed(),
+    });
     this.watches = new WatchRunner(
       {
         list: () =>
@@ -321,6 +354,7 @@ export class A2ANode {
               relayFrom: ctx?.relayFrom,
             });
             this.relayKeys.delete(normaliseFingerprint(peer.cert_sha256));
+            this.syncPairRooms(false);
             this.audit.write({ event: 'pair.accepted', peer: peer.peer_id, displayName: peer.display_name, cardUrl: peer.card_url, remote, via: ctx?.relayFrom ? 'relay' : 'direct' });
             this.changed();
             return response;
@@ -336,6 +370,7 @@ export class A2ANode {
     if (this.listening) await server.start();
     this.server = server;
     this.audit.write({ event: 'server.started', url: this.origin(), listening: this.listening });
+    this.syncPairRooms();
     if (this.opts.relay) this.setRelay(this.opts.relay);
     if (this.opts.autoFlush !== false) {
       this.flushTimer = setInterval(() => void this.flushOutbox().catch(() => {}), OUTBOX_TICK_MS);
@@ -354,6 +389,7 @@ export class A2ANode {
     this.flushTimer = null;
     this.relay?.stop();
     this.relay = null;
+    this.rooms.stop();
     const s = this.server;
     this.server = null;
     if (s) {
@@ -390,6 +426,9 @@ export class A2ANode {
     this.relay = null;
     this.relayOpts = cfg;
     const url = cfg ? normaliseRelayUrl(cfg.url) : '';
+    // Rooms: one relay connection per session that is in a room, each with
+    // that session's own identity (design 11b). Independent of the install's.
+    this.rooms.start(this.server ? cfg : null);
     if (!cfg || !url || !this.server) {
       this.changed();
       return;
@@ -429,6 +468,148 @@ export class A2ANode {
       log: this.opts.log,
     });
     this.relay.start();
+  }
+
+  // ---- rooms glue (design 11b) ------------------------------------------------------
+
+  /**
+   * Migration: every paired peer with a stored certificate is also a
+   * two-member room (owned by the install identity, carried by the pairing
+   * link). Run on start and after each pair / unpair. Peers paired before v17
+   * are reported once with the existing re-pair wording.
+   */
+  private syncPairRooms(report = true): void {
+    try {
+      const r = this.rooms.migratePeers(this.store.listPeers());
+      if (report) for (const s of r.skipped) this.audit.write({ event: 'room.migration_skipped', peer: s.peer, reason: s.reason });
+    } catch {
+      // No rooms tables in this database (the Claude Code plugin daemon until
+      // step 3): pairwise keeps working exactly as before.
+    }
+  }
+
+  /**
+   * A room member asked something: an IN task the member session answers with A2AReply.
+   *
+   * ⚠ A `request` or `notify` is HELD for the user's approval exactly as the
+   * pairwise path holds one from an `inform` peer (router.ts gate, design
+   * 4.2.3 / 6.3). Without this a room member could make our agent do work
+   * with no consent - rooms are joined by invite, but an invite is not the
+   * same as permission to act, and the invite may have been forwarded.
+   * `inform` is information only, so it is delivered immediately.
+   */
+  /**
+   * Release the approval hold on a ROOM task. The text already reached the
+   * session (inside the untrusted envelope) when it arrived; what was
+   * withheld is permission to act on it. So this only flips the state - there
+   * is no peer row to read a trust level from, and nothing to route again.
+   */
+  private acceptRoomTask(t: TaskRow, opts: { sessionId?: string; by?: string }): TaskRow {
+    const sessionId = opts.sessionId ?? t.session_id;
+    this.store.patchTask(t.task_id, { approval: 'accepted', sessionId }, this.now());
+    this.audit.write({
+      event: 'task.approval',
+      peer: t.peer_id,
+      taskId: t.task_id,
+      approval: 'accepted',
+      by: opts.by ?? 'user',
+      sessionId,
+    });
+    this.setInboundState(this.store.getTask(t.task_id)!, 'TASK_STATE_WORKING', `${this.opts.displayName} approved; working on it.`);
+    this.changed();
+    return this.store.getTask(t.task_id)!;
+  }
+
+  private roomInTask(a: { owner: string; room: RoomRow; kind: MessageKind; text: string; senderFp: string; requesterTaskId: string | null }): string {
+    const taskId = randomUUID();
+    const held = a.kind !== 'inform';
+    const status = {
+      state: (held ? 'TASK_STATE_INPUT_REQUIRED' : 'TASK_STATE_WORKING') as TaskState,
+      timestamp: new Date(this.now()).toISOString(),
+    };
+    this.store.insertTask({
+      taskId,
+      peerId: `room:${a.room.room_id}`,
+      direction: 'in',
+      contextId: a.room.room_id,
+      sessionId: a.owner,
+      kind: a.kind,
+      state: status.state,
+      summary: a.text.slice(0, 200),
+      requestJson: JSON.stringify({ room: a.room.room_id, owner: a.owner, from: a.senderFp, requesterTaskId: a.requesterTaskId, parts: [{ text: a.text }] }),
+      statusJson: JSON.stringify(status),
+      approval: held ? 'pending' : null,
+      now: this.now(),
+    });
+    if (held) {
+      this.audit.write({
+        event: 'room.approval.pending',
+        room: a.room.room_id,
+        taskId,
+        from: a.senderFp.slice(0, 12),
+        kind: a.kind,
+      });
+    }
+    return taskId;
+  }
+
+  /** A member answered (or updated) one of OUR room requests. */
+  private roomReply(a: { owner: string; room: RoomRow; taskId: string; state: string | null; text: string; who: string; msgId: string }): void {
+    const t = this.store.getTask(a.taskId);
+    if (!t || t.direction !== 'out' || t.peer_id !== `room:${a.room.room_id}` || t.session_id !== a.owner) return;
+    if (TERMINAL_STATES.has(t.state)) return;
+    const text = `${a.who}: ${a.text}`.slice(0, 8000);
+    if (a.state && isTaskState(a.state) && a.state !== t.state) {
+      const status = { state: a.state, timestamp: new Date(this.now()).toISOString(), message: this.agentMessage(t.task_id, t.context_id ?? '', text) };
+      this.store.patchTask(t.task_id, { state: a.state, statusJson: JSON.stringify(status), lastPushTs: this.now() }, this.now());
+      this.audit.write({ event: 'task.state', peer: t.peer_id, taskId: t.task_id, direction: 'out', from: t.state, state: a.state, source: 'room' });
+      this.emit(this.store.getTask(t.task_id)!, 'state', a.state, text, false);
+    } else {
+      this.store.patchTask(t.task_id, { lastPushTs: this.now() }, this.now());
+      this.emit(t, 'message', t.state, text, false);
+    }
+    this.changed();
+  }
+
+  /** An IN room task changed: tell the requester in the room (the room's "push"). */
+  private roomTaskUpdate(t: TaskRow, state: TaskState | null, text: string): void {
+    const req = safeJson<{ room?: string; owner?: string; requesterTaskId?: string | null }>(t.request_json);
+    if (!req?.room || !req.owner || !req.requesterTaskId) return;
+    void this.rooms.postReply(req.owner, req.room, req.requesterTaskId, state, text).catch((e) => {
+      this.audit.write({ event: 'outbound.failed', peer: t.peer_id, taskId: t.task_id, error: (e as Error).message });
+    });
+  }
+
+  /** Post to a room from a session. A request / notify makes an OUT task to wait on. */
+  async roomPost(sessionId: string, roomRef: string, args: { text: string; kind?: MessageKind }): Promise<import('./rooms').PostResult> {
+    const room = this.rooms.resolve(sessionId, roomRef);
+    const kind = args.kind ?? 'inform';
+    if (kind === 'inform' || room.migrated_from) return this.rooms.post(sessionId, room, { text: args.text, kind });
+    const taskId = randomUUID();
+    this.store.insertTask({
+      taskId,
+      peerId: `room:${room.room_id}`,
+      direction: 'out',
+      contextId: room.room_id,
+      sessionId,
+      kind,
+      state: 'TASK_STATE_SUBMITTED',
+      summary: String(args.text ?? '').trim().slice(0, 200),
+      statusJson: JSON.stringify({ state: 'TASK_STATE_SUBMITTED' }),
+      now: this.now(),
+    });
+    try {
+      return await this.rooms.post(sessionId, room, { text: args.text, kind, taskId });
+    } catch (e) {
+      this.store.patchTask(taskId, { state: 'TASK_STATE_FAILED', statusJson: JSON.stringify({ state: 'TASK_STATE_FAILED', message: this.agentMessage(taskId, room.room_id, `Not posted: ${(e as Error).message}`) }) }, this.now());
+      throw e;
+    }
+  }
+
+  /** The session was deleted: leave its rooms and drop its identity. */
+  async forgetSession(sessionId: string): Promise<void> {
+    await this.rooms.forgetSession(sessionId);
+    this.changed();
   }
 
   relayStatus(): RelayStatus | null {
@@ -778,6 +959,8 @@ export class A2ANode {
     if (push) this.store.savePushConfig(taskId, push.path, push.token);
     this.store.setContext(contextId, peer.peer_id, result.sessionId, this.now());
     this.store.recordSeenMessage(peer.peer_id, msg.messageId, taskId, this.now());
+    // Migrated pair room (design 11b): keep it in that room's history for A2ARead.
+    this.rooms.notePairInbound(peer, kind, text, taskId, msg.messageId);
     this.audit.write({
       event: 'inbound.message',
       peer: peer.peer_id,
@@ -907,6 +1090,22 @@ export class A2ANode {
   accept(ref: string, opts: { sessionId?: string; by?: string } = {}): { task: TaskRow; delivery: DeliveryResult } {
     const t = this.resolveTask(ref, 'in');
     if (t.approval !== 'pending' || TERMINAL_STATES.has(t.state)) throw new Error(`Task ${shortId(t.task_id)} is not waiting for approval.`);
+    // A ROOM task has no peer row - its peer_id is `room:<id>` - and it was
+    // already delivered to the session that owns the room when it arrived.
+    // So approving it just releases the hold; there is no peer trust to read
+    // and nothing to route a second time.
+    if (t.peer_id.startsWith('room:')) {
+      const task = this.acceptRoomTask(t, opts);
+      return {
+        task,
+        delivery: {
+          sessionId: task.session_id ?? '',
+          via: 'context',
+          mode: 'queued',
+          envelope: '',
+        },
+      };
+    }
     const peer = this.store.getPeer(t.peer_id);
     if (!peer) throw new Error(`The peer for task ${shortId(t.task_id)} is no longer paired.`);
     const msg = JSON.parse(t.request_json ?? '{}') as Message;
@@ -977,7 +1176,8 @@ export class A2ANode {
     if (args.action === 'message') {
       if (!parts.length) throw new Error('Nothing to send: give text or data.');
       const m = this.agentMessage(t.task_id, t.context_id ?? '', '', undefined, parts);
-      this.queuePush(t, { message: m });
+      if (t.peer_id.startsWith('room:')) this.roomTaskUpdate(t, null, partsText(parts));
+      else this.queuePush(t, { message: m });
       this.changed();
       return this.store.getTask(t.task_id)!;
     }
@@ -1040,6 +1240,12 @@ export class A2ANode {
     // A finished task (completed, failed, rejected, or cancelled by either
     // side) has nothing left to watch: stop the check for good.
     if (TERMINAL_STATES.has(state)) this.stopWatch(t, `task ${stateWord(state)}`);
+    if (o.push !== false && t.peer_id.startsWith('room:')) {
+      // A room task's "push" is a signed reply posted to the room.
+      const fresh = this.store.getTask(t.task_id)!;
+      this.roomTaskUpdate(fresh, state, taskOutcomeText({ status, artifacts: artifacts ?? prevArtifacts }) || statusText);
+      return;
+    }
     if (o.push !== false) this.queuePush(this.store.getTask(t.task_id)!, { task: this.toTask(this.store.getTask(t.task_id)!) });
   }
 
@@ -1445,6 +1651,9 @@ export class A2ANode {
    * wait is now satisfied. Never throws: an offline peer just means "not yet".
    */
   async pollForWait(state: WaitA2AState, staleMs = POLL_STALE_MS): Promise<string | null> {
+    // Wait-for-anything (design 11c): the inbox is local, so the backstop is
+    // a DB read - did anything land after the wait started? No network.
+    if (state.rooms) return this.rooms.pendingNote(state.rooms.owners, state.rooms.afterSeq, state.rooms.roomIds);
     const candidates = this.tasksInScope(state);
     const now = this.now();
     for (const t of candidates) {
@@ -1508,8 +1717,32 @@ export class A2ANode {
     return { taskIds, peer, contextId, states: args.states && args.states.length ? args.states : null, deadlineTs: now + args.timeoutMs, pollStaleMs: POLL_STALE_MS, startedTs: now };
   }
 
+  /**
+   * WaitForA2A "anything" mode (design 11c): wake on the next message from
+   * someone else in any room this session is in (or just `rooms`). Messages
+   * that arrived before the wait started do not count (they were delivered
+   * already). The timer backstop re-reads the local inbox once a minute.
+   */
+  buildAnyWait(args: { sessionId: string; rooms?: string[]; timeoutMs: number }): WaitA2AState {
+    const roomIds = (args.rooms ?? []).filter((r) => String(r ?? '').trim()).map((r) => this.rooms.resolve(args.sessionId, r).room_id);
+    const visible = this.rooms.list(args.sessionId);
+    if (!visible.length) throw new Error('This session is in no rooms, so there is nothing to wait for. Create or join a room first (A2ARoom).');
+    const now = this.now();
+    return {
+      taskIds: [],
+      peer: null,
+      contextId: null,
+      states: null,
+      deadlineTs: now + args.timeoutMs,
+      pollStaleMs: 60_000,
+      startedTs: now,
+      rooms: { sessionId: args.sessionId, owners: [args.sessionId, INSTALL_OWNER], roomIds, afterSeq: this.roomStore.maxSeq() },
+    };
+  }
+
   /** Already satisfied by what we know locally? Returns the resume note, else null. */
   alreadySatisfied(state: WaitA2AState): string | null {
+    if (state.rooms) return this.rooms.pendingNote(state.rooms.owners, state.rooms.afterSeq, state.rooms.roomIds);
     for (const t of this.tasksInScope(state)) {
       const ev = this.eventFromRow(t);
       if (eventWakes(state, ev)) return resumeNote(ev);
@@ -1755,6 +1988,11 @@ export class A2ANode {
       this.setOutboundCanceled(t, 'Cancelled before it was delivered.');
       return { task: this.store.getTask(t.task_id)!, note: 'it had not been delivered yet; removed from the queue' };
     }
+    if (t.peer_id.startsWith('room:')) {
+      // A room request has no remote task to cancel: stop waiting on it here.
+      this.setOutboundCanceled(t, 'Cancelled by the requester.');
+      return { task: this.store.getTask(t.task_id)!, note: 'cancelled here; members who already saw it are not told' };
+    }
     const peer = this.store.getPeer(t.peer_id);
     if (!peer) throw new Error(`The peer for task ${shortId(t.task_id)} is no longer paired.`);
     const remote = await clientCancelTask(this.endpointFor(peer), t.task_id).catch((e) => {
@@ -1810,6 +2048,7 @@ export class A2ANode {
   async redeem(code: string): Promise<PeerRow> {
     const peer = await redeemCode(this.store, code, this.identity(), this.now(), (p) => this.pairingRouteFor(p));
     this.relayKeys.delete(normaliseFingerprint(peer.cert_sha256));
+    this.syncPairRooms(false);
     this.audit.write({ event: 'pair.redeemed', peer: peer.peer_id, displayName: peer.display_name, cardUrl: peer.card_url });
     this.changed();
     return peer;
@@ -1832,6 +2071,7 @@ export class A2ANode {
     this.stopPeerWatches(peer.peer_id, 'peer revoked');
     this.store.deletePeer(peer.peer_id);
     for (const r of this.store.listOutbox(peer.peer_id)) this.store.deleteOutbox(r.id);
+    this.syncPairRooms(false);
     this.audit.write({ event: 'peer.revoked', peer: peer.peer_id, notified: told });
     this.changed();
     return peer;

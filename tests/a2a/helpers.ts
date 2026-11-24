@@ -8,7 +8,7 @@ import initSqlJs, { type Database } from 'sql.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema } from '../../electron/a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, applyA2ARoomsSchema } from '../../electron/a2a/schema';
 import { A2ANode } from '../../electron/a2a/node';
 import { generateSelfSignedCert, type TlsIdentity } from '../../electron/a2a/tls';
 import type { SecretPort, SqlHandle } from '../../electron/a2a/store';
@@ -31,6 +31,8 @@ export async function makeSql(): Promise<{ sql: SqlHandle; raw: Database }> {
   applyA2AP3Schema((q) => raw.exec(q), columnsOf);
   // ...and the relay cert_pem column (v17).
   applyA2ARelaySchema((q) => raw.exec(q), columnsOf);
+  // ...and the rooms tables (v18).
+  applyA2ARoomsSchema((q) => raw.exec(q));
   const sql: SqlHandle = {
     prepare: (q: string) => ({
       run: (...p: unknown[]) => {

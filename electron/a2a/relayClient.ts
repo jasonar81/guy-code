@@ -99,6 +99,14 @@ export interface RelayClientOptions {
   onStatus?(s: RelayStatus): void;
   /** Called each time the stream (re)authenticates: a good moment to flush the outbox. */
   onReady?(): void;
+  /**
+   * A room post (design 11b): `to` was "room:<id>". There is no reply; the
+   * handler must call `ackRoom` (rooms.ts does, for every post, including the
+   * ones it drops) or the relay redelivers it when this stream dies.
+   */
+  onRoomEnvelope?(env: RoomEnvelope): void | Promise<void>;
+  /** `room_member` / `room_snapshot` events (informational; the roster is end to end). */
+  onRoomEvent?(event: 'room_member' | 'room_snapshot', data: Record<string, unknown>): void;
   /** How long a caller waits for a reply after the relay said 202. Default 30 s. */
   replyWaitMs?: number;
   backoff?: { baseMs: number; maxMs: number };
@@ -106,6 +114,22 @@ export interface RelayClientOptions {
   staleMs?: number;
   log?: { info(...a: unknown[]): void; warn(...a: unknown[]): void };
 }
+
+/** A room post as it arrives: the relay-proven sender, the room, and the sealed bytes. */
+export interface RoomEnvelope extends SealedEnvelope {
+  room: string;
+  from: string;
+  msgId: string;
+}
+
+/** The relay's answer to a room post. */
+export interface RoomPostResult {
+  delivered: number;
+  queued: number;
+  dropped: Array<{ to: string; reason: string }>;
+}
+
+export const ROOM_ADDRESS_PREFIX = 'room:';
 
 /** The relay accepted the message but reports it was never delivered (TTL, never answered). */
 export class RelayDroppedError extends Error {
@@ -287,6 +311,58 @@ export class RelayClient {
     throw new Error(`Relay rejected the message: ${code || r.status} - ${msg}`);
   }
 
+  // ---- rooms (design 11b) -----------------------------------------------------------
+
+  /** POST a rooms call ({room} join / leave, or an ack). Throws RelayUnavailableError / Error. */
+  private async roomCall(path: string, body: Record<string, string>): Promise<any> {
+    if (!this.isConnected()) throw new RelayUnavailableError(`The relay is not connected${this.lastError ? ` (${this.lastError})` : ''}.`);
+    const r = await this.post(path, body, 15_000);
+    if (r.status === 200) return r.body;
+    const msg = String(r.body?.error?.message ?? `HTTP ${r.status}`);
+    if (r.status === 401) {
+      this.dropConnection();
+      throw new RelayUnavailableError(`The relay session expired; reconnecting (${msg}).`);
+    }
+    if (r.status >= 500 || r.status === 429) throw new RelayUnavailableError(`Relay refused: ${msg}`);
+    throw Object.assign(new Error(`Relay refused: ${msg}`), { status: r.status, code: r.body?.error?.code });
+  }
+
+  /** Join a room at the relay. Idempotent; the relay forgets rooms on restart, so call it after every login. */
+  joinRoom(room: string): Promise<{ members: string[]; joined: boolean }> {
+    return this.roomCall('/relay/v1/rooms/join', { room });
+  }
+
+  leaveRoom(room: string): Promise<unknown> {
+    return this.roomCall('/relay/v1/rooms/leave', { room });
+  }
+
+  /** Acknowledge a room post; until then the relay redelivers it if our stream dies. */
+  async ackRoom(room: string, sender: string, msgId: string): Promise<void> {
+    try {
+      await this.roomCall('/relay/v1/ack', { room, sender, msgId });
+    } catch (e) {
+      // 404 = already acked (or the relay restarted and forgot it): nothing to do.
+      if ((e as { status?: number }).status !== 404) throw e;
+    }
+  }
+
+  /** Post an already sealed (and signed) message to a room: still exactly the six envelope fields. */
+  async postRoom(room: string, msgId: string, sealed: SealedEnvelope): Promise<RoomPostResult> {
+    if (!this.isConnected()) throw new RelayUnavailableError(`The relay is not connected${this.lastError ? ` (${this.lastError})` : ''}.`);
+    const env = { to: ROOM_ADDRESS_PREFIX + room, from: this.me, msgId, iv: sealed.iv, ct: sealed.ct, tag: sealed.tag };
+    const r = await this.post('/relay/v1/send', env, 15_000);
+    if (r.status === 202 && r.body?.status === 'posted') {
+      return { delivered: Number(r.body.delivered ?? 0), queued: Number(r.body.queued ?? 0), dropped: Array.isArray(r.body.dropped) ? r.body.dropped : [] };
+    }
+    const msg = String(r.body?.error?.message ?? `HTTP ${r.status}`);
+    if (r.status === 401) {
+      this.dropConnection();
+      throw new RelayUnavailableError(`The relay session expired; reconnecting (${msg}).`);
+    }
+    if (r.status >= 500 || r.status === 429) throw new RelayUnavailableError(`Relay refused the post: ${msg}`);
+    throw Object.assign(new Error(`Relay refused the post: ${msg}`), { status: r.status, code: r.body?.error?.code });
+  }
+
   private registerWaiter(msgId: string, key: Buffer): { promise: Promise<RelayResponse> } {
     let resolve!: (r: RelayResponse) => void;
     let reject!: (e: Error) => void;
@@ -407,6 +483,14 @@ export class RelayClient {
       case 'replaced':
         this.fail(gen, 'another connection with this identity replaced this one');
         break;
+      case 'room_member':
+      case 'room_snapshot':
+        try {
+          this.opts.onRoomEvent?.(event, d);
+        } catch {
+          /* informational */
+        }
+        break;
     }
   }
 
@@ -485,6 +569,21 @@ export class RelayClient {
     const from = String(env?.from ?? '');
     const msgId = String(env?.msgId ?? '');
     if (!from || !msgId) return;
+    const to = String(env?.to ?? '');
+    if (to.startsWith(ROOM_ADDRESS_PREFIX)) {
+      // A room post: no reply. rooms.ts verifies, stores, delivers and acks.
+      const room = to.slice(ROOM_ADDRESS_PREFIX.length);
+      if (!this.opts.onRoomEnvelope) {
+        void this.ackRoom(room, from, msgId).catch(() => {});
+        return;
+      }
+      try {
+        await this.opts.onRoomEnvelope({ room, from, msgId, iv: String(env.iv ?? ''), ct: String(env.ct ?? ''), tag: String(env.tag ?? '') });
+      } catch (e) {
+        this.opts.log?.warn('[a2a-relay] room post handler failed:', (e as Error).message);
+      }
+      return;
+    }
     const k = `${from}|${msgId}`;
     const seen = this.seen.get(k);
     if (seen === 'busy') return; // a redelivery while we are still working on it

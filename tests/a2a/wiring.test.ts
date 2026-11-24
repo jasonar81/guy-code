@@ -17,7 +17,8 @@ const src = (p: string) => readFileSync(join(root, p), 'utf8');
 describe('A2A wiring', () => {
   it('db.ts applies the shared A2A schema as numbered migrations (v14 tables, v15 P2 + v16 P3 guarded columns)', () => {
     const db = src('electron/db.ts');
-    expect(db).toMatch(/import \{ A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema \} from '\.\/a2a\/schema'/);
+    expect(db).toMatch(/import \{ A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, applyA2ARoomsSchema \} from '\.\/a2a\/schema'/);
+    expect(db).toMatch(/version: 18,[\s\S]{0,600}applyA2ARoomsSchema\(/);
     expect(db).toMatch(/version: 14,[\s\S]{0,800}up: A2A_SCHEMA_SQL/);
     expect(db).toMatch(/version: 15,[\s\S]{0,600}applyA2AP2Schema\(/);
     expect(db).toMatch(/version: 16,[\s\S]{0,600}applyA2AP3Schema\(/);
@@ -75,7 +76,7 @@ describe('A2A wiring', () => {
   });
 
   it('exposes the P2 tool set, with natural-language triggers in the descriptions', () => {
-    expect(Object.keys(A2A_TOOLS).sort()).toEqual(['A2ACancel', 'A2APair', 'A2APeers', 'A2AReply', 'A2ARequest', 'A2ASend', 'A2ATasks', 'WaitForA2A']);
+    expect(Object.keys(A2A_TOOLS).sort()).toEqual(['A2ACancel', 'A2APair', 'A2APeers', 'A2APost', 'A2ARead', 'A2AReply', 'A2ARequest', 'A2ARoom', 'A2ASend', 'A2ATasks', 'WaitForA2A']);
     expect(A2A_TOOLS.A2ASend.schema.description).toMatch(/tell Dylan's agent/);
     expect(A2A_TOOLS.A2ARequest.schema.description).toMatch(/ask Dylan's agent/);
     expect(A2A_TOOLS.A2ARequest.schema.description).toMatch(/tell us when/);

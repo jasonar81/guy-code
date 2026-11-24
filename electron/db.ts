@@ -38,7 +38,7 @@ import * as fsp from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import log from 'electron-log';
-import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema } from './a2a/schema';
+import { A2A_SCHEMA_SQL, applyA2AP2Schema, applyA2AP3Schema, applyA2ARelaySchema, applyA2ARoomsSchema } from './a2a/schema';
 import type { WaitA2AState } from './a2a/waiters';
 
 let SQL: SqlJsStatic | null = null;
@@ -1218,6 +1218,14 @@ function migrate(d: Database) {
       // relay. Guarded by PRAGMA table_info like v15 / v16 (see a2a/schema.ts).
       up: (dd) => applyA2ARelaySchema((sql) => dd.exec(sql), (table) => tableColumns(dd, table)),
     },
+    {
+      version: 18,
+      // A2A rooms (design 11b): per-SESSION identities, rooms, rosters, the
+      // room inbox and room invites. New tables only, every statement IF NOT
+      // EXISTS, so it is safe to re-run (see a2a/schema.ts). Room keys and
+      // session private keys go to secret storage, never these tables.
+      up: (dd) => applyA2ARoomsSchema((sql) => dd.exec(sql)),
+    },
   ];
 
   for (const m of migrations) {
@@ -1577,6 +1585,14 @@ export function deleteSession(id: string): void {
     // the session is gone.
     'DELETE FROM usage_rollup WHERE session_id = ?',
     'DELETE FROM audit_events WHERE session_id = ?',
+    // A2A rooms (v18): the session's own identity and its room state. The
+    // A2A node also leaves the rooms at the relay and clears the keys from
+    // secret storage when it is running (a2a/index.ts a2aSessionDeleted).
+    'DELETE FROM a2a_session_identities WHERE session_id = ?',
+    'DELETE FROM a2a_rooms WHERE session_id = ?',
+    'DELETE FROM a2a_room_members WHERE session_id = ?',
+    'DELETE FROM a2a_room_messages WHERE session_id = ?',
+    'DELETE FROM a2a_room_invites WHERE session_id = ?',
     'DELETE FROM sessions WHERE id = ?',
   ]) {
     try {

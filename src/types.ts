@@ -355,12 +355,37 @@ export interface A2APanelTask {
   updatedTs: number | null;
 }
 
+/** Rooms (design 11b). Mirrors electron/a2a/index.ts. */
+export interface A2APanelRoomMember {
+  fingerprint: string;
+  handle: string;
+  displayName: string | null;
+  sessionLabel: string | null;
+  agentKind: string | null;
+  you: boolean;
+  localSessionId: string | null;
+  sameInstall: boolean;
+}
+
+export interface A2APanelRoom {
+  roomId: string;
+  name: string;
+  sessionId: string;
+  sessionLabel: string | null;
+  status: string;
+  epoch: number;
+  migratedFrom: string | null;
+  members: A2APanelRoomMember[];
+  relayState: string | null;
+}
+
 export interface A2APanelSnapshot {
   running: boolean;
   paused: boolean;
   peers: A2APanelPeer[];
   pending: A2APanelTask[];
   tasks: A2APanelTask[];
+  rooms?: A2APanelRoom[];
 }
 
 /** A2A relay connection (design 11a), for the Agents panel. Mirrors electron/a2a/index.ts. */

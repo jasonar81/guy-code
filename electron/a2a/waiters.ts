@@ -40,6 +40,43 @@ export interface WaitA2AState {
   deadlineTs: number;
   pollStaleMs: number;
   startedTs: number;
+  /**
+   * Wait for ANYTHING (design 11c): set = wake on the next message posted by
+   * someone else in any room this session belongs to (or only `roomIds`).
+   * Task events never match this mode; room messages never match the others.
+   */
+  rooms?: {
+    /** The waiting session. */
+    sessionId: string;
+    /** Local members whose rooms count: the session itself, plus INSTALL_OWNER (migrated pair rooms). */
+    owners: string[];
+    /** Empty = every room. */
+    roomIds: string[];
+    /** Inbox sequence number when the wait started: only later messages count. */
+    afterSeq: number;
+  } | null;
+}
+
+/** A new message in a room, as seen by one local member. */
+export interface RoomMessageEvent {
+  /** The local member that received it: a session id, or INSTALL_OWNER. */
+  owner: string;
+  roomId: string;
+  /** The resume note: sender, room and the (enveloped) content. */
+  note: string;
+}
+
+/**
+ * Owner id of rooms held by the INSTALL identity rather than a session: the
+ * two-member rooms migrated from pairwise peers (rooms.ts). Every session of
+ * the install may use them, so any session's wait-for-anything includes them.
+ */
+export const INSTALL_OWNER = '@install';
+
+/** Does a room message end this wait? */
+export function roomEventWakes(w: WaitA2AState, ev: RoomMessageEvent): boolean {
+  if (!w.rooms || !w.rooms.owners.includes(ev.owner)) return false;
+  return !w.rooms.roomIds.length || w.rooms.roomIds.includes(ev.roomId);
 }
 
 /** One change on a task, or a new agent message on it. */
@@ -94,6 +131,7 @@ export function inScope(w: Pick<WaitA2AState, 'taskIds' | 'peer' | 'contextId'>,
 
 export function eventWakes(w: WaitA2AState, ev: A2ATaskEvent): boolean {
   if (ev.direction !== 'out') return false;
+  if (w.rooms) return false; // wait-for-anything is woken by room messages, not task events
   if (!inScope(w, ev)) return false;
   if (ev.kind === 'message') return !w.states || w.states.length === 0;
   return stateWakes(w.states, ev.state, ev.approvalPending);
@@ -165,6 +203,40 @@ export async function decideTimerWake(
 interface InProcessWaiter {
   state: WaitA2AState;
   resolve(note: string): void;
+}
+
+/**
+ * Sessions sleeping in WaitForA2A any-message mode that this room message
+ * wakes (persistent ones through the port, subagents in process). Returns
+ * the resumed session ids; `inProcess` counts subagent waiters woken.
+ */
+export function wakeOnRoomMessage(inProcess: Set<InProcessWaiter>, port: WaitPort | undefined, ev: RoomMessageEvent): { sessions: string[]; inProcess: number } {
+  let n = 0;
+  for (const w of [...inProcess]) {
+    if (roomEventWakes(w.state, ev)) {
+      inProcess.delete(w);
+      w.resolve(ev.note);
+      n++;
+    }
+  }
+  const sessions: string[] = [];
+  if (!port) return { sessions, inProcess: n };
+  let rows: Array<{ sessionId: string; state: WaitA2AState }> = [];
+  try {
+    rows = port.listWaiting();
+  } catch {
+    return { sessions, inProcess: n };
+  }
+  for (const r of rows) {
+    if (!roomEventWakes(r.state, ev)) continue;
+    try {
+      port.resume(r.sessionId, ev.note);
+      sessions.push(r.sessionId);
+    } catch {
+      /* archived meanwhile */
+    }
+  }
+  return { sessions, inProcess: n };
 }
 
 export class Waiters {
@@ -248,5 +320,10 @@ export class Waiters {
 
   inProcessCount(): number {
     return this.inProcess.size;
+  }
+
+  /** A room message arrived for a local member session (design 11c). */
+  onRoomMessage(ev: RoomMessageEvent): { sessions: string[]; inProcess: number } {
+    return wakeOnRoomMessage(this.inProcess, this.port, ev);
   }
 }
